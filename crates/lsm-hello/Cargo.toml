@@ -1,0 +1,16 @@
+[package]
+name = "lsm-hello"
+description = "Loads the milestone 1 LSM smoke-test program and prints its log"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aya = "0.13"
+aya-log = "0.2"
+clap.workspace = true
+env_logger = "0.11"
+log = "0.4"
+# aya-log 0.2 reads its perf buffer asynchronously.
+tokio = { version = "1", features = ["macros", "rt", "signal", "time"] }

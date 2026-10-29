@@ -53,6 +53,8 @@ rustup toolchain install nightly --component rust-src
 # release binary instead (the upstream-recommended route).
 command -v cargo-binstall >/dev/null || cargo install --locked cargo-binstall
 command -v bpf-linker >/dev/null || cargo binstall -y bpf-linker
+# aya-tool shells out to bindgen to turn kernel BTF into Rust structs.
+command -v bindgen >/dev/null || cargo install --locked bindgen-cli
 command -v aya-tool >/dev/null || cargo install --git https://github.com/aya-rs/aya aya-tool
 
 echo

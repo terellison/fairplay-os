@@ -11,11 +11,16 @@
 #![no_std]
 #![no_main]
 
-#[allow(non_upper_case_globals, non_snake_case, non_camel_case_types, dead_code)]
+#[allow(
+    non_upper_case_globals,
+    non_snake_case,
+    non_camel_case_types,
+    dead_code
+)]
 mod vmlinux;
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_pid_tgid, bpf_probe_read_kernel},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel},
     macros::{lsm, map},
     maps::{HashMap, RingBuf},
     programs::LsmContext,
@@ -34,41 +39,55 @@ static PROTECTED: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 #[map]
 static VIOLATIONS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
+/// The verdict is built here, not inside a `Result`: packing an `i32` into
+/// `Result<i32, i64>` loses its sign for the verifier, which then can't prove
+/// R0 is in [-4095, 0] and rejects the program.
 #[lsm(hook = "ptrace_access_check")]
 pub fn ptrace_access_check(ctx: LsmContext) -> i32 {
-    try_ptrace_access_check(&ctx).unwrap_or(0)
-}
-
-fn try_ptrace_access_check(ctx: &LsmContext) -> Result<i32, i64> {
     // int ptrace_access_check(struct task_struct *child, unsigned int mode)
     // For BPF LSM, arg 2 is the verdict from earlier LSMs in the stack.
-    let child: *const task_struct = unsafe { ctx.arg(0) };
-    let mode: u32 = unsafe { ctx.arg(1) };
     let prev: i32 = unsafe { ctx.arg(2) };
     if prev != 0 {
-        return Ok(prev);
+        return prev;
     }
+    match should_deny(&ctx) {
+        Ok(true) => -EPERM,
+        _ => 0,
+    }
+}
+
+/// True if the caller must not touch the target's memory. Records the attempt.
+fn should_deny(ctx: &LsmContext) -> Result<bool, i64> {
+    let child: *const task_struct = unsafe { ctx.arg(0) };
+    let mode: u32 = unsafe { ctx.arg(1) };
 
     let target = unsafe { bpf_probe_read_kernel(&(*child).tgid)? } as u32;
     let Some(&domain) = (unsafe { PROTECTED.get(&target) }) else {
-        return Ok(0); // not protected: normal kernel rules apply
+        return Ok(false); // not protected: normal kernel rules apply
     };
 
     let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
     if caller == target {
-        return Ok(0);
+        return Ok(false);
     }
     if let Some(&caller_domain) = unsafe { PROTECTED.get(&caller) } {
         if caller_domain == domain {
-            return Ok(0); // the game and its own anti-cheat
+            return Ok(false); // the game and its own anti-cheat
         }
     }
 
     if let Some(mut entry) = VIOLATIONS.reserve::<Violation>(0) {
-        entry.write(Violation { caller, target, hook: Hook::PtraceAccess as u32, mode });
+        let comm = bpf_get_current_comm().unwrap_or([0; 16]);
+        entry.write(Violation {
+            caller,
+            target,
+            hook: Hook::PtraceAccess as u32,
+            mode,
+            comm,
+        });
         entry.submit(0);
     }
-    Ok(-EPERM)
+    Ok(true)
 }
 
 #[cfg(not(test))]
