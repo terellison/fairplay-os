@@ -86,6 +86,7 @@ dependencies = [
  "anyhow",
  "clap",
  "md-5",
+ "safewrite",
 ]
 
 [[package]]
