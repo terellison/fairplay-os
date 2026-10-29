@@ -84,9 +84,11 @@ fn report(v: &Violation) {
     let exe = std::fs::read_link(format!("/proc/{}/exe", v.caller))
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<exited>".into());
+    let len = v.comm.iter().position(|&b| b == 0).unwrap_or(v.comm.len());
+    let comm = String::from_utf8_lossy(&v.comm[..len]);
     println!(
-        "DENIED caller={} exe={} target={} hook={} mode={:#x}",
-        v.caller, exe, v.target, hook, v.mode
+        "DENIED caller={} comm={} exe={} target={} hook={} mode={:#x}",
+        v.caller, comm, exe, v.target, hook, v.mode
     );
 }
 

@@ -30,6 +30,7 @@ check "workspace is a subvolume"   sudo btrfs subvolume show /work/ws
 check "nightly + rust-src"         bash -c 'rustup component list --toolchain nightly --installed | grep -q rust-src'
 check "bpf-linker installed"       command -v bpf-linker
 check "aya-tool installed"         command -v aya-tool
+check "bindgen installed (aya-tool needs it)" command -v bindgen
 
 echo "Secure Boot: $(sudo mokutil --sb-state 2>/dev/null || echo 'not available (expected on arm64 QEMU; see README)')"
 echo "$pass passed, $fail failed, $skip skipped"
