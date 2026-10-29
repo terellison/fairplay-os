@@ -1,0 +1,27 @@
+[package]
+name = "fairplay-ebpf"
+description = "BPF LSM program that guards protected game processes"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[dependencies]
+aya-ebpf = "0.1"
+fairplay-common = { path = "../fairplay-common" }
+
+[[bin]]
+name = "fairplay"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+overflow-checks = false
+panic = "abort"
+
+[profile.release]
+debug = 2
+panic = "abort"
+
+# Standalone workspace: built for bpfel-unknown-none with nightly.
+[workspace]

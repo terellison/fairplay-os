@@ -1,0 +1,14 @@
+[package]
+name = "fairplay-attest"
+description = "TPM quote + IMA log collection, and the server-side verifier (milestone 6)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+default = []
+# Real TPM access. Needs libtss2 (apt install libtss2-dev) and a TPM (swtpm in the VM).
+tpm = ["dep:tss-esapi"]
+
+[dependencies]
+tss-esapi = { version = "7", optional = true }

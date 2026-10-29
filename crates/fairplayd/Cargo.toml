@@ -1,0 +1,13 @@
+[package]
+name = "fairplayd"
+description = "Loads the fairplay LSM program, owns the protected-process map, reports violations"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+aya = "0.13"
+clap.workspace = true
+fairplay-common = { workspace = true, features = ["user"] }
+libc = "0.2"

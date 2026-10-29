@@ -1,0 +1,11 @@
+[package]
+name = "cheatsim"
+description = "Plays the attacker: tries every memory path in the threat model against a target"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nix = { version = "0.29", features = ["ptrace", "uio", "process"] }

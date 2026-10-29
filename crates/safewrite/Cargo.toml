@@ -1,0 +1,8 @@
+[package]
+name = "safewrite"
+description = "Crash-safe file writes: temp file, fsync, rename"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]

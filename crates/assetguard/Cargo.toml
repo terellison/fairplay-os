@@ -1,0 +1,11 @@
+[package]
+name = "assetguard"
+description = "Perforce sync wrapper: snapshot, sync, verify digests, check case collisions, roll back"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+md-5 = "0.10"
