@@ -11,7 +11,7 @@ KVER="$(uname -r)"
 echo "== packages"
 sudo apt-get update
 sudo apt-get install -y \
-  build-essential pkg-config clang llvm lld libelf-dev zlib1g-dev \
+  build-essential pkg-config clang libclang-dev llvm lld libelf-dev zlib1g-dev \
   "linux-tools-$KVER" linux-tools-common \
   btrfs-progs tpm2-tools libtss2-dev git curl
 
@@ -49,8 +49,11 @@ if ! command -v rustup >/dev/null; then
   . "$HOME/.cargo/env"
 fi
 rustup toolchain install nightly --component rust-src
-cargo install bpf-linker
-cargo install --git https://github.com/aya-rs/aya aya-tool
+# bpf-linker from source needs a matching LLVM dev install; use the prebuilt
+# release binary instead (the upstream-recommended route).
+command -v cargo-binstall >/dev/null || cargo install --locked cargo-binstall
+command -v bpf-linker >/dev/null || cargo binstall -y bpf-linker
+command -v aya-tool >/dev/null || cargo install --git https://github.com/aya-rs/aya aya-tool
 
 echo
 echo "Done. Reboot (sudo reboot), then run vm/check-milestone1.sh."
