@@ -1,6 +1,6 @@
 # fairplay-os
 
-Prototype for the Gaming Workstation OS design doc: a crash-safe Perforce
+Prototype for the Gaming Workstation OS [design doc](docs/design.md): a crash-safe Perforce
 workspace (Part A), OS-level fairness primitives that anti-cheat vendors build
 on from user space (Part B), and resource lanes (Part C, later).
 
@@ -155,3 +155,17 @@ programs, so milestones 1, 3 and 4 still need a run on the VM; see
 User-space crates build and test anywhere Linux runs: `cargo test --workspace`.
 The eBPF crate needs nightly, `bpf-linker`, and `vmlinux.rs` generated from the
 running kernel, so it builds on the VM.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
