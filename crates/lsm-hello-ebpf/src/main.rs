@@ -27,6 +27,9 @@ use aya_ebpf::{
 use aya_log_ebpf::info;
 use vmlinux::file;
 
+// Defines `file_path()`; see build.rs for why the field's path varies.
+include!(concat!(env!("OUT_DIR"), "/file_path.rs"));
+
 const PATH_LEN: usize = 256;
 
 /// Scratch space for the path; too big to keep on the 512-byte BPF stack.
@@ -53,7 +56,7 @@ fn try_file_open(ctx: &LsmContext) -> Result<(), i64> {
     let buf = unsafe { &mut *PATH_BUF.get_ptr_mut(0).ok_or(0i64)? };
     let len = unsafe {
         bpf_d_path(
-            core::ptr::addr_of!((*f).f_path) as *mut _,
+            file_path(f) as *mut _,
             buf.as_mut_ptr() as *mut _,
             PATH_LEN as u32,
         )
