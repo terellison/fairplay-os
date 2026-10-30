@@ -75,9 +75,10 @@ its last push.
    `cargo test --workspace`, shellcheck, and `vm/test-milestone2.sh` if assetguard or `vm/`
    changed). CI can't load BPF programs: if you touch `crates/*-ebpf` or `fairplayd`, run
    the milestone 1/3 tests on the VM and paste the output into the PR.
-5. **Open the PR** with what changed, why, and how you tested it. Then arm auto-merge:
-   `gh pr merge --auto --squash`. It merges once the owner approves and checks pass;
-   never try to merge any other way.
+5. **Open the PR** with what changed, why, and how you tested it, and request the owner's
+   review so the Approve option shows up for them: `gh pr create --reviewer terellison ...`.
+   Then arm auto-merge: `gh pr merge --auto --squash`. It merges once the owner approves
+   and checks pass; never try to merge any other way.
 6. **When `master` moves**, update your branch (merge or rebase `origin/master`) so checks
    rerun against what will actually land. Any push after the owner's approval resets it.
 7. **The App can't edit `.github/workflows/`.** If CI needs changing, describe the change
