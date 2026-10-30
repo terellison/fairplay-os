@@ -4,6 +4,7 @@ members = [
     "crates/safewrite",
     "crates/assetguard",
     "crates/fairplay-common",
+    "crates/fairplay-api",
     "crates/fairplayd",
     "crates/fairplay-attest",
     "crates/cheatsim",
@@ -21,5 +22,9 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+fairplay-api = { path = "crates/fairplay-api" }
 fairplay-common = { path = "crates/fairplay-common" }
+nix = "0.29"
 safewrite = { path = "crates/safewrite" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

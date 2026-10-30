@@ -34,7 +34,15 @@ pub struct Violation {
     /// The caller's comm, NUL-padded. Captured in the kernel because the
     /// caller has often exited by the time user space reads the event.
     pub comm: [u8; 16],
+    /// File name (no directory) of the caller's executable, NUL-padded and
+    /// cut at [`EXE_NAME_LEN`] - 1 bytes. Empty for kernel threads. Also
+    /// captured in the kernel; user space adds the full path if the caller
+    /// is still alive.
+    pub exe: [u8; EXE_NAME_LEN],
 }
+
+/// Bytes reserved for [`Violation::exe`].
+pub const EXE_NAME_LEN: usize = 64;
 
 #[cfg(feature = "user")]
 mod user {

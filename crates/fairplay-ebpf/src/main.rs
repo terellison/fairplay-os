@@ -21,13 +21,21 @@
 mod vmlinux;
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel},
+    cty::c_void,
+    helpers::{
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
+        bpf_probe_read_kernel, gen::bpf_probe_read_kernel_str,
+    },
     macros::{lsm, map},
     maps::{HashMap, RingBuf},
     programs::LsmContext,
 };
-use fairplay_common::{Hook, Violation};
-use vmlinux::task_struct;
+use core::ptr::addr_of;
+use fairplay_common::{Hook, Violation, EXE_NAME_LEN};
+use vmlinux::{dentry, file, mm_struct, path, qstr, task_struct};
+
+// task_mm, mm_exe_file, file_path, dentry_name: see build.rs.
+include!(concat!(env!("OUT_DIR"), "/fields.rs"));
 
 const EPERM: i32 = 1;
 
@@ -79,16 +87,46 @@ fn should_deny(ctx: &LsmContext) -> Result<bool, i64> {
 
     if let Some(mut entry) = VIOLATIONS.reserve::<Violation>(0) {
         let comm = bpf_get_current_comm().unwrap_or([0; 16]);
+        let mut exe = [0u8; EXE_NAME_LEN];
+        let _ = current_exe_name(&mut exe);
         entry.write(Violation {
             caller,
             target,
             hook: Hook::PtraceAccess as u32,
             mode,
             comm,
+            exe,
         });
         entry.submit(0);
     }
     Ok(true)
+}
+
+/// The file name of the current task's executable
+/// (`current->mm->exe_file->f_path.dentry->d_name`), read here because a
+/// short-lived caller is usually gone by the time user space could look at
+/// `/proc/<pid>/exe`. Leaves `out` zeroed on failure (e.g. kernel threads).
+fn current_exe_name(out: &mut [u8; EXE_NAME_LEN]) -> Result<(), i64> {
+    unsafe {
+        let task = bpf_get_current_task() as *const task_struct;
+        let mm: *const mm_struct = bpf_probe_read_kernel(task_mm(task))?;
+        if mm.is_null() {
+            return Ok(());
+        }
+        let exe: *const file = bpf_probe_read_kernel(mm_exe_file(mm))?;
+        if exe.is_null() {
+            return Ok(());
+        }
+        let dentry: *const dentry = bpf_probe_read_kernel(addr_of!((*file_path(exe)).dentry))?;
+        let name: *const u8 = bpf_probe_read_kernel(addr_of!((*dentry_name(dentry)).name))?;
+        // Room for the NUL, so the result is always terminated.
+        bpf_probe_read_kernel_str(
+            out.as_mut_ptr() as *mut c_void,
+            (EXE_NAME_LEN - 1) as u32,
+            name as *const c_void,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(not(test))]

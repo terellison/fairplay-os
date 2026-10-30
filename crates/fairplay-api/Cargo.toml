@@ -1,0 +1,17 @@
+[package]
+name = "fairplay-api"
+description = "fairplayd's socket protocol (request/response types), a client, and fairplayctl"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nix = { workspace = true, features = ["socket", "uio"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "fairplayctl"
+path = "src/bin/fairplayctl.rs"

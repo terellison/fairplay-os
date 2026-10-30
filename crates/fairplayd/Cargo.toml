@@ -1,6 +1,6 @@
 [package]
 name = "fairplayd"
-description = "Loads the fairplay LSM program, owns the protected-process map, reports violations"
+description = "Loads the fairplay LSM program, owns the protected-process map, serves the socket API"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -9,5 +9,9 @@ version.workspace = true
 anyhow.workspace = true
 aya = "0.13"
 clap.workspace = true
+fairplay-api.workspace = true
+fairplay-attest = { path = "../fairplay-attest" }
 fairplay-common = { workspace = true, features = ["user"] }
 libc = "0.2"
+nix = { workspace = true, features = ["socket", "uio", "user", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "macros"] }

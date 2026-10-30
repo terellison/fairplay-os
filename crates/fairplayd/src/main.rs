@@ -1,39 +1,76 @@
-//! fairplayd v0 (milestones 3 and 4).
+//! fairplayd (milestones 3 and 4).
 //!
-//! v0 is a foreground tool: load the LSM program, register the processes to
-//! protect, and print every denied attempt. The socket API from the design doc
-//! (launch_protected, session_status, attest, violations) builds on this in
-//! milestone 4.
+//! Loads the BPF LSM program, owns the PROTECTED map, and serves the design
+//! doc's vendor-facing API on a Unix socket (see the `fairplay-api` crate):
+//! `launch_protected`, `session_status`, `attest`, and a `violations` stream.
+//! Every denied attempt is also printed as a `DENIED` line, as in milestone 3.
 //!
-//!     sudo fairplayd --obj fairplay.o --protect <game pid> --allow <anti-cheat pid>
+//!     sudo fairplayd --obj fairplay.o                    # socket API only
+//!     sudo fairplayd --obj fairplay.o --protect <pid>    # milestone 3 style
+//!
+//! The kernel enforces, fairplayd decides who is protected, and the vendor's
+//! server sets policy. Protection ends when fairplayd exits (fails open).
 
-use std::{path::PathBuf, thread, time::Duration};
+mod host;
+mod launch;
+mod server;
+mod state;
+
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{bail, Context, Result};
 use aya::{
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, MapData, MapError, RingBuf},
     programs::Lsm,
     Btf, Ebpf,
 };
 use clap::Parser;
-use fairplay_common::{Hook, Violation, MAP_PROTECTED, MAP_VIOLATIONS};
+use fairplay_api::{ProcessState, ViolationEvent, DEFAULT_LAUNCHER_GROUP, DEFAULT_SOCKET};
+use fairplay_common::{Violation, MAP_PROTECTED, MAP_VIOLATIONS};
+use tokio::{io::unix::AsyncFd, sync::broadcast};
+
+use crate::state::{c_str, hook_name, Daemon, ProtectedMap, CLI_DOMAIN};
 
 #[derive(Parser)]
-#[command(about = "Protect game processes with a BPF LSM program")]
+#[command(about = "Protect game processes with a BPF LSM program and serve the fairplay API")]
 struct Args {
     /// Compiled eBPF object (crates/fairplay-ebpf/target/bpfel-unknown-none/release/fairplay)
     #[arg(long)]
     obj: PathBuf,
-    /// Process to protect (the game)
-    #[arg(long, required = true)]
+    /// Unix socket to serve the API on.
+    #[arg(long, default_value = DEFAULT_SOCKET)]
+    socket: PathBuf,
+    /// Group whose members may call launch_protected (root always may).
+    #[arg(long, default_value = DEFAULT_LAUNCHER_GROUP)]
+    launcher_group: String,
+    /// Also protect this already-running process (milestone 3; not tracked
+    /// as a session, and not removed if it exits).
+    #[arg(long)]
     protect: Vec<u32>,
-    /// Process allowed into the same protection domain (the vendor's anti-cheat)
+    /// Process allowed into the --protect processes' domain.
     #[arg(long)]
     allow: Vec<u32>,
 }
 
-/// v0 uses a single protection domain.
-const DOMAIN: u32 = 1;
+/// The kernel's PROTECTED map.
+pub struct BpfMap(HashMap<MapData, u32, u32>);
+
+impl ProtectedMap for BpfMap {
+    fn insert(&mut self, pid: u32, domain: u32) -> Result<()> {
+        Ok(self.0.insert(pid, domain, 0)?)
+    }
+    fn remove(&mut self, pid: u32) -> Result<()> {
+        match self.0.remove(&pid) {
+            Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+pub type Shared = Arc<Mutex<Daemon<BpfMap>>>;
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -49,47 +86,170 @@ fn main() -> Result<()> {
     prog.load("ptrace_access_check", &btf)?;
     prog.attach()?;
 
-    {
-        let mut protected: HashMap<_, u32, u32> =
-            HashMap::try_from(ebpf.map_mut(MAP_PROTECTED).context("PROTECTED map")?)?;
-        for pid in args.protect.iter().chain(&args.allow) {
-            protected.insert(pid, DOMAIN, 0)?;
-        }
+    let mut map = BpfMap(HashMap::try_from(
+        ebpf.take_map(MAP_PROTECTED).context("PROTECTED map")?,
+    )?);
+    for &pid in args.protect.iter().chain(&args.allow) {
+        map.insert(pid, CLI_DOMAIN)?;
     }
-    eprintln!(
-        "fairplayd: protecting {:?}, domain members {:?}. Ctrl-C to stop (protection ends with this process).",
-        args.protect, args.allow
-    );
+    if !args.protect.is_empty() {
+        eprintln!(
+            "fairplayd: protecting {:?}, domain members {:?} (from the command line)",
+            args.protect, args.allow
+        );
+    }
+    let ring = RingBuf::try_from(ebpf.take_map(MAP_VIOLATIONS).context("VIOLATIONS map")?)?;
 
-    let mut ring = RingBuf::try_from(ebpf.take_map(MAP_VIOLATIONS).context("VIOLATIONS map")?)?;
+    let launcher_gid = host::group_gid(&args.launcher_group);
+    match launcher_gid {
+        Some(g) => eprintln!(
+            "fairplayd: launchers: root and group {} (gid {g})",
+            args.launcher_group
+        ),
+        None => eprintln!(
+            "fairplayd: group {} does not exist; only root may launch",
+            args.launcher_group
+        ),
+    }
+
+    let daemon: Shared = Arc::new(Mutex::new(Daemon::new(map)));
+    let (events, _) = broadcast::channel::<ViolationEvent>(1024);
+
+    // Reaping is plain blocking waitid, so it gets its own thread.
+    {
+        let daemon = daemon.clone();
+        std::thread::Builder::new()
+            .name("reaper".into())
+            .spawn(move || reaper(daemon))?;
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let listener = server::bind(&args.socket)?;
+        eprintln!(
+            "fairplayd: listening on {}. Ctrl-C to stop (protection ends with this process).",
+            args.socket.display()
+        );
+        let ctx = server::Ctx {
+            daemon: daemon.clone(),
+            events: events.clone(),
+            launcher_gid,
+        };
+        tokio::spawn(read_violations(ring, daemon, events));
+        tokio::select! {
+            r = server::serve(listener, ctx) => r?,
+            _ = shutdown_signal() => {}
+        }
+        let _ = std::fs::remove_file(&args.socket);
+        eprintln!("fairplayd: stopping; protected processes still running are no longer protected");
+        Ok(())
+    })
+}
+
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut int), Ok(mut term)) = (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+    ) else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = int.recv() => {}
+        _ = term.recv() => {}
+    }
+}
+
+/// Streams the ring buffer: prints each record, files it under its session,
+/// and hands it to `violations` subscribers. Woken by the kernel (epoll on
+/// the ring buffer's fd), so the caller is usually still alive when we read
+/// /proc/<caller>/exe.
+async fn read_violations(
+    ring: RingBuf<MapData>,
+    daemon: Shared,
+    events: broadcast::Sender<ViolationEvent>,
+) -> Result<()> {
+    // SAFETY: the RingBuf owns its fd and keeps it open for as long as the
+    // AsyncFd (which owns the RingBuf) is registered.
+    let mut ring = unsafe { AsyncFd::register(ring) }
+        .map_err(|e| anyhow::anyhow!("watching the ring buffer: {e}"))?;
     loop {
+        let mut guard = ring.readable_mut().await?;
+        let ring = guard.get_inner_mut();
         while let Some(item) = ring.next() {
             if item.len() < std::mem::size_of::<Violation>() {
                 continue;
             }
             // SAFETY: the BPF side writes exactly one Violation per entry.
             let v: Violation = unsafe { std::ptr::read_unaligned(item.as_ptr().cast()) };
-            report(&v);
+            drop(item);
+            let exe_path = std::fs::read_link(format!("/proc/{}/exe", v.caller))
+                .ok()
+                .map(|p| p.display().to_string());
+            report(&v, exe_path.as_deref());
+            let ev = daemon.lock().unwrap().record_violation(&v, exe_path);
+            let _ = events.send(ev); // no subscribers is fine
         }
-        thread::sleep(Duration::from_millis(50));
+        guard.clear_ready();
     }
 }
 
-fn report(v: &Violation) {
-    let hook = match v.hook {
-        x if x == Hook::PtraceAccess as u32 => "ptrace_access_check",
-        x if x == Hook::UinputOpen as u32 => "file_open(/dev/uinput)",
-        _ => "unknown",
-    };
-    let exe = std::fs::read_link(format!("/proc/{}/exe", v.caller))
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "<exited>".into());
-    let len = v.comm.iter().position(|&b| b == 0).unwrap_or(v.comm.len());
-    let comm = String::from_utf8_lossy(&v.comm[..len]);
+fn report(v: &Violation, exe_path: Option<&str>) {
     println!(
         "DENIED caller={} comm={} exe={} target={} hook={} mode={:#x}",
-        v.caller, comm, exe, v.target, hook, v.mode
+        v.caller,
+        c_str(&v.comm),
+        exe_path.map(str::to_owned).unwrap_or_else(|| c_str(&v.exe)),
+        v.target,
+        hook_name(v.hook),
+        v.mode
     );
+}
+
+/// Collects exited children. For each: wait without reaping (`WNOWAIT`), so
+/// the PID stays reserved; remove it from PROTECTED; then reap. Reaping
+/// first would let the kernel hand the PID to a new process that would then
+/// be protected by mistake.
+fn reaper(daemon: Shared) {
+    loop {
+        // SAFETY: zeroed siginfo_t is a valid out-parameter for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if rc != 0 {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ECHILD) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Some(libc::EINTR) => {}
+                e => {
+                    eprintln!("fairplayd: waitid failed: {e:?}");
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            continue;
+        }
+        // SAFETY: waitid filled in a CLD_* record.
+        let (pid, status, code) = unsafe { (info.si_pid(), info.si_status(), info.si_code) };
+        let state = if code == libc::CLD_EXITED {
+            ProcessState::Exited {
+                code: Some(status),
+                signal: None,
+            }
+        } else {
+            ProcessState::Exited {
+                code: None,
+                signal: Some(status),
+            }
+        };
+        let mut d = daemon.lock().unwrap();
+        if let Some(session) = d.child_exited(pid as u32, state) {
+            eprintln!("fairplayd: session {session}: pid {pid} exited ({state:?}); removed from PROTECTED");
+        }
+        // Now the PID may be freed.
+        // SAFETY: pid is our exited child.
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        drop(d);
+    }
 }
 
 fn check_bpf_lsm_enabled() -> Result<()> {
