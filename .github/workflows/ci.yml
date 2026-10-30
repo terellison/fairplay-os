@@ -1,0 +1,165 @@
+# Validates every PR and every push to master.
+#
+# What CI can and can't prove: GitHub's runners don't boot with BPF LSM
+# enabled, so CI builds and lints the eBPF programs but can't load them.
+# Loading (milestones 1 and 3) is tested on the VM. Milestone 2 runs in full
+# here: a throwaway p4d and a loopback btrfs filesystem.
+#
+# Tool versions match vm/provision-guest.sh; bump both together.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_STABLE: "1.99.1"
+
+jobs:
+  user-space:
+    name: User space (fmt, clippy, test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.RUST_STABLE }}
+        run: |
+          rustup toolchain install "$RUST_STABLE" --profile minimal -c rustfmt,clippy
+          rustup default "$RUST_STABLE"
+      - name: Install libtss2 (fairplay-attest's tpm feature)
+        run: sudo apt-get update -q && sudo apt-get install -y -q libtss2-dev
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: user-space-${{ env.RUST_STABLE }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: user-space-${{ env.RUST_STABLE }}-
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p fairplay-attest --features tpm -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: user-space-x86_64
+          path: |
+            target/release/assetguard
+            target/release/fairplayd
+            target/release/cheatsim
+            target/release/lsm-hello
+          retention-days: 14
+
+  ebpf:
+    name: eBPF programs (build, fmt, clippy)
+    runs-on: ubuntu-24.04
+    env:
+      BPF_LINKER_VERSION: "0.12.0"
+      BPF_LINKER_SHA256: 6789717c8cb6a2a5d920f3b6bfac2bd7efc00f6228ecd149108a99699a75c679
+      BINDGEN_VERSION: "0.73.2"
+      AYA_TOOL_REV: 1bf09c59
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Show the runner kernel
+        run: |
+          uname -r
+          test -r /sys/kernel/btf/vmlinux && echo "kernel BTF: present"
+          echo "active LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || sudo cat /sys/kernel/security/lsm)"
+          echo "::notice::eBPF programs are built and linted here; loading them is tested on the VM (runner kernels don't enable BPF LSM)."
+      - name: Install nightly from rust-toolchain.toml
+        working-directory: crates/fairplay-ebpf
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        id: tools
+        with:
+          path: ~/.local/bpf-tools
+          key: bpf-tools-${{ runner.os }}-linker-${{ env.BPF_LINKER_VERSION }}-bindgen-${{ env.BINDGEN_VERSION }}-aya-${{ env.AYA_TOOL_REV }}
+      - name: Install bpf-linker, bindgen, aya-tool
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.local/bpf-tools/bin
+          f=bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          curl -fsSLO "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/$f"
+          echo "$BPF_LINKER_SHA256  $f" | sha256sum -c
+          tar --zstd -xf "$f" -C ~/.local/bpf-tools/bin bpf-linker
+          cargo install --locked --root ~/.local/bpf-tools "bindgen-cli@$BINDGEN_VERSION"
+          cargo install --root ~/.local/bpf-tools --git https://github.com/aya-rs/aya --rev "$AYA_TOOL_REV" aya-tool
+      - run: echo "$HOME/.local/bpf-tools/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/fairplay-ebpf/target
+            crates/lsm-hello-ebpf/target
+          key: ebpf-${{ hashFiles('crates/*-ebpf/Cargo.lock', 'crates/*-ebpf/rust-toolchain.toml') }}
+      - name: fairplay-ebpf (milestone 3)
+        working-directory: crates/fairplay-ebpf
+        run: |
+          aya-tool generate task_struct > src/vmlinux.rs
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+          cargo build --release
+          readelf -SW target/bpfel-unknown-none/release/fairplay | grep -q 'lsm/ptrace_access_check'
+      - name: lsm-hello-ebpf (milestone 1)
+        working-directory: crates/lsm-hello-ebpf
+        run: |
+          aya-tool generate file > src/vmlinux.rs
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+          cargo build --release
+          readelf -SW target/bpfel-unknown-none/release/lsm-hello | grep -q 'lsm/file_open'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ebpf-objects
+          path: |
+            crates/fairplay-ebpf/target/bpfel-unknown-none/release/fairplay
+            crates/lsm-hello-ebpf/target/bpfel-unknown-none/release/lsm-hello
+          retention-days: 14
+
+  milestone2:
+    name: Milestone 2 (assetguard vs p4d)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust ${{ env.RUST_STABLE }}
+        run: |
+          rustup toolchain install "$RUST_STABLE" --profile minimal
+          rustup default "$RUST_STABLE"
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: milestone2-${{ env.RUST_STABLE }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install btrfs-progs and Perforce (signature-checked)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q btrfs-progs
+          ./vm/install-p4.sh
+      - name: Mount a loopback btrfs at /work
+        run: |
+          truncate -s 4G "$RUNNER_TEMP/work.img"
+          mkfs.btrfs -q "$RUNNER_TEMP/work.img"
+          sudo mkdir -p /work
+          sudo mount -o loop "$RUNNER_TEMP/work.img" /work
+          sudo chown "$(id -u):$(id -g)" /work
+      - run: ./vm/test-milestone2.sh
+
+  shellcheck:
+    name: Shell scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck --version && shellcheck vm/*.sh vm/macos/*.sh

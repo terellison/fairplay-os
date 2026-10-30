@@ -1,4 +1,6 @@
 target/
 crates/fairplay-ebpf/target/
 crates/fairplay-ebpf/src/vmlinux.rs
+crates/lsm-hello-ebpf/target/
+crates/lsm-hello-ebpf/src/vmlinux.rs
 vm/out/

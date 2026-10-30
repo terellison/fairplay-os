@@ -4,18 +4,23 @@ Prototype for the Gaming Workstation OS design doc: a crash-safe Perforce
 workspace (Part A), OS-level fairness primitives that anti-cheat vendors build
 on from user space (Part B), and resource lanes (Part C, later).
 
+New here, or lost in acronyms? Start with [docs/GUIDE.md](docs/GUIDE.md): what
+each piece does, how they fit, and a glossary.
+
 ## Layout
 
 | Path | Milestone | State |
 | --- | --- | --- |
 | `crates/safewrite` | A | Done, tested: temp file, fsync, rename, fsync dir |
-| `crates/assetguard` | 2 | Case check, ztag parser, digest verify tested; sync/rollback needs a test depot |
+| `crates/assetguard` | 2 | Snapshot, sync, verify, case check, rollback (files + have list); tested against a local p4d |
 | `crates/fairplay-common` | 3 | Shared map types |
+| `crates/lsm-hello-ebpf` | 1 | Smoke-test LSM program: logs every `file_open` by `cat` |
+| `crates/lsm-hello` | 1 | Loads it and prints its log |
 | `crates/fairplay-ebpf` | 3 | LSM program on `ptrace_access_check`; builds on the VM |
 | `crates/fairplayd` | 3-4 | Loads the program, registers PIDs, prints violations |
 | `crates/cheatsim` | 3 | Attacker: ptrace, process_vm_readv, /proc/pid/mem |
 | `crates/fairplay-attest` | 6 | API shape only |
-| `vm/` | 1 | VM creation, provisioning, and the milestone-1 check |
+| `vm/` | 1-2 | VM creation, provisioning, the milestone-1 check, the milestone-2 test |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
 
@@ -35,6 +40,31 @@ In another terminal:
     ./vm/provision-guest.sh && sudo reboot
     # after reboot:
     ./vm/check-milestone1.sh
+
+Then prove an LSM program loads and runs:
+
+    cd crates/lsm-hello-ebpf
+    aya-tool generate file > src/vmlinux.rs
+    cargo build --release
+    cd ../..
+    cargo build --release -p lsm-hello
+    sudo ./target/release/lsm-hello \
+      --obj crates/lsm-hello-ebpf/target/bpfel-unknown-none/release/lsm-hello
+    # another terminal: each file cat opens shows up as a log line
+    cat /etc/hostname
+
+## Milestone 2: assetguard
+
+Inside the VM (needs `p4` and `p4d`, which `provision-guest.sh` installs):
+
+    ./vm/test-milestone2.sh
+
+It starts a throwaway Perforce server on 127.0.0.1:16661, breaks syncs four
+ways (p4 killed mid-file, persistent and one-off truncation, a case
+collision), and checks with `p4 have` and `p4 reconcile -n` that each one
+either rolled back cleanly or was repaired. It cleans up after itself and
+doesn't touch `/work/ws`. See [docs/GUIDE.md](docs/GUIDE.md#part-a-the-file-layer)
+for what it's proving.
 
 ## Milestone 3: protected process
 
@@ -71,6 +101,11 @@ process, so a block proves the LSM program did it.
   measured on real Linux hardware with a GPU.
 
 ## Building here vs on the VM
+
+CI (`.github/workflows/ci.yml`) runs on every PR: fmt, clippy, unit tests,
+both eBPF builds, the full milestone 2 test, and shellcheck. It can't load BPF
+programs, so milestones 1 and 3 still need a run on the VM; see
+[docs/GUIDE.md](docs/GUIDE.md#what-ci-checks).
 
 User-space crates build and test anywhere Linux runs: `cargo test --workspace`.
 The eBPF crate needs nightly, `bpf-linker`, and `vmlinux.rs` generated from the

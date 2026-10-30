@@ -48,12 +48,22 @@ if ! command -v rustup >/dev/null; then
   # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
 fi
-rustup toolchain install nightly --component rust-src
+# The eBPF crates pin an exact nightly in rust-toolchain.toml; install that one.
+NIGHTLY="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$(dirname "$0")/../crates/fairplay-ebpf/rust-toolchain.toml")"
+rustup toolchain install "$NIGHTLY" --component rust-src
 # bpf-linker from source needs a matching LLVM dev install; use the prebuilt
 # release binary instead (the upstream-recommended route).
 command -v cargo-binstall >/dev/null || cargo install --locked cargo-binstall
-command -v bpf-linker >/dev/null || cargo binstall -y bpf-linker
-command -v aya-tool >/dev/null || cargo install --git https://github.com/aya-rs/aya aya-tool
+# Versions match CI (.github/workflows/ci.yml); bump both together.
+command -v bpf-linker >/dev/null || cargo binstall -y bpf-linker@0.12.0
+# aya-tool shells out to bindgen to turn kernel BTF into Rust structs.
+command -v bindgen >/dev/null || cargo install --locked bindgen-cli@0.73.2
+command -v aya-tool >/dev/null || cargo install --git https://github.com/aya-rs/aya --rev 1bf09c59 aya-tool
+
+echo "== Perforce p4 + p4d (milestone 2 runs a throwaway local server)"
+if ! command -v p4 >/dev/null || ! command -v p4d >/dev/null; then
+  "$(dirname "$0")/install-p4.sh"
+fi
 
 echo
 echo "Done. Reboot (sudo reboot), then run vm/check-milestone1.sh."
