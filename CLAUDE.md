@@ -76,7 +76,8 @@ its last push.
    changed). CI can't load BPF programs: if you touch `crates/*-ebpf` or `fairplayd`, run
    the milestone 1/3 tests on the VM and paste the output into the PR.
 5. **Open the PR** with what changed, why, and how you tested it, and request the owner's
-   review so the Approve option shows up for them: `gh pr create --reviewer terellison ...`.
+   review so the Approve option shows up for them (REST, because Ubuntu's gh 2.45 breaks on
+   `gh pr edit`): `gh api -X POST repos/terellison/fairplay-os/pulls/<n>/requested_reviewers -f 'reviewers[]=terellison'`.
    Then arm auto-merge: `gh pr merge --auto --squash`. It merges once the owner approves
    and checks pass; never try to merge any other way.
 6. **When `master` moves**, update your branch (merge or rebase `origin/master`) so checks
