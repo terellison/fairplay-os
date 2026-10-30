@@ -7,8 +7,12 @@
 //!     assetguard sync --workspace /work/ws --snapshots /work/.snapshots [-- //game/...]
 //!     assetguard verify [//game/...]
 //!     assetguard case-check /work/ws
+//!
+//! `ASSETGUARD_P4` overrides the p4 binary (the milestone 2 test uses it to
+//! inject faults into a real sync).
 
 mod casecheck;
+mod have;
 mod verify;
 mod ztag;
 
@@ -73,8 +77,15 @@ fn main() -> ExitCode {
 }
 
 fn sync(workspace: &Path, snapshots: &Path, paths: &[String]) -> Result<bool> {
+    // Record the server's have list before touching anything: restoring files
+    // without restoring it would leave the server believing we have the new
+    // revisions, and the next sync would skip them.
+    let before = have::read(&p4(&with_paths(&["have"], paths))?);
     let snap = snapshot(workspace, snapshots)?;
-    eprintln!("snapshot: {}", snap.display());
+    let have_file = snap.with_extension("have");
+    safewrite::write(&have_file, have::serialize(&before))
+        .with_context(|| format!("saving have list to {}", have_file.display()))?;
+    eprintln!("snapshot: {} ({} files)", snap.display(), before.len());
 
     let ok = (|| -> Result<bool> {
         p4(&with_paths(&["sync"], paths))?;
@@ -96,7 +107,7 @@ fn sync(workspace: &Path, snapshots: &Path, paths: &[String]) -> Result<bool> {
             if let Err(e) = &ok {
                 eprintln!("sync failed: {e:#}");
             }
-            rollback(workspace, &snap)?;
+            rollback(workspace, &snap, &before, paths)?;
             eprintln!("rolled back to {}", snap.display());
             Ok(false)
         }
@@ -149,8 +160,7 @@ fn case_check(root: &Path) -> Result<bool> {
 
 fn snapshot(workspace: &Path, snapshots: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(snapshots)?;
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let dest = snapshots.join(format!("pre-sync-{ts}"));
+    let dest = fresh_name(snapshots, "pre-sync")?;
     run(
         "btrfs",
         &["subvolume", "snapshot", "-r", &s(workspace), &s(&dest)],
@@ -158,18 +168,21 @@ fn snapshot(workspace: &Path, snapshots: &Path) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// Move the broken workspace aside and put a writable copy of the snapshot in
-/// its place. Anything holding files open in the workspace keeps the old inodes;
-/// close the editor before rolling back.
-fn rollback(workspace: &Path, snap: &Path) -> Result<()> {
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let failed = workspace.with_file_name(format!(
-        "{}.failed-{ts}",
-        workspace
-            .file_name()
-            .context("workspace has no name")?
-            .to_string_lossy()
-    ));
+/// Move the broken workspace aside, put a writable copy of the snapshot in its
+/// place, and reset the server's have list to what it was before the sync.
+/// Anything holding files open in the workspace (including a shell whose cwd
+/// is inside it) keeps the old inodes; close the editor before rolling back.
+fn rollback(
+    workspace: &Path,
+    snap: &Path,
+    before: &have::HaveList,
+    paths: &[String],
+) -> Result<()> {
+    let name = workspace.file_name().context("workspace has no name")?;
+    let failed = fresh_name(
+        workspace.parent().context("workspace has no parent")?,
+        &format!("{}.failed", name.to_string_lossy()),
+    )?;
     std::fs::rename(workspace, &failed).context("moving failed workspace aside")?;
     run("btrfs", &["subvolume", "snapshot", &s(snap), &s(workspace)])?;
     eprintln!(
@@ -177,7 +190,31 @@ fn rollback(workspace: &Path, snap: &Path) -> Result<()> {
         failed.display()
     );
     // The have list on the server still reflects the failed sync; re-align it.
-    p4(&["flush", "//...#have"]).map(|_| ())
+    let now = have::read(&p4(&with_paths(&["have"], paths))?);
+    let specs = have::restore_specs(before, &now);
+    if specs.is_empty() {
+        return Ok(());
+    }
+    let list = snap.with_extension("flush");
+    safewrite::write(&list, specs.join("\n") + "\n")?;
+    p4(&["-x", &s(&list), "flush"])?;
+    eprintln!("have list restored ({} entries reset)", specs.len());
+    Ok(())
+}
+
+/// `dir/prefix-<unix time>`, with `-2`, `-3`... appended if that exists
+/// (a retry right after a failure lands in the same second).
+fn fresh_name(dir: &Path, prefix: &str) -> Result<PathBuf> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let base = dir.join(format!("{prefix}-{ts}"));
+    let mut path = base.clone();
+    let mut n = 1;
+    // Check the .have sidecar too: it shares the snapshot's name.
+    while path.exists() || path.with_extension("have").exists() {
+        n += 1;
+        path = PathBuf::from(format!("{}-{n}", base.display()));
+    }
+    Ok(path)
 }
 
 fn with_paths<'a>(base: &[&'a str], paths: &'a [String]) -> Vec<&'a str> {
@@ -188,9 +225,10 @@ fn with_paths<'a>(base: &[&'a str], paths: &'a [String]) -> Vec<&'a str> {
 }
 
 fn p4(args: &[&str]) -> Result<String> {
+    let bin = std::env::var("ASSETGUARD_P4").unwrap_or_else(|_| "p4".into());
     let mut full = vec!["-ztag"];
     full.extend_from_slice(args);
-    run("p4", &full)
+    run(&bin, &full)
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<String> {
@@ -200,8 +238,9 @@ fn run(cmd: &str, args: &[&str]) -> Result<String> {
         .with_context(|| format!("running {cmd}"))?;
     if !out.status.success() {
         bail!(
-            "{cmd} {} failed: {}",
+            "{cmd} {} failed ({}): {}",
             args.join(" "),
+            out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }

@@ -31,6 +31,9 @@ pub struct Violation {
     pub hook: u32,
     /// The ptrace access mode bits the caller asked for.
     pub mode: u32,
+    /// The caller's comm, NUL-padded. Captured in the kernel because the
+    /// caller has often exited by the time user space reads the event.
+    pub comm: [u8; 16],
 }
 
 #[cfg(feature = "user")]

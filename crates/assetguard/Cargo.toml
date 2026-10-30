@@ -9,3 +9,4 @@ version.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 md-5 = "0.10"
+safewrite.workspace = true

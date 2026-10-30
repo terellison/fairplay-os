@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned so a new nightly can't break the build (or CI) on its own. Bump on
+# purpose: change the date, rebuild, and rerun the milestone tests.
+channel = "nightly-2026-10-29"
+components = ["rust-src", "rustfmt", "clippy"]
