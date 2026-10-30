@@ -45,4 +45,40 @@ Known VM limits:
 
 - Keep the design doc's split: the kernel enforces, user space decides, the server sets policy.
 - Prefer existing kernel mechanisms (BPF LSM, cgroups v2, IMA) over new kernel code.
-- Ask before committing or pushing; the user reviews changes first.
+- Never commit to or push `master`. All work goes through a PR; the owner's approval on the
+  PR is the review.
+
+## Working as an agent (GitHub)
+
+Several agents may work on this repo at once. Each acts on GitHub as the
+`fairplay-os-agents` GitHub App, never as the owner, so the owner's approval is a real
+second identity. `master` is protected by two rulesets: all four CI checks must pass on a
+branch that is up to date with `master`, and a PR needs the owner's approval given after
+its last push.
+
+1. **Check for overlap first:** `gh pr list` and read open PR titles. If another agent is
+   already on the same files or milestone, pick something else or say so.
+2. **Get a token** (1 hour, this repo only; config in `~/.config/fairplay-agents/`):
+   ```
+   export GH_TOKEN="$(tools/gh-app-token.sh)"
+   git remote set-url origin "https://x-access-token:$GH_TOKEN@github.com/terellison/fairplay-os.git"
+   ```
+   Commit as the App:
+   ```
+   export GIT_AUTHOR_NAME='fairplay-os-agents[bot]' GIT_COMMITTER_NAME='fairplay-os-agents[bot]'
+   export GIT_AUTHOR_EMAIL='350097673+fairplay-os-agents[bot]@users.noreply.github.com'
+   export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+   ```
+3. **One task, one branch:** `agent/<short-topic>` from the latest `origin/master`. Keep the
+   PR small and about one thing; small PRs from parallel agents conflict less.
+4. **Before pushing:** run what CI runs (`cargo fmt --check`, `cargo clippy -- -D warnings`,
+   `cargo test --workspace`, shellcheck, and `vm/test-milestone2.sh` if assetguard or `vm/`
+   changed). CI can't load BPF programs: if you touch `crates/*-ebpf` or `fairplayd`, run
+   the milestone 1/3 tests on the VM and paste the output into the PR.
+5. **Open the PR** with what changed, why, and how you tested it. Then arm auto-merge:
+   `gh pr merge --auto --squash`. It merges once the owner approves and checks pass;
+   never try to merge any other way.
+6. **When `master` moves**, update your branch (merge or rebase `origin/master`) so checks
+   rerun against what will actually land. Any push after the owner's approval resets it.
+7. **The App can't edit `.github/workflows/`.** If CI needs changing, describe the change
+   in the PR or an issue and the owner will make it.
