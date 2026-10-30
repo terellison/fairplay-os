@@ -54,8 +54,9 @@ Known VM limits:
 Several agents may work on this repo at once. Each acts on GitHub as the
 `fairplay-os-agents` GitHub App, never as the owner, so the owner's approval is a real
 second identity. `master` is protected by two rulesets: all four CI checks must pass on a
-branch that is up to date with `master`, and a PR needs the owner's approval given after
-its last push.
+branch that is up to date with `master`, and a PR needs the owner's approval. New
+commits on the branch dismiss an earlier approval; merging `master` in (the owner's
+Update branch button) does not.
 
 1. **Check for overlap first:** `gh pr list` and read open PR titles. If another agent is
    already on the same files or milestone, pick something else or say so.
@@ -85,6 +86,7 @@ its last push.
    Then arm auto-merge: `gh pr merge --auto --squash`. It merges once the owner approves
    and checks pass; never try to merge any other way.
 6. **When `master` moves**, update your branch (merge or rebase `origin/master`) so checks
-   rerun against what will actually land. Any push after the owner's approval resets it.
+   rerun against what will actually land. A merge of `master` keeps the owner's approval;
+   any other new commit dismisses it, and the owner has to approve again.
 7. **The App can't edit `.github/workflows/`.** If CI needs changing, describe the change
    in the PR or an issue and the owner will make it.
