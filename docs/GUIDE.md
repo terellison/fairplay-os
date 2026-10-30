@@ -2,7 +2,8 @@
 
 A plain-English tour of what's in this repo, how the pieces fit, and what every
 acronym means. The [README](../README.md) has the commands; this file has the
-"why". Terms in **bold** are in the [glossary](#glossary) at the bottom.
+"why"; the [design doc](design.md) is the plan everything follows. Terms in
+**bold** are in the [glossary](#glossary) at the bottom.
 
 ## The one-paragraph version
 
