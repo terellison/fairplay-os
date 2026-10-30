@@ -26,6 +26,7 @@ pass=0; fail=0
 ok()  { echo "PASS  $1"; pass=$((pass+1)); }
 bad() { echo "FAIL  $1"; fail=$((fail+1)); }
 step() { echo; echo "== $1"; }
+indent() { sed 's/^/      /'; }
 
 cleanup() {
   [ -n "${P4D_PID:-}" ] && kill "$P4D_PID" 2>/dev/null && wait "$P4D_PID" 2>/dev/null
@@ -59,6 +60,7 @@ for _ in $(seq 50); do p4 info >/dev/null 2>&1 && break; sleep 0.1; done
 p4 info >/dev/null || { echo "p4d did not start; see $T/p4d.log" >&2; exit 2; }
 
 step "seed the depot: @1, then @2 (edits, an add, a delete)"
+# shellcheck disable=SC2030  # the author client only exists inside this subshell
 (
   set -e
   export P4CLIENT=author
@@ -126,7 +128,7 @@ check_at() {
   if diff <(want_have "$change") <(have_now) >/dev/null; then
     ok "$label: server have list is exactly @$change"
   else
-    bad "$label: server have list is not @$change"; diff <(want_have "$change") <(have_now) | sed 's/^/      /'
+    bad "$label: server have list is not @$change"; diff <(want_have "$change") <(have_now) | indent
   fi
   # reconcile compares every file's content with its have revision and finds
   # files on disk that p4 doesn't know about.
@@ -135,7 +137,7 @@ check_at() {
   if grep -q "no file(s) to reconcile" <<<"$rec"; then
     ok "$label: every file on disk matches its have revision (p4 reconcile -n)"
   else
-    bad "$label: disk differs from have list"; sed 's/^/      /' <<<"$rec"
+    bad "$label: disk differs from have list"; indent <<<"$rec"
   fi
 }
 
@@ -150,7 +152,11 @@ run_ag() {
 step "1. p4 killed mid-sync, a file half-written"
 run_ag "killed mid-sync" 1 env ASSETGUARD_P4="$T/bin/p4-fault" FAULT=kill
 check_at "killed mid-sync" 1
-ls -d "$T"/ws.failed-* >/dev/null 2>&1 && ok "killed mid-sync: broken workspace kept for inspection" || bad "killed mid-sync: no ws.failed-* kept"
+if ls -d "$T"/ws.failed-* >/dev/null 2>&1; then
+  ok "killed mid-sync: broken workspace kept for inspection"
+else
+  bad "killed mid-sync: no ws.failed-* kept"
+fi
 
 step "2. a file keeps arriving truncated (repair fails too)"
 run_ag "persistent truncation" 1 env ASSETGUARD_P4="$T/bin/p4-fault" FAULT=truncate-always
@@ -161,6 +167,7 @@ run_ag "one-off truncation" 0 env ASSETGUARD_P4="$T/bin/p4-fault" FAULT=truncate
 check_at "one-off truncation" 2
 
 step "4. the depot gains Art/Hero.uasset next to Art/hero.uasset"
+# shellcheck disable=SC2031  # as above: P4CLIENT=author is local to the subshell
 (
   export P4CLIENT=author
   cd "$T/author" && head -c 1000 /dev/urandom > Art/Hero.uasset &&

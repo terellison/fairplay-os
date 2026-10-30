@@ -102,6 +102,11 @@ process, so a block proves the LSM program did it.
 
 ## Building here vs on the VM
 
+CI (`.github/workflows/ci.yml`) runs on every PR: fmt, clippy, unit tests,
+both eBPF builds, the full milestone 2 test, and shellcheck. It can't load BPF
+programs, so milestones 1 and 3 still need a run on the VM; see
+[docs/GUIDE.md](docs/GUIDE.md#what-ci-checks).
+
 User-space crates build and test anywhere Linux runs: `cargo test --workspace`.
 The eBPF crate needs nightly, `bpf-linker`, and `vmlinux.rs` generated from the
 running kernel, so it builds on the VM.

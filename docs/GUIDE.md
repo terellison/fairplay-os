@@ -224,6 +224,28 @@ So `crates/fairplay-ebpf` and `crates/lsm-hello-ebpf` are their own Cargo
 workspaces, excluded from the main one. Each pairs with a normal user-space
 crate that loads it using **aya**.
 
+## What CI checks
+
+Every pull request (and every push to `master`) runs
+`.github/workflows/ci.yml` on GitHub's Ubuntu 24.04 x86_64 machines:
+
+| Job | What it proves |
+| --- | --- |
+| User space | Formatting, clippy (warnings are errors), all unit tests, release builds |
+| eBPF programs | Both BPF programs build, format and lint cleanly against the runner's kernel, and each contains its LSM hook |
+| Milestone 2 | The full `vm/test-milestone2.sh`, on a throwaway btrfs disk image with a real `p4d` |
+| Shell scripts | `shellcheck` on everything in `vm/` |
+
+**What it can't prove:** GitHub's machines don't boot with BPF LSM turned on,
+so CI can't *load* our BPF programs. Milestones 1 and 3 (and later 5) are
+still tested by hand on the VM, as in the README. If a PR touches
+`crates/*-ebpf` or `fairplayd`, run those before merging.
+
+Tool versions are pinned in both CI and `vm/provision-guest.sh`. This
+includes the exact Rust nightly, in each eBPF crate's `rust-toolchain.toml`.
+A new upstream release can't break a build on its own; updating is a
+deliberate change to both files.
+
 ## Glossary
 
 **Kernel and BPF**
@@ -329,6 +351,10 @@ crate that loads it using **aya**.
   **utf16** files are also converted on download. assetguard skips both.
 
 **VM and build**
+
+- **CI** (continuous integration): a server that builds and tests every
+  change automatically. Ours is **GitHub Actions**; a **workflow** is its
+  config file, a **job** one machine's worth of steps, a **runner** that machine.
 
 - **VM** (virtual machine): a computer emulated in software.
 - **QEMU**: the VM software. **HVF** (Hypervisor.framework) is Apple's API
