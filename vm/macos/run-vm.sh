@@ -22,6 +22,7 @@ if [ "$TPM" = "on" ]; then
     --flags startup-clear \
     --daemon
   trap 'pkill -f "swtpm socket --tpm2 --tpmstate dir=$DIR/tpm" || true' EXIT
+  # shellcheck disable=SC2054  # commas are QEMU option syntax, not separators
   TPM_ARGS=(
     -chardev socket,id=chrtpm,path="$DIR/tpm/swtpm.sock"
     -tpmdev emulator,id=tpm0,chardev=chrtpm

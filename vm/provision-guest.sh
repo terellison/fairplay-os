@@ -48,37 +48,21 @@ if ! command -v rustup >/dev/null; then
   # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
 fi
-rustup toolchain install nightly --component rust-src
+# The eBPF crates pin an exact nightly in rust-toolchain.toml; install that one.
+NIGHTLY="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$(dirname "$0")/../crates/fairplay-ebpf/rust-toolchain.toml")"
+rustup toolchain install "$NIGHTLY" --component rust-src
 # bpf-linker from source needs a matching LLVM dev install; use the prebuilt
 # release binary instead (the upstream-recommended route).
 command -v cargo-binstall >/dev/null || cargo install --locked cargo-binstall
-command -v bpf-linker >/dev/null || cargo binstall -y bpf-linker
+# Versions match CI (.github/workflows/ci.yml); bump both together.
+command -v bpf-linker >/dev/null || cargo binstall -y bpf-linker@0.12.0
 # aya-tool shells out to bindgen to turn kernel BTF into Rust structs.
-command -v bindgen >/dev/null || cargo install --locked bindgen-cli
-command -v aya-tool >/dev/null || cargo install --git https://github.com/aya-rs/aya aya-tool
+command -v bindgen >/dev/null || cargo install --locked bindgen-cli@0.73.2
+command -v aya-tool >/dev/null || cargo install --git https://github.com/aya-rs/aya --rev 1bf09c59 aya-tool
 
 echo "== Perforce p4 + p4d (milestone 2 runs a throwaway local server)"
-# Official arm64 builds. Perforce replaces patch builds in place within a
-# release, so check the published SHA256SUMS and the GPG signature against
-# Perforce's package-signing key (fingerprint pinned here) instead of pinning
-# file hashes.
-P4_REL="${P4_REL:-r25.2}"
-P4_KEY_FPR="E58131C0AEA7B082C6DC4C937123CB760FF18869"
 if ! command -v p4 >/dev/null || ! command -v p4d >/dev/null; then
-  dl="$(mktemp -d)"
-  base="https://cdist2.perforce.com/perforce/$P4_REL/bin.linux26aarch64"
-  for f in p4 p4.asc p4d p4d.asc SHA256SUMS; do curl -fsSL -o "$dl/$f" "$base/$f"; done
-  curl -fsSL -o "$dl/perforce.pubkey" https://package.perforce.com/perforce.pubkey
-  for f in p4 p4d; do
-    want="$(awk -v f="*$f" '$2==f {print $1}' "$dl/SHA256SUMS")"
-    echo "$want  $dl/$f" | sha256sum -c --quiet
-    GNUPGHOME="$dl/gnupg" bash -c "mkdir -m700 \$GNUPGHOME && gpg -q --import '$dl/perforce.pubkey' 2>/dev/null &&
-      gpg --status-fd 1 --verify '$dl/$f.asc' '$dl/$f' 2>/dev/null | grep -q 'VALIDSIG.* $P4_KEY_FPR\$'" ||
-      { echo "p4: bad signature on $f" >&2; exit 1; }
-    rm -rf "$dl/gnupg"
-  done
-  sudo install -m755 "$dl/p4" "$dl/p4d" /usr/local/bin/
-  rm -rf "$dl"
+  "$(dirname "$0")/install-p4.sh"
 fi
 
 echo

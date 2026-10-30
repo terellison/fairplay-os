@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Milestone 1 exit check. Run inside the VM after provisioning and a reboot.
-set -uo pipefail
 # shellcheck disable=SC2016  # single-quoted checks run in a child bash on purpose
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+NIGHTLY="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$REPO/crates/fairplay-ebpf/rust-toolchain.toml")"
 
 pass=0; fail=0; skip=0
 skip() { echo "SKIP  $1 ($2)"; skip=$((skip+1)); }
@@ -27,7 +30,7 @@ check "IMA policy on cmdline"      grep -qw ima_policy=tcb /proc/cmdline
 check "IMA measuring"              bash -c '[ "$(sudo head -n 5 /sys/kernel/security/ima/ascii_runtime_measurements | wc -l)" -ge 2 ]'
 check "btrfs workspace mounted"    bash -c 'findmnt -n -o FSTYPE /work | grep -q btrfs'
 check "workspace is a subvolume"   sudo btrfs subvolume show /work/ws
-check "nightly + rust-src"         bash -c 'rustup component list --toolchain nightly --installed | grep -q rust-src'
+check "$NIGHTLY + rust-src" bash -c "rustup component list --toolchain $NIGHTLY --installed | grep -q rust-src"
 check "bpf-linker installed"       command -v bpf-linker
 check "aya-tool installed"         command -v aya-tool
 check "bindgen installed (aya-tool needs it)" command -v bindgen
