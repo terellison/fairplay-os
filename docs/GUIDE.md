@@ -179,6 +179,13 @@ different kernel, and the server can act on that.
 - Grab information about the caller (such as its **comm**) *inside* the BPF
   program. By the time `fairplayd` reads the event, a short-lived attacker has
   usually exited.
+- Kernel structs change shape between versions. `struct file`'s `f_path` is
+  a plain field on the VM's 6.8 kernel, but on 7.0 (which CI found) it sits
+  inside an anonymous union. Our programs are compiled against one kernel's
+  layout (`vmlinux.rs`) rather than using **CO-RE** (relocations that let one
+  binary adapt at load time). So `lsm-hello-ebpf/build.rs` works out where
+  the field lives at build time. Prefer fields that rarely move, like
+  `task_struct.tgid`.
 
 ## Part C: resource lanes
 
@@ -276,6 +283,9 @@ deliberate change to both files.
 - **aya-tool**, **bindgen**, **bpf-linker**: build tools; see
   [above](#why-the-bpf-crates-build-separately).
 - **Hook**: a point in the kernel where our program gets called.
+- **CO-RE** (Compile Once, Run Everywhere): BPF relocations that let one
+  compiled program adapt to each kernel's struct layout at load time. We don't
+  use it yet, so programs are built per kernel.
 - **EPERM** / **EACCES**: "operation not permitted" / "permission denied"
   error codes.
 - **cgroup** (control group, v2): the kernel's way to group processes and give
