@@ -61,8 +61,11 @@ its last push.
 2. **Get a token** (1 hour, this repo only; config in `~/.config/fairplay-agents/`):
    ```
    export GH_TOKEN="$(tools/gh-app-token.sh)"
-   git remote set-url origin "https://x-access-token:$GH_TOKEN@github.com/terellison/fairplay-os.git"
+   git push "https://x-access-token:$GH_TOKEN@github.com/terellison/fairplay-os.git" HEAD:refs/heads/agent/<topic>
    ```
+   Push with the URL inline like this, not via `origin`: `origin` may be SSH (the owner's
+   key), and `git remote set-url` writes the token into `.git/config`, which every worktree
+   shares, so parallel agents overwrite each other and expired tokens stay on disk.
    Commit as the App:
    ```
    export GIT_AUTHOR_NAME='fairplay-os-agents[bot]' GIT_COMMITTER_NAME='fairplay-os-agents[bot]'
