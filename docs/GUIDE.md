@@ -7,13 +7,17 @@ acronym means. The [README](../README.md) has the commands; this file has the
 
 ## The one-paragraph version
 
-We're prototyping a Linux setup for people who both *make* games and *play*
-them. It has three jobs. **A:** keep huge game-asset checkouts from getting
-half-broken when a download dies midway. **B:** let the operating system itself
-protect a running game from cheat tools, and later prove to a game server that
-it did, so anti-cheat companies don't need to install their own code into the
-kernel. **C:** keep the game smooth while big background jobs (compiles, asset
-syncs) run. Everything is developed in a Linux virtual machine on a Mac.
+We're prototyping a Linux-based operating system to replace Windows, both on
+gamers' PCs and on game developers' workstations. The headline for players:
+competitive games without **kernel-level anti-cheat**, which gamers dislike
+because it runs a vendor's code with full control of the machine. It has three
+jobs. **A:** keep huge game-asset checkouts from getting half-broken when a
+download dies midway. **B:** let the operating system itself protect a running
+game from cheat tools, and later prove to a game server that it did, so
+anti-cheat companies don't need to install their own code into the kernel.
+**C:** keep the game smooth while other programs (downloads, browsers,
+compiles) run. Everything is developed in a Linux virtual machine on a Mac;
+the parts that need a real gaming PC come later.
 
 ## Where things stand
 
@@ -23,9 +27,36 @@ syncs) run. Everything is developed in a Linux virtual machine on a Mac.
 | 2 | assetguard vs a real Perforce server | Done | `./vm/test-milestone2.sh` |
 | 3 | Protected process | Done | `cheatsim` + `fairplayd` (README) |
 | 4 | fairplayd socket API | Done | `./vm/test-milestone4.sh` |
-| 5 | Block `/dev/uinput` during a session | Not started | |
+| 8 | Protection follows the game's child processes | Next | |
+| 9 | fairplayd protects itself from root | Not started | |
+| 5 | Report fake input devices and who made them | Not started | |
+| 7 | Only approved code may load into the game | Not started | |
+| 10 | Vendor anti-cheat: signed and sandboxed | Not started | |
 | 6 | Attestation | Blocked: the VM has no TPM | |
-| 7 | Executable-mapping allowlist | Stretch | |
+| 11 | Player-mode system image | Needs an x86 PC | |
+| 12 | A Windows game under **Proton**, protected | Needs an x86 PC | |
+
+The numbers are names; the table is in the order we plan to do them. The
+[design doc](design.md#milestones) has each one's exit test.
+
+## Player mode and developer mode
+
+On a gamer's PC the owner has full admin rights (**root**), and the owner
+might be the cheater. On a developer's PC the owner needs debuggers and
+unsigned code. So the OS boots in one of two **modes**:
+
+- **Player mode** (the default): the system files are signed and read-only,
+  kernel **lockdown** is on, and root can still install apps and change
+  settings but can't switch off the game protection. Turning it off takes a
+  reboot, and the game's server can tell.
+- **Developer mode** (picked at boot): everything is open. Games still run;
+  the server just knows the machine is in developer mode and decides what to
+  allow, such as casual matches only.
+
+A game can never switch modes itself. It can only ask the OS to show "Ranked
+needs player mode. Restart now?", and the user decides. Discord, Spotify, a
+browser and OBS keep running alongside the game in either mode; they just can't
+read or tamper with it.
 
 ## The big picture
 
@@ -352,7 +383,8 @@ deliberate change to both files.
 - **cgroup** (control group, v2): the kernel's way to group processes and give
   each group a share of CPU, memory and I/O.
 - **uinput**: `/dev/uinput` lets a program create a fake keyboard or mouse.
-  Aimbots use it, which is why milestone 5 blocks it during a protected session.
+  Aimbots use it, but so do Steam Input and accessibility tools, so milestone
+  5 reports such devices (and who made them) rather than blocking them.
 - **lockdown**: a kernel mode that stops even root from changing the running
   kernel.
 
@@ -426,6 +458,46 @@ deliberate change to both files.
   number (**nonce**) from the server, so it can't be replayed.
 - **AK** (Attestation Key): the TPM key that signs quotes.
 - **Attestation**: proving to a remote party what software a machine is running.
+- **ECDAA**: a TPM signature scheme that proves "this came from a genuine
+  TPM" without saying *which* TPM, so attestation can't track a machine.
+- **Taint flag**: a possible later feature: a one-way TPM record that
+  something developer-only happened since boot.
+
+**Players and the desktop**
+
+- **Ring 0**: the CPU's most privileged level, where the kernel runs. Code
+  there can do anything to the machine, and a bug in it crashes everything.
+- **Kernel-level anti-cheat**: anti-cheat that installs its own driver into
+  the kernel (ring 0), e.g. Riot's Vanguard. What this project replaces.
+- **Player mode / developer mode**: the two ways the OS can boot; see
+  [above](#player-mode-and-developer-mode).
+- **Proton / Wine**: Wine runs Windows programs on Linux by providing the
+  Windows system functions they expect. Proton is Valve's Wine bundle for
+  Steam games. **wineserver** is a helper process Wine runs alongside each
+  game.
+- **DLL**: a Windows code library. Cheats inject their own DLL into a game;
+  under Wine, `WINEDLLOVERRIDES` and `WINEDLLPATH` can do that, the way
+  `LD_PRELOAD` does for Linux programs.
+- **X11 / Wayland / XWayland**: ways programs draw windows and get input on
+  Linux. X11 is the old one, where any program can read other windows and
+  fake input (its **XTest** feature). Wayland keeps programs apart.
+  XWayland runs old X11 programs, many Proton games among them, on Wayland.
+- **Overlay**: something drawn on top of a game, like the Steam or Discord
+  overlay. Most work by loading code into the game, so they need approval.
+- **Steam Input**: Steam's controller remapping, which creates virtual
+  controllers through uinput.
+- **Flatpak**: a way to install desktop apps in their own sandbox, without
+  needing root.
+- **Landlock**: a Linux feature that lets a program be confined to the files
+  it's allowed to touch. We'd use it to keep the vendor's anti-cheat away
+  from your files.
+- **Sandbox**: confining a program so it can only reach what it needs.
+- **Atomic update / rollback**: an update applies all at once or not at all,
+  and a bad one can be undone by booting the previous version.
+- **shim**: a small, Microsoft-signed boot program that lets Linux boot with
+  Secure Boot on ordinary PCs.
+- **x86 / x86_64**: the Intel and AMD CPU family that gaming PCs (and Windows
+  games) use. The Mac VM is arm64, so it can't run them.
 
 **Files and Perforce**
 
