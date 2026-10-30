@@ -13,14 +13,15 @@ each piece does, how they fit, and a glossary.
 | --- | --- | --- |
 | `crates/safewrite` | A | Done, tested: temp file, fsync, rename, fsync dir |
 | `crates/assetguard` | 2 | Snapshot, sync, verify, case check, rollback (files + have list); tested against a local p4d |
-| `crates/fairplay-common` | 3 | Shared map types |
+| `crates/fairplay-common` | 3 | Types shared by the BPF program and user space |
+| `crates/fairplay-api` | 4 | The socket protocol (JSON types), a client, and `fairplayctl` |
 | `crates/lsm-hello-ebpf` | 1 | Smoke-test LSM program: logs every `file_open` by `cat` |
 | `crates/lsm-hello` | 1 | Loads it and prints its log |
 | `crates/fairplay-ebpf` | 3 | LSM program on `ptrace_access_check`; builds on the VM |
-| `crates/fairplayd` | 3-4 | Loads the program, registers PIDs, prints violations |
+| `crates/fairplayd` | 3-4 | Loads the program, owns the PROTECTED map, serves the socket API, streams violations |
 | `crates/cheatsim` | 3 | Attacker: ptrace, process_vm_readv, /proc/pid/mem |
 | `crates/fairplay-attest` | 6 | API shape only |
-| `vm/` | 1-2 | VM creation, provisioning, the milestone-1 check, the milestone-2 test |
+| `vm/` | 1-4 | VM creation, provisioning, the milestone-1 check, the milestone-2 and milestone-4 tests |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
 
@@ -89,6 +90,50 @@ Inside the VM:
 The attacker runs as root on purpose. Normal kernel rules let root read any
 process, so a block proves the LSM program did it.
 
+Since milestone 4, `fairplayd` also serves its socket API while it runs (on
+`/run/fairplayd.sock`; `--socket` picks another path). `--protect` still
+works as above, for a process that is already running.
+
+## Milestone 4: the socket API
+
+`fairplayd` serves the design doc's vendor-facing API over a Unix socket,
+one JSON object per line:
+
+| Call | Who may call it | What it does |
+| --- | --- | --- |
+| `launch_protected` | root, or the `fairplay-launcher` group | Starts a program protected from its first instruction, as the launcher (never as root by default). `join` starts it inside an existing session's protection domain: that's how the vendor's anti-cheat gets in. |
+| `session_status` | the session's launcher or user, its own processes, root | Protected or not, the game's state and exit code, members, violation count, kernel lockdown mode, virtual input devices present |
+| `violations` | same | A stream: one event per denied attempt (process, its executable, the hook), pushed as it happens |
+| `attest` | anyone | `unavailable` until milestone 6 (no TPM in the VM); echoes the nonce |
+| `list_sessions` | anyone (sees their own) | For humans |
+
+The exit test, inside the VM, as your normal user:
+
+    ./vm/test-milestone4.sh
+
+It builds everything, starts its own `fairplayd`, launches `cheatsim game`
+through the socket as you (with the launcher group added via `setpriv`; your
+account isn't changed), launches a mock anti-cheat written in Python into the
+game's domain, attacks the game as root (0/3 leak), and checks that the mock
+vendor's stream got exactly one event per attempt. It also checks the
+authorization rules, that a domain member *can* read the game, `attest`,
+and that the game's PID leaves the kernel map when it exits. It cleans up
+after itself.
+
+By hand:
+
+    sudo groupadd --system fairplay-launcher && sudo usermod -aG fairplay-launcher $USER
+    # log out and back in for the group to apply, then:
+    sudo ./target/release/fairplayd \
+      --obj crates/fairplay-ebpf/target/bpfel-unknown-none/release/fairplay
+    # another terminal:
+    ./target/release/fairplayctl launch -- ./target/release/cheatsim game
+    ./target/release/fairplayctl violations 1      # streams; leave it running
+    # a third terminal (pid and addr as printed by the game):
+    sudo ./target/release/cheatsim attack --pid <pid> --addr <addr>
+    ./target/release/fairplayctl status 1
+    ./target/release/fairplayctl attest
+
 ## Known gaps on arm64 QEMU
 
 - **Secure Boot.** Homebrew's arm64 UEFI firmware has no Secure Boot keys
@@ -104,7 +149,7 @@ process, so a block proves the LSM program did it.
 
 CI (`.github/workflows/ci.yml`) runs on every PR: fmt, clippy, unit tests,
 both eBPF builds, the full milestone 2 test, and shellcheck. It can't load BPF
-programs, so milestones 1 and 3 still need a run on the VM; see
+programs, so milestones 1, 3 and 4 still need a run on the VM; see
 [docs/GUIDE.md](docs/GUIDE.md#what-ci-checks).
 
 User-space crates build and test anywhere Linux runs: `cargo test --workspace`.

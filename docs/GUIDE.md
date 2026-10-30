@@ -21,7 +21,7 @@ syncs) run. Everything is developed in a Linux virtual machine on a Mac.
 | 1 | VM baseline | Done | `./vm/check-milestone1.sh`, then `lsm-hello` (README) |
 | 2 | assetguard vs a real Perforce server | Done | `./vm/test-milestone2.sh` |
 | 3 | Protected process | Done | `cheatsim` + `fairplayd` (README) |
-| 4 | fairplayd socket API | Not started | |
+| 4 | fairplayd socket API | Done | `./vm/test-milestone4.sh` |
 | 5 | Block `/dev/uinput` during a session | Not started | |
 | 6 | Attestation | Blocked: the VM has no TPM | |
 | 7 | Executable-mapping allowlist | Stretch | |
@@ -149,10 +149,12 @@ read another's memory:
   not, it says no (**EPERM**) and writes a record to `VIOLATIONS`.
 - **`fairplay-common`**: the shared shape of those records, so the kernel side
   and the user side agree byte for byte.
-- **`fairplayd`**: the daemon. It loads the bouncer, writes PIDs into the
-  list, and prints a `DENIED` line for each record. Protection ends when it
-  exits, so a crashed `fairplayd` fails open, not closed. Milestone 4 turns its
-  command-line flags into a socket API that games and anti-cheat programs call.
+- **`fairplayd`**: the **daemon**. It loads the bouncer, writes PIDs into the
+  list, prints a `DENIED` line for each record, and answers games and
+  anti-cheat programs over a socket (milestone 4, below). Protection ends
+  when it exits, so a crashed `fairplayd` fails open, not closed.
+- **`fairplayctl`** (in `crates/fairplay-api`): a small command-line client
+  for that socket, for people and tests.
 - **`cheatsim`**: the test cheat. `cheatsim game` holds a secret number in
   memory; `cheatsim attack` tries all three paths to read it. It runs as
   **root** on purpose: normally root may read anything, so a block proves it
@@ -164,6 +166,64 @@ read another's memory:
   ran. On request, the TPM signs those records (a **quote**) and the game
   company's server checks them: was it a known kernel, was `fairplayd` running,
   was our bouncer loaded? The OS only reports facts; the server decides.
+
+### The socket API (milestone 4)
+
+Programs talk to `fairplayd` through a **Unix domain socket**,
+`/run/fairplayd.sock`: a file-like address that only programs on the same
+machine can connect to. Each request and each answer is one line of
+**JSON**. The calls follow the design doc's "vendor-facing API":
+
+- **`launch_protected`**: "start this game, protected". Only a *launcher*
+  may ask: root, or a member of the `fairplay-launcher` group. `fairplayd`
+  starts the program itself, so there's no moment where the game runs
+  unprotected: it **forks** a child, the child waits on a pipe, `fairplayd`
+  puts the child's PID in the `PROTECTED` list, and only then lets the child
+  switch to the launcher's user and start the game. The game never runs as
+  root unless root explicitly asks for that. Variables like `LD_PRELOAD`,
+  which tell Linux to load extra code into a program, are dropped (the
+  design doc's "clean launch environment"), and the game gets
+  **no_new_privs**, so it can't gain privileges later. With `join`, the
+  launcher starts a second program *inside* the game's protection domain:
+  that's how the vendor's anti-cheat gets permission to inspect the game.
+- **`session_status`**: is it protected? Plus the game's state (running, or
+  its exit code), who's in its domain, how many attempts were blocked, the
+  kernel's **lockdown** mode, and whether any virtual input devices (fake
+  keyboards and mice, the kind aimbots make) exist. Called without a session,
+  it answers about the caller's own session, which is what an anti-cheat
+  sitting next to the game wants.
+- **`violations`**: a live **stream**. The caller subscribes once, and every
+  denied attempt is pushed to it as it happens: which process, which
+  executable, which hook. Vendors get detection signal without a driver.
+- **`attest`**: will return the TPM's signed report (milestone 6). The VM has
+  no TPM, so for now it answers `unavailable`, honestly, and echoes the
+  nonce it was given.
+
+**How it knows who's calling.** The kernel tells it. When a program
+connects, `fairplayd` asks the kernel for the caller's process ID, user and
+groups (**SO_PEERCRED**, **SO_PEERGROUPS**); nothing in a request can claim
+to be someone else. Each user sees only their own sessions; root sees all.
+The game's own anti-cheat (a process in the session) may see its session too.
+
+**Cleaning up.** When a protected program exits, `fairplayd` removes its PID
+from the list *before* **reaping** it. Until it's reaped, the exited process
+is a **zombie** whose PID the kernel won't hand out again, so a new, unrelated
+process can never inherit the protection.
+
+**Milestone 4's test** (`vm/test-milestone4.sh`) plays every part: a launcher
+starts `cheatsim game`, a mock anti-cheat (a short Python script that speaks
+the JSON directly) joins its domain and subscribes to violations, and
+`cheatsim attack` runs as root. The attack must leak nothing, and the mock
+vendor must receive exactly three events, one per attempt, each naming the
+process, its executable and the hook.
+
+"Which executable" is read inside the kernel, like the process name, because
+the attacker is often gone by the time `fairplayd` could look it up. The BPF
+program follows `task->mm->exe_file` to the file's name. Those structs are
+among the ones whose layout moves between kernels, so `fairplay-ebpf/build.rs`
+finds each field in `vmlinux.rs` at build time, the same trick as
+`lsm-hello-ebpf`. The full path is added from user space when the caller is
+still running.
 
 **"Best-effort"** is deliberate. Someone with physical access and a custom
 kernel can defeat any of this. The point is that attestation then *shows* a
@@ -244,8 +304,8 @@ Every pull request (and every push to `master`) runs
 | Shell scripts | `shellcheck` on everything in `vm/` |
 
 **What it can't prove:** GitHub's machines don't boot with BPF LSM turned on,
-so CI can't *load* our BPF programs. Milestones 1 and 3 (and later 5) are
-still tested by hand on the VM, as in the README. If a PR touches
+so CI can't *load* our BPF programs. Milestones 1, 3 and 4 (and later 5)
+are still tested on the VM, as in the README. If a PR touches
 `crates/*-ebpf` or `fairplayd`, run those before merging.
 
 Tool versions are pinned in both CI and `vm/provision-guest.sh`. This
@@ -307,6 +367,44 @@ deliberate change to both files.
   modify another.
 - **inode**: the file itself, as opposed to its name. A program that has a
   file open keeps the old inode even after the name points somewhere new.
+- **Daemon**: a program that runs in the background and serves requests.
+  `fairplayd` is one (the "d" is for daemon).
+- **uid / gid**: user ID and group ID, the numbers Linux uses for accounts
+  and groups. Root is uid 0. A process also has *supplementary groups*.
+- **fork / exec**: how Linux starts programs. `fork` makes a copy of the
+  running process; `exec` replaces that copy with a new program, keeping its
+  PID.
+- **Reap / zombie**: a finished process stays as a *zombie* (just its exit
+  code and PID) until its parent *reaps* it by collecting that code. Only then
+  can the PID be reused.
+- **no_new_privs**: a per-process flag that stops it, and anything it starts,
+  from gaining privileges (e.g. through setuid programs).
+- **Protection domain**: the set of processes allowed to read each other: a
+  game and its anti-cheat. Each launch gets its own.
+- **Session**: one `launch_protected` game plus anything launched into its
+  domain, as `fairplayd` tracks it.
+
+**The socket API**
+
+- **Unix domain socket**: a connection point that looks like a file
+  (`/run/fairplayd.sock`) but carries messages between programs on the same
+  machine, like a local network connection.
+- **SO_PEERCRED / SO_PEERGROUPS**: ways to ask the kernel who is on the
+  other end of a Unix socket: their process ID, uid, gid and groups. The
+  caller can't fake them.
+- **SCM_RIGHTS**: passing open files over a Unix socket. `fairplayctl launch`
+  hands over its terminal this way, so the game's output appears there.
+- **File descriptor (fd)**: a process's handle to an open file, pipe or
+  socket. 0, 1 and 2 are stdin, stdout and stderr.
+- **JSON**: a plain-text data format (`{"op":"attest","nonce":"00ff"}`), easy
+  for any language to read and write.
+- **Stream / subscribe**: instead of asking repeatedly, the client asks once
+  and the daemon keeps sending events on the same connection.
+- **tokio**: the Rust library `fairplayd` uses to serve many connections at
+  once.
+- **setpriv**: a command that runs another with a chosen uid, gid and groups.
+  The milestone 4 test uses it to act as a launcher without changing your
+  account.
 
 **Trust and attestation**
 
