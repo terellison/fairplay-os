@@ -1,6 +1,6 @@
 # fairplay-os
 
-Prototype for the Gaming Workstation OS design doc: a crash-safe Perforce
+Prototype for the Gaming Workstation OS [design doc](docs/design.md): a crash-safe Perforce
 workspace (Part A), OS-level fairness primitives that anti-cheat vendors build
 on from user space (Part B), and resource lanes (Part C, later).
 

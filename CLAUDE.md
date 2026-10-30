@@ -1,7 +1,8 @@
 # fairplay-os
 
 Prototype for a Linux-based gaming / game-dev workstation OS. Design doc:
-https://claude.ai/artifact/F4Z7ANrbVehsBtfonY9GdG (ask the user to paste a section if you need it).
+[docs/design.md](docs/design.md). Read the relevant part before designing anything; where this
+file adapts it to the VM (TPM, Secure Boot), this file wins.
 
 Three parts:
 - **A. File layer**: crash-safe Perforce workspaces on btrfs (`safewrite`, `assetguard`).
