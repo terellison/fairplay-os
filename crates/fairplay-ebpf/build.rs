@@ -31,7 +31,7 @@ fn main() {
         code += &format!(
             "/// `&(*p).{field}`, wherever this kernel's `struct {ty}` keeps it.\n\
              #[inline(always)]\n\
-             unsafe fn {func}(p: *const {ty}) -> *const {field_ty} {{\n    \
+             pub(crate) unsafe fn {func}(p: *const {ty}) -> *const {field_ty} {{\n    \
              unsafe {{ core::ptr::addr_of!((*p).{access}) }}\n}}\n"
         );
     }

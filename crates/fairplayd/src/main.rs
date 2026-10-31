@@ -72,6 +72,14 @@ impl ProtectedMap for BpfMap {
 
 pub type Shared = Arc<Mutex<Daemon<BpfMap>>>;
 
+/// The LSM programs in the object, as (program name, kernel LSM hook), each
+/// from one module in `crates/fairplay-ebpf/src/hooks/`. All are loaded and
+/// attached at startup, and stay attached until fairplayd exits.
+const LSM_PROGRAMS: &[(&str, &str)] = &[
+    // (program name, LSM hook), one line per hook.
+    ("ptrace_access_check", "ptrace_access_check"),
+];
+
 fn main() -> Result<()> {
     let args = Args::parse();
     check_bpf_lsm_enabled()?;
@@ -79,12 +87,15 @@ fn main() -> Result<()> {
     let mut ebpf =
         Ebpf::load_file(&args.obj).with_context(|| format!("loading {}", args.obj.display()))?;
     let btf = Btf::from_sys_fs().context("reading kernel BTF")?;
-    let prog: &mut Lsm = ebpf
-        .program_mut("ptrace_access_check")
-        .context("program ptrace_access_check missing from object")?
-        .try_into()?;
-    prog.load("ptrace_access_check", &btf)?;
-    prog.attach()?;
+    for &(name, hook) in LSM_PROGRAMS {
+        let prog: &mut Lsm = ebpf
+            .program_mut(name)
+            .with_context(|| format!("program {name} missing from object"))?
+            .try_into()?;
+        prog.load(hook, &btf)
+            .with_context(|| format!("loading {name} on LSM hook {hook}"))?;
+        prog.attach().with_context(|| format!("attaching {name}"))?;
+    }
 
     let mut map = BpfMap(HashMap::try_from(
         ebpf.take_map(MAP_PROTECTED).context("PROTECTED map")?,
