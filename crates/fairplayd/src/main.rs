@@ -49,9 +49,10 @@ use aya::{
 use clap::Parser;
 use fairplay_api::{ProcessState, ViolationEvent, DEFAULT_LAUNCHER_GROUP, DEFAULT_SOCKET};
 use fairplay_common::{
-    ExecAllow, ExecKey, Violation, ANY_DOMAIN, FS_SYSTEM, MAP_EXEC_ALLOWED, MAP_EXEC_TRUSTED_FS,
-    MAP_INPUT_ALLOWED, MAP_INPUT_BLOCK, MAP_PROTECTED, MAP_READERS, MAP_READER_FILES,
-    MAP_SANDBOXED, MAP_UNFOLLOWED, MAP_VIOLATIONS, VIOLATION_REPORTED,
+    ExecAllow, ExecKey, Hook, Violation, ANY_DOMAIN, FS_SYSTEM, MAP_EXEC_ALLOWED,
+    MAP_EXEC_TRUSTED_FS, MAP_INPUT_ALLOWED, MAP_INPUT_BLOCK, MAP_PERF_GUARD, MAP_PROTECTED,
+    MAP_READERS, MAP_READER_FILES, MAP_SANDBOXED, MAP_UNFOLLOWED, MAP_VIOLATIONS,
+    VIOLATION_REPORTED,
 };
 use tokio::{io::unix::AsyncFd, sync::broadcast};
 
@@ -111,6 +112,7 @@ pub struct BpfMap {
     unfollowed: HashMap<MapData, u32, u64>,
     exec: HashMap<MapData, ExecKey, ExecAllow>,
     input_block: Array<MapData, u32>,
+    perf_guard: Array<MapData, u32>,
     readers: HashMap<MapData, u32, u32>,
     reader_files: HashMap<MapData, ExecKey, ExecAllow>,
     sandboxed: HashMap<MapData, u32, u32>,
@@ -176,6 +178,9 @@ impl ProtectedMap for BpfMap {
     fn set_input_block(&mut self, on: bool) -> Result<()> {
         Ok(self.input_block.set(0, u32::from(on), 0)?)
     }
+    fn set_perf_guard(&mut self, on: bool) -> Result<()> {
+        Ok(self.perf_guard.set(0, u32::from(on), 0)?)
+    }
 }
 
 pub type Shared = Arc<Mutex<Daemon<BpfMap>>>;
@@ -202,6 +207,9 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("inode_follow_link", "inode_follow_link"),
     ("socket_connect", "socket_connect"),
     ("socket_sendmsg", "socket_sendmsg"),
+    // CPU-wide perf events while anything is protected (issue #27); inert
+    // while PERF_GUARD is 0.
+    ("perf_event_open", "perf_event_open"),
 ];
 
 /// LSM programs for hooks older kernels lack. fairplayd starts without them
@@ -290,6 +298,7 @@ fn main() -> Result<()> {
                 .context("EXEC_ALLOWED map")?,
         )?,
         input_block: Array::try_from(ebpf.take_map(MAP_INPUT_BLOCK).context("INPUT_BLOCK map")?)?,
+        perf_guard: Array::try_from(ebpf.take_map(MAP_PERF_GUARD).context("PERF_GUARD map")?)?,
         readers: HashMap::try_from(ebpf.take_map(MAP_READERS).context("READERS map")?)?,
         sandboxed: HashMap::try_from(ebpf.take_map(MAP_SANDBOXED).context("SANDBOXED map")?)?,
         reader_files: HashMap::try_from(
@@ -338,6 +347,9 @@ fn main() -> Result<()> {
     // --allow names readers.
     for &pid in &args.allow {
         daemon.map_mut().add_reader(pid, CLI_DOMAIN)?;
+    }
+    if !args.protect.is_empty() || !args.allow.is_empty() {
+        daemon.protected_from_cli()?;
     }
     if !args.protect.is_empty() {
         eprintln!(
@@ -471,6 +483,10 @@ async fn read_violations(
                 record_input(&v, &daemon, &events);
                 continue;
             }
+            if v.hook == Hook::PerfCpu as u32 {
+                record_machine_wide(&v, &daemon, &events);
+                continue;
+            }
             // Not for a protected caller (e.g. a game whose own mapping was
             // denied): reading its /proc/<pid>/exe is itself a ptrace
             // access check, which the kernel would deny and log as a
@@ -488,6 +504,20 @@ async fn read_violations(
             let _ = events.send(ev); // no subscribers is fine
         }
         guard.clear_ready();
+    }
+}
+
+/// A denial that concerns every game on the machine (a CPU-wide perf
+/// event): printed, and sent to every running session's subscribers.
+fn record_machine_wide(v: &Violation, daemon: &Shared, events: &broadcast::Sender<ViolationEvent>) {
+    let caller_protected = daemon.lock().unwrap().is_protected(v.caller);
+    let exe_path = (!caller_protected)
+        .then(|| std::fs::read_link(format!("/proc/{}/exe", v.caller)).ok())
+        .flatten()
+        .map(|p| p.display().to_string());
+    report(v, exe_path.as_deref());
+    for ev in daemon.lock().unwrap().record_machine_wide(v, exe_path) {
+        let _ = events.send(ev);
     }
 }
 

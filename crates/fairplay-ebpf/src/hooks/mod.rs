@@ -12,6 +12,7 @@ mod file_open;
 mod file_permission;
 mod inode_follow_link;
 mod mmap_file;
+mod perf_event_open;
 mod ptrace;
 mod socket;
 mod task_kill;

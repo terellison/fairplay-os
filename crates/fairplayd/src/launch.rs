@@ -23,7 +23,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
-use fairplay_api::{ApiError, ErrorCode};
+use fairplay_api::{ApiError, ErrorCode, PID_ENV};
 
 use crate::{sandbox, state::Identity};
 
@@ -63,8 +63,14 @@ pub fn prepare(argv: &[String], env: &[String], cwd: &str) -> Result<Prepared, A
             dropped_env.push(key.to_owned());
             continue;
         }
+        if key == PID_ENV {
+            continue; // ours to set
+        }
         envp.push(c(kv)?);
     }
+    // Clients in the session check that the socket is served by us
+    // (fairplay_api::client), not by a fake put in its place.
+    envp.push(c(&format!("{PID_ENV}={}", std::process::id()))?);
     Ok(Prepared {
         argv: argv.iter().map(|a| c(a)).collect::<Result<_, _>>()?,
         envp,
@@ -399,7 +405,8 @@ mod tests {
         )
         .unwrap();
         let env: Vec<_> = p.envp.iter().map(|c| c.to_str().unwrap()).collect();
-        assert_eq!(env, vec!["HOME=/h", "OLD_X=1"]);
+        let ours = format!("FAIRPLAYD_PID={}", std::process::id());
+        assert_eq!(env, vec!["HOME=/h", "OLD_X=1", &ours]);
         assert_eq!(p.dropped_env, vec!["LD_PRELOAD", "LD_LIBRARY_PATH"]);
     }
 
@@ -420,12 +427,14 @@ mod tests {
         )
         .unwrap();
         let env: Vec<_> = p.envp.iter().map(|c| c.to_str().unwrap()).collect();
+        let ours = format!("FAIRPLAYD_PID={}", std::process::id());
         assert_eq!(
             env,
             vec![
                 "WINEPREFIX=/h/pfx",
                 "WINEDLLOVERRIDES_X=1",
-                "MY_WINEDLLPATH=1"
+                "MY_WINEDLLPATH=1",
+                &ours,
             ]
         );
         assert_eq!(

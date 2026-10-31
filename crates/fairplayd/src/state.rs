@@ -57,6 +57,8 @@ pub trait ProtectedMap {
     /// INPUT_BLOCK: deny virtual input from executables not on the input
     /// allowlist (milestone 7).
     fn set_input_block(&mut self, on: bool) -> Result<()>;
+    /// PERF_GUARD: deny CPU-wide perf events (issue #27).
+    fn set_perf_guard(&mut self, on: bool) -> Result<()>;
 }
 
 /// Who is on the other end of a connection, as the kernel reported it
@@ -271,6 +273,11 @@ pub struct Daemon<M> {
     input: InputLog,
     /// What INPUT_BLOCK is set to.
     input_block: bool,
+    /// What PERF_GUARD is set to: on while anything is protected.
+    perf_guard: bool,
+    /// Processes were protected from the command line (`--protect`),
+    /// which fairplayd doesn't track: PERF_GUARD stays on.
+    cli_protected: bool,
     /// Domains whose launched processes have all exited, but which may
     /// still have members: processes they started, which the kernel keeps
     /// in the domain (milestone 5) and which may outlive them. Their
@@ -290,6 +297,8 @@ impl<M: ProtectedMap> Daemon<M> {
             readers: ExecEntries::new(Table::ReaderFiles),
             input: InputLog::default(),
             input_block: false,
+            perf_guard: false,
+            cli_protected: false,
             draining: BTreeSet::new(),
         }
     }
@@ -493,8 +502,17 @@ impl<M: ProtectedMap> Daemon<M> {
             self.input_block = true;
             log_input_block(true);
         }
+        // So is the CPU-wide perf guard.
+        if !self.perf_guard {
+            if let Err(e) = self.map.set_perf_guard(true) {
+                self.sync_input_block();
+                return Err(e.context("turning on the CPU-wide perf guard"));
+            }
+            self.perf_guard = true;
+        }
         if let Err(e) = self.map.insert(pid, t.domain) {
             self.sync_input_block();
+            self.sync_perf_guard();
             return Err(e);
         }
         if t.join {
@@ -549,6 +567,7 @@ impl<M: ProtectedMap> Daemon<M> {
             self.release_drained();
         }
         self.sync_input_block();
+        self.sync_perf_guard();
         self.prune_ended();
         Some(id)
     }
@@ -577,6 +596,36 @@ impl<M: ProtectedMap> Daemon<M> {
             self.readers.release(&mut self.map, domain);
             eprintln!("fairplayd: domain {domain} has no processes left; its allowlist entries are released");
         }
+        self.sync_perf_guard();
+    }
+
+    /// `--protect` put processes in PROTECTED: keep PERF_GUARD on for good.
+    pub fn protected_from_cli(&mut self) -> Result<()> {
+        self.cli_protected = true;
+        self.map.set_perf_guard(true)?;
+        self.perf_guard = true;
+        Ok(())
+    }
+
+    /// Sets PERF_GUARD to whether anything may be protected: a session
+    /// running, a domain still draining (its launched processes are gone,
+    /// what they started may not be), or `--protect`.
+    fn sync_perf_guard(&mut self) {
+        let want = self.cli_protected
+            || !self.draining.is_empty()
+            || self.sessions.values().any(Session::running);
+        if want == self.perf_guard {
+            return;
+        }
+        match self.map.set_perf_guard(want) {
+            Ok(()) => self.perf_guard = want,
+            Err(e) => eprintln!("fairplayd: setting PERF_GUARD: {e:#}"),
+        }
+    }
+
+    /// Whether the kernel is denying CPU-wide perf events.
+    pub fn perf_guarded(&self) -> bool {
+        self.perf_guard
     }
 
     /// Sets INPUT_BLOCK to whether any running session asked for blocking.
@@ -628,6 +677,36 @@ impl<M: ProtectedMap> Daemon<M> {
         }
         self.input.push(r);
         events
+    }
+
+    /// A denial that concerns every game on the machine (a CPU-wide perf
+    /// event): one event per running session.
+    pub fn record_machine_wide(
+        &mut self,
+        v: &Violation,
+        exe_path: Option<String>,
+    ) -> Vec<ViolationEvent> {
+        let at = now();
+        self.sessions
+            .iter_mut()
+            .filter(|(_, s)| s.running())
+            .map(|(&id, s)| {
+                s.violations += 1;
+                ViolationEvent {
+                    session: Some(id),
+                    caller: v.caller,
+                    comm: c_str(&v.comm),
+                    exe: c_str(&v.exe),
+                    exe_path: exe_path.clone(),
+                    target: v.target,
+                    hook: hook_name(v.hook).into(),
+                    outcome: Outcome::Denied,
+                    mode: v.mode,
+                    file: Some(c_str(&v.file)).filter(|f| !f.is_empty()),
+                    seen_at: at,
+                }
+            })
+            .collect()
     }
 
     pub fn input_log(&self) -> &InputLog {
@@ -780,6 +859,7 @@ pub fn hook_name(hook: u32) -> &'static str {
         x if x == Hook::ProcMemWrite as u32 => "proc_mem_write",
         x if x == Hook::ProcLink as u32 => "proc_link",
         x if x == Hook::UnixAbstract as u32 => "unix_abstract",
+        x if x == Hook::PerfCpu as u32 => "perf_event_open",
         x => match crate::input::Mechanism::of_hook(x) {
             Some(m) => input_hook_name(m),
             None => "unknown",
@@ -838,6 +918,8 @@ mod tests {
         sandboxed: HashMap<u32, u32>,
         input_block: bool,
         fail_input_block: bool,
+        perf_guard: bool,
+        fail_perf_guard: bool,
     }
 
     impl ProtectedMap for FakeMap {
@@ -901,6 +983,11 @@ mod tests {
         fn set_input_block(&mut self, on: bool) -> Result<()> {
             anyhow::ensure!(!self.fail_input_block, "map update failed");
             self.input_block = on;
+            Ok(())
+        }
+        fn set_perf_guard(&mut self, on: bool) -> Result<()> {
+            anyhow::ensure!(!self.fail_perf_guard, "map update failed");
+            self.perf_guard = on;
             Ok(())
         }
     }
@@ -1553,6 +1640,64 @@ mod tests {
         assert!(d.map.input_block, "the game still runs");
         d.child_exited(4245, EXITED_0);
         assert!(!d.map.input_block);
+    }
+
+    #[test]
+    fn perf_guard_lasts_while_anything_is_protected() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        assert!(!d.map.perf_guard);
+        launch(&mut d, &alice, 4242);
+        assert!(d.map.perf_guard && d.perf_guarded());
+        launch(&mut d, &alice, 4243);
+        d.child_exited(4242, EXITED_0);
+        assert!(d.map.perf_guard, "another session runs");
+        // The game left a child behind: still in PROTECTED, so the domain
+        // drains and the guard stays.
+        let domain = d.map.entries[&4243];
+        d.map.entries.insert(5000, domain);
+        d.child_exited(4243, EXITED_0);
+        assert!(d.map.perf_guard, "a process it started is still protected");
+        d.map.entries.remove(&5000);
+        d.release_drained();
+        assert!(!d.map.perf_guard && !d.perf_guarded());
+        // --protect keeps it on for good.
+        d.protected_from_cli().unwrap();
+        launch(&mut d, &alice, 4244);
+        d.child_exited(4244, EXITED_0);
+        d.release_drained();
+        assert!(d.map.perf_guard);
+    }
+
+    #[test]
+    fn perf_guard_that_cannot_be_set_fails_the_launch() {
+        let mut d = Daemon::new(FakeMap {
+            fail_perf_guard: true,
+            ..Default::default()
+        });
+        let alice = launcher(1000);
+        let t = d.begin_launch(&alice, None).unwrap();
+        assert!(d.register(t, 4242, &alice, 1000, vec![], None).is_err());
+        assert!(d.map.entries.is_empty(), "nothing protected, nothing runs");
+    }
+
+    #[test]
+    fn machine_wide_denials_reach_every_running_session() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        launch(&mut d, &alice, 4242);
+        launch(&mut d, &alice, 4243);
+        launch(&mut d, &alice, 4244);
+        d.child_exited(4244, EXITED_0);
+        let mut v = denied(77, 0);
+        v.hook = Hook::PerfCpu as u32;
+        let evs = d.record_machine_wide(&v, None);
+        assert_eq!(evs.len(), 2, "the ended session hears nothing");
+        assert!(evs
+            .iter()
+            .all(|e| e.hook == "perf_event_open" && e.target == 0));
+        let s = d.session_of_pid(4242).unwrap();
+        assert_eq!(d.status(&alice, Some(s)).unwrap().1.unwrap().violations, 1);
     }
 
     #[test]

@@ -71,6 +71,15 @@ pub const MAP_INPUT_ALLOWED: &str = "INPUT_ALLOWED";
 /// Name of the one-entry array (index 0, a `u32`) that is nonzero while
 /// some running session asked for `block_virtual_input`, milestone 7.
 pub const MAP_INPUT_BLOCK: &str = "INPUT_BLOCK";
+/// Name of the one-entry array (index 0, a `u32`) that is nonzero while
+/// any process is protected (a session runs, a finished session's
+/// processes are still around, or `--protect`): CPU-wide
+/// `perf_event_open` is denied then (issue #27).
+pub const MAP_PERF_GUARD: &str = "PERF_GUARD";
+/// `PERF_SECURITY_CPU` (`<linux/perf_event.h>`): the `perf_event_open`
+/// LSM hook's `type` for an event on a whole CPU (no task: `pid == -1`,
+/// or a cgroup), checked by the kernel's `perf_allow_cpu`.
+pub const PERF_SECURITY_CPU: u32 = 1;
 
 /// Which LSM hook denied (or, for the input hooks, saw) the attempt.
 #[repr(u32)]
@@ -130,6 +139,14 @@ pub enum Hook {
     /// `socket_connect` / `socket_sendmsg`: an abstract Unix socket
     /// address (X11's `@/tmp/.X11-unix/X0`). Target 0; `file` the name.
     UnixAbstract = 26,
+    // Issue #27 (milestone 6 follow-ups), part 2. Machine-wide, like the
+    // input hooks: target 0, filed under every running session.
+    /// `perf_event_open`: a CPU-wide perf event (`pid == -1`, or a cgroup
+    /// event) while a process is protected. One sampling every process on
+    /// a CPU reads the game's registers and user stack without the ptrace
+    /// check a per-process event gets. `mode` is the event's
+    /// `PERF_TYPE_*`.
+    PerfCpu = 35,
     // Milestone 8 follow-ups (#23), numbered 40 and up.
     /// `bprm_check_security`: a protected process exec'ing an ELF file
     /// that is not on its executable-mapping allowlist. `execve` fails with
