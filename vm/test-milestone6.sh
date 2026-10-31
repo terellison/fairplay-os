@@ -180,9 +180,10 @@ ADDR="$(sed -n 's/^pid=[0-9]* addr=//p' "$T/game.out")"
 sudo "$CHEATSIM" attack --pid "$GPID" --addr "$ADDR" >"$T/attack.out" 2>&1
 check "a game it launched is still protected: 0/3 leaked" grep -q '^0/3 paths leaked' "$T/attack.out"
 
-# Issue #27: CPU-wide perf events would sample the game's registers and
-# user stack with no ptrace check. Per-process ones are checked against
-# the target, so they still work on anything unprotected.
+# Issue #27: perf events sample registers and the user stack. Root's
+# CAP_PERFMON skips the kernel's ptrace check for them, so fairplayd denies
+# CPU-wide ones while anything is protected and per-process ones on the
+# game; per-process ones on anything unprotected still work.
 count() { grep -c "$1" "$T/daemon.out"; }
 count_more_than() { [ "$(count "$1")" -gt "$2" ]; }
 # perf_attempt <label> <expect: opened|blocked> [--pid N]: cheatsim perf as root.
@@ -196,15 +197,22 @@ before="$(count "$PERF_DENIED")"
 perf_attempt "CPU-wide perf_event_open during a session" blocked
 wait_until count_more_than "$PERF_DENIED" "$before"
 check "one DENIED line (hook=perf_event_open)" test "$(count "$PERF_DENIED")" -eq $((before + 1))
-grep "$PERF_DENIED" "$T/daemon.out" | tail -n1 | indent
+grep 'hook=perf_event' "$T/daemon.out" | indent
 sleep 30 & BG_PIDS="$BG_PIDS $!"
 perf_attempt "per-process perf on an unprotected process" opened --pid "$!"
-GAME_PTRACE="^DENIED .* target=$GPID hook=ptrace_access_check"
-before="$(count "$GAME_PTRACE")"
-perf_attempt "per-process perf on the game (its ptrace check)" blocked --pid "$GPID"
-wait_until count_more_than "$GAME_PTRACE" "$before"
-check "one DENIED line (hook=ptrace_access_check on the game)" \
-  test "$(count "$GAME_PTRACE")" -eq $((before + 1))
+GAME_PERF="^DENIED .* target=$GPID hook=perf_event_alloc mode=0x1$"
+before="$(count "$GAME_PERF")"
+perf_attempt "per-process perf on the game" blocked --pid "$GPID"
+wait_until count_more_than "$GAME_PERF" "$before"
+check "one DENIED line (hook=perf_event_alloc, target the game)" \
+  test "$(count "$GAME_PERF")" -eq $((before + 1))
+grep "$GAME_PERF" "$T/daemon.out" | indent
+FPD_PERF="^DENIED .* target=$FPD hook=perf_event_alloc mode=0x1$"
+before="$(count "$FPD_PERF")"
+perf_attempt "per-process perf on fairplayd itself" blocked --pid "$FPD"
+wait_until count_more_than "$FPD_PERF" "$before"
+check "one DENIED line (hook=perf_event_alloc, target fairplayd)" \
+  test "$(count "$FPD_PERF")" -eq $((before + 1))
 
 # Issue #27: clients check who serves the socket (SO_PEERCRED).
 FAKE='import os, socket, sys

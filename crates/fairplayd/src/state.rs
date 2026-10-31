@@ -860,6 +860,7 @@ pub fn hook_name(hook: u32) -> &'static str {
         x if x == Hook::ProcLink as u32 => "proc_link",
         x if x == Hook::UnixAbstract as u32 => "unix_abstract",
         x if x == Hook::PerfCpu as u32 => "perf_event_open",
+        x if x == Hook::PerfTarget as u32 => "perf_event_alloc",
         x => match crate::input::Mechanism::of_hook(x) {
             Some(m) => input_hook_name(m),
             None => "unknown",

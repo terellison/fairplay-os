@@ -147,6 +147,12 @@ pub enum Hook {
     /// check a per-process event gets. `mode` is the event's
     /// `PERF_TYPE_*`.
     PerfCpu = 35,
+    /// `perf_event_alloc`: a perf event on one protected process (or on
+    /// fairplayd while it protects itself) by a process its ptrace rule
+    /// would refuse. Root's `CAP_PERFMON` skips the kernel's ptrace check
+    /// for perf, so `PtraceAccess` never sees these. Target is that pid;
+    /// `mode` is the event's `PERF_TYPE_*`.
+    PerfTarget = 36,
     // Milestone 8 follow-ups (#23), numbered 40 and up.
     /// `bprm_check_security`: a protected process exec'ing an ELF file
     /// that is not on its executable-mapping allowlist. `execve` fails with

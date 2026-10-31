@@ -207,9 +207,10 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("inode_follow_link", "inode_follow_link"),
     ("socket_connect", "socket_connect"),
     ("socket_sendmsg", "socket_sendmsg"),
-    // CPU-wide perf events while anything is protected (issue #27); inert
-    // while PERF_GUARD is 0.
+    // Perf events on protected processes (or fairplayd), and CPU-wide ones
+    // while anything is protected (issue #27).
     ("perf_event_open", "perf_event_open"),
+    ("perf_event_alloc", "perf_event_alloc"),
 ];
 
 /// LSM programs for hooks older kernels lack. fairplayd starts without them

@@ -1,19 +1,27 @@
-//! `perf_event_open` (issue #27): no CPU-wide perf events while any process
-//! is protected (PERF_GUARD, set by fairplayd).
+//! Perf events (issue #27). With `PERF_SAMPLE_REGS_USER` and
+//! `PERF_SAMPLE_STACK_USER` a perf event copies the registers and user
+//! stack of whatever it watches, so it reads memory like ptrace does. The
+//! kernel's own check doesn't hold against root: `perf_check_permission`
+//! skips `ptrace_may_access` for anyone with `CAP_PERFMON`, so
+//! `ptrace_access_check` never sees root's events. Two hooks close that,
+//! whenever any process is protected (not only with `--self-protect`), like
+//! the ptrace rules:
 //!
-//! A perf event on one process is checked against that process with
-//! `ptrace_may_access`, so `ptrace_access_check` already refuses one on a
-//! protected process (and records it there). A CPU-wide event (`pid ==
-//! -1`, or a cgroup event) names no process and gets no such check, yet
-//! with `PERF_SAMPLE_REGS_USER` and `PERF_SAMPLE_STACK_USER` it copies the
-//! registers and user stack of whatever runs on that CPU: the game too.
-//! The kernel asks this hook with type `PERF_SECURITY_CPU` for exactly
-//! those events, after `perf_event_paranoid` has already turned away
-//! anyone without `CAP_PERFMON`. So while PERF_GUARD is set, every such
-//! request from a user-space process is denied and recorded (target 0;
-//! fairplayd files it under every running session). Per-process events on
-//! unprotected processes are untouched, and so are the kernel's own
-//! counters (the hard-lockup watchdog), made from kernel threads.
+//! - `perf_event_open` with type `PERF_SECURITY_CPU`: an event on a whole
+//!   CPU (`pid == -1`, or a cgroup event) samples every process that runs
+//!   there, the game included. Denied while PERF_GUARD (set by fairplayd)
+//!   is on. Recorded as [`Hook::PerfCpu`], target 0; fairplayd files it
+//!   under every running session.
+//! - `perf_event_alloc`: an event on one task (`event->hw.target`, set
+//!   before the hook runs). Same rule as `ptrace_access_check`: on a
+//!   protected process only the process itself and its domain's readers
+//!   may, and while fairplayd protects itself nobody else may watch it.
+//!   Recorded as [`Hook::PerfTarget`]. Counters copied to a child at fork
+//!   (`event->parent` set) were already allowed on the parent and pass.
+//!
+//! Both leave alone the kernel's own counters (the hard-lockup watchdog),
+//! made from kernel threads, and per-process events on unprotected
+//! processes.
 
 use aya_ebpf::{
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_task, bpf_probe_read_kernel},
@@ -24,13 +32,24 @@ use core::ptr::addr_of;
 use fairplay_common::{Hook, PERF_SECURITY_CPU};
 
 use crate::{
-    domain::{record_in, Name, EPERM},
+    domain::{denied_caller_in, record_in, record_violation, task_domain, Name, EPERM},
     maps::PERF_GUARD,
-    vmlinux::{perf_event_attr, task_struct},
+    self_protect::outsider,
+    vmlinux::{perf_event, perf_event_attr, task_struct},
 };
 
 /// `PF_KTHREAD` (`<linux/sched.h>`).
 const PF_KTHREAD: u32 = 0x0020_0000;
+
+/// Is the current task a kernel thread? (Unreadable counts as not.)
+#[inline(always)]
+fn kthread() -> bool {
+    unsafe {
+        let task = bpf_get_current_task() as *const task_struct;
+        bpf_probe_read_kernel(addr_of!((*task).flags))
+    }
+    .is_ok_and(|flags| flags & PF_KTHREAD != 0)
+}
 
 #[lsm(hook = "perf_event_open")]
 pub fn perf_event_open(ctx: LsmContext) -> i32 {
@@ -40,27 +59,57 @@ pub fn perf_event_open(ctx: LsmContext) -> i32 {
     if prev != 0 {
         return prev;
     }
-    match should_deny(&ctx) {
-        Ok(true) => -EPERM,
-        _ => 0,
+    let kind: u32 = unsafe { ctx.arg(1) };
+    if kind != PERF_SECURITY_CPU || !PERF_GUARD.get(0).is_some_and(|&on| on != 0) || kthread() {
+        return 0;
+    }
+    let attr: *const perf_event_attr = unsafe { ctx.arg(0) };
+    let event_type = unsafe { bpf_probe_read_kernel(addr_of!((*attr).type_)) }.unwrap_or(u32::MAX);
+    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+    record_in(caller, 0, 0, Hook::PerfCpu, event_type, 0, Name::None);
+    -EPERM
+}
+
+#[lsm(hook = "perf_event_alloc")]
+pub fn perf_event_alloc(ctx: LsmContext) -> i32 {
+    // int perf_event_alloc(struct perf_event *event)
+    // For BPF LSM, arg 1 is the verdict from earlier LSMs in the stack.
+    let prev: i32 = unsafe { ctx.arg(1) };
+    if prev != 0 {
+        return prev;
+    }
+    match should_deny_alloc(unsafe { ctx.arg(0) }) {
+        Ok(false) => 0,
+        // Unreadable: deny, as the ptrace and self-protection checks do.
+        _ => -EPERM,
     }
 }
 
-fn should_deny(ctx: &LsmContext) -> Result<bool, i64> {
-    let kind: u32 = unsafe { ctx.arg(1) };
-    if kind != PERF_SECURITY_CPU || !PERF_GUARD.get(0).is_some_and(|&on| on != 0) {
+fn should_deny_alloc(event: *const perf_event) -> Result<bool, i64> {
+    let target: *const task_struct =
+        unsafe { bpf_probe_read_kernel(addr_of!((*event).hw.target))? };
+    // A CPU-wide event (perf_event_open's job), or a kernel counter.
+    if target.is_null() || kthread() {
         return Ok(false);
     }
-    let flags = unsafe {
-        let task = bpf_get_current_task() as *const task_struct;
-        bpf_probe_read_kernel(addr_of!((*task).flags))?
+    let parent: *const perf_event = unsafe { bpf_probe_read_kernel(addr_of!((*event).parent))? };
+    if !parent.is_null() {
+        return Ok(false); // inherited at fork
+    }
+    let event_type = unsafe { bpf_probe_read_kernel(addr_of!((*event).attr.type_))? };
+    if let Some((caller, fairplayd)) = outsider() {
+        let tgid = unsafe { bpf_probe_read_kernel(addr_of!((*target).tgid))? } as u32;
+        if tgid == fairplayd {
+            record_violation(caller, fairplayd, Hook::PerfTarget, event_type);
+            return Ok(true);
+        }
+    }
+    let Some((tgid, domain)) = task_domain(target)? else {
+        return Ok(false);
     };
-    if flags & PF_KTHREAD != 0 {
+    let Some(caller) = denied_caller_in(tgid, domain) else {
         return Ok(false);
-    }
-    let attr: *const perf_event_attr = unsafe { ctx.arg(0) };
-    let event_type = unsafe { bpf_probe_read_kernel(addr_of!((*attr).type_)) }.unwrap_or(0);
-    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
-    record_in(caller, 0, 0, Hook::PerfCpu, event_type, 0, Name::None);
+    };
+    record_violation(caller, tgid, Hook::PerfTarget, event_type);
     Ok(true)
 }
