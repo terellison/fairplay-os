@@ -115,7 +115,8 @@ Steps for a worker:
    changed). CI can't load BPF programs: if you touch `crates/*-ebpf` or `fairplayd`, run
    the milestone 1/3/4 tests on the VM and paste the output into the PR. The VM is shared,
    so run anything that loads BPF programs under the lock, one agent at a time:
-   `flock /run/lock/fairplay-vm-tests ./vm/test-milestone4.sh`.
+   `flock -o /run/lock/fairplay-vm-tests ./vm/test-milestone4.sh` (`-o`: the test's own child
+   processes don't inherit the lock, so orphans of a killed test can't hold it).
 5. **Open the PR** with what changed, why, and how you tested it, then arm auto-merge:
    `gh pr merge --auto --squash`. It merges once the PR is approved and checks pass; never
    try to merge any other way. The lead finds new PRs on its own, and GitHub asks the owner

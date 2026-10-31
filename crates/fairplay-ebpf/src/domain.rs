@@ -23,6 +23,7 @@ use crate::{
 include!(concat!(env!("OUT_DIR"), "/fields.rs"));
 
 pub const EPERM: i32 = 1;
+pub const EACCES: i32 = 13;
 
 /// The current task's tgid if it must be kept away from `target` (a tgid),
 /// `None` if normal kernel rules apply: the target is not protected, the

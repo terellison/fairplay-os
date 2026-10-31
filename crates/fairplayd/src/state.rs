@@ -4,7 +4,7 @@
 //! is unit-tested without BPF or root.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -49,6 +49,9 @@ pub trait ProtectedMap {
     fn unfollowed(&self, domain: u32) -> u64;
     /// Drops `domain`'s UNFOLLOWED count, once nothing will ask for it.
     fn forget_domain(&mut self, domain: u32);
+    /// The domains that have a process in PROTECTED right now, launched by
+    /// us or started by one of those.
+    fn live_domains(&self) -> Result<BTreeSet<u32>>;
     fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()>;
     fn disallow_exec(&mut self, key: ExecKey) -> Result<()>;
     /// INPUT_BLOCK: deny virtual input from executables not on the input
@@ -268,6 +271,12 @@ pub struct Daemon<M> {
     input: InputLog,
     /// What INPUT_BLOCK is set to.
     input_block: bool,
+    /// Domains whose launched processes have all exited, but which may
+    /// still have members: processes they started, which the kernel keeps
+    /// in the domain (milestone 5) and which may outlive them. Their
+    /// EXEC_ALLOWED and READER_FILES entries stay until
+    /// [`Daemon::release_drained`] finds the domain empty.
+    draining: BTreeSet<u32>,
 }
 
 impl<M: ProtectedMap> Daemon<M> {
@@ -281,6 +290,7 @@ impl<M: ProtectedMap> Daemon<M> {
             readers: ExecEntries::new(Table::ReaderFiles),
             input: InputLog::default(),
             input_block: false,
+            draining: BTreeSet::new(),
         }
     }
 
@@ -531,16 +541,42 @@ impl<M: ProtectedMap> Daemon<M> {
             eprintln!("fairplayd: removing pid {pid} from SANDBOXED: {e:#}");
         }
         p.state = state;
-        // The domain's last process is gone: its files are no longer
-        // allowed (domains aren't reused while the daemon runs, but the map
-        // is finite).
+        // The session's last launched process is gone. Once the domain has
+        // no members left at all, its files are no longer allowed (domains
+        // aren't reused while the daemon runs, but the map is finite).
         if !s.procs().any(Proc::running) {
-            self.exec.release(&mut self.map, s.domain);
-            self.readers.release(&mut self.map, s.domain);
+            self.draining.insert(s.domain);
+            self.release_drained();
         }
         self.sync_input_block();
         self.prune_ended();
         Some(id)
+    }
+
+    /// Releases the allowlist entries of every draining domain (see
+    /// `draining`) with no process left in PROTECTED. Called when a
+    /// session's last launched process exits, and then periodically.
+    /// Nothing can join an empty domain: only a member's fork adds to it,
+    /// and fairplayd adds only to sessions with a launched process running.
+    pub fn release_drained(&mut self) {
+        if self.draining.is_empty() {
+            return;
+        }
+        let live = match self.map.live_domains() {
+            Ok(live) => live,
+            Err(e) => {
+                // Try again next time; until then the entries stay.
+                eprintln!("fairplayd: reading PROTECTED: {e:#}");
+                return;
+            }
+        };
+        let empty: Vec<u32> = self.draining.difference(&live).copied().collect();
+        for domain in empty {
+            self.draining.remove(&domain);
+            self.exec.release(&mut self.map, domain);
+            self.readers.release(&mut self.map, domain);
+            eprintln!("fairplayd: domain {domain} has no processes left; its allowlist entries are released");
+        }
     }
 
     /// Sets INPUT_BLOCK to whether any running session asked for blocking.
@@ -736,6 +772,7 @@ pub fn hook_name(hook: u32) -> &'static str {
         x if x == Hook::PtraceAccess as u32 => "ptrace_access_check",
         x if x == Hook::MmapFile as u32 => "mmap_file",
         x if x == Hook::FileMprotect as u32 => "file_mprotect",
+        x if x == Hook::BprmCheck as u32 => "bprm_check_security",
         x if x == Hook::TaskKill as u32 => "task_kill",
         x if x == Hook::BpfMap as u32 => "bpf_map",
         x if x == Hook::BpfProg as u32 => "bpf_prog",
@@ -827,6 +864,9 @@ mod tests {
         fn forget_domain(&mut self, domain: u32) {
             self.unfollowed.remove(&domain);
         }
+        fn live_domains(&self) -> Result<BTreeSet<u32>> {
+            Ok(self.entries.values().copied().collect())
+        }
         fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
             anyhow::ensure!(
                 self.exec_fail_at.is_none_or(|n| self.exec.len() < n),
@@ -917,6 +957,31 @@ mod tests {
         d.child_exited(4243, EXITED_0);
         assert!(d.map.exec.is_empty());
         assert_eq!(d.exec_entries(), 0);
+    }
+
+    #[test]
+    fn exec_allowlist_outlives_the_launched_process_while_its_children_run() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        let t = d.begin_launch(&alice, None).unwrap();
+        d.allow_exec(&t, &[file(1)]).unwrap();
+        d.allow_readers(&t, &[file(5)]).unwrap();
+        d.register(t, 4242, &alice, 1000, vec!["game".into()], None)
+            .unwrap();
+        // The game started a process (the kernel put it in the domain).
+        d.map.entries.insert(5000, t.domain);
+        d.child_exited(4242, EXITED_0);
+        assert_eq!(d.map.exec.len(), 1, "the child can still map the game");
+        assert_eq!(d.map.reader_files.len(), 1);
+        d.release_drained();
+        assert_eq!(d.map.exec.len(), 1);
+        // The child exits (the kernel drops it); the next pass releases.
+        d.map.entries.remove(&5000);
+        d.release_drained();
+        assert!(d.map.exec.is_empty());
+        assert!(d.map.reader_files.is_empty());
+        assert_eq!(d.exec_entries(), 0);
+        d.release_drained();
     }
 
     #[test]
@@ -1411,6 +1476,7 @@ mod tests {
         assert_eq!(ev.hook, "mmap_file");
         assert_eq!(ev.file.as_deref(), Some("cheat.so"));
         assert_eq!(hook_name(Hook::FileMprotect as u32), "file_mprotect");
+        assert_eq!(hook_name(Hook::BprmCheck as u32), "bprm_check_security");
         // Process hooks have no file.
         assert_eq!(d.record_violation(&denied(1, 4242), None).file, None);
         assert_eq!(ev.outcome, Outcome::Denied);

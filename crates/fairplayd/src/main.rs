@@ -163,6 +163,16 @@ impl ProtectedMap for BpfMap {
     fn forget_domain(&mut self, domain: u32) {
         let _ = self.unfollowed.remove(&domain);
     }
+    fn live_domains(&self) -> Result<std::collections::BTreeSet<u32>> {
+        // Entries can come and go while we walk; only a member's fork adds
+        // one, so a draining domain's member can be missed only if it
+        // forked and exited mid-walk, and the cost is a child losing the
+        // game's files (it fails closed).
+        self.protected
+            .iter()
+            .map(|r| Ok(r?.1))
+            .collect::<Result<_>>()
+    }
     fn set_input_block(&mut self, on: bool) -> Result<()> {
         Ok(self.input_block.set(0, u32::from(on), 0)?)
     }
@@ -178,6 +188,7 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("ptrace_access_check", "ptrace_access_check"),
     ("mmap_file", "mmap_file"),
     ("file_mprotect", "file_mprotect"),
+    ("bprm_check_security", "bprm_check_security"),
     // Self-protection (milestone 6); inert unless --self-protect.
     ("task_kill", "task_kill"),
     ("bpf", "bpf"),
@@ -390,6 +401,7 @@ fn main() -> Result<()> {
             system_devs,
             socket: args.socket.clone(),
         };
+        tokio::spawn(release_drained(daemon.clone()));
         tokio::spawn(read_violations(ring, daemon, events));
         let deadline = async {
             match protect_for {
@@ -409,6 +421,17 @@ fn main() -> Result<()> {
         eprintln!("fairplayd: stopping; protected processes still running are no longer protected");
         Ok(())
     })
+}
+
+/// Once a second, releases the allowlists of sessions whose launched
+/// processes have exited, as soon as the last process they started is gone
+/// too (see `Daemon::release_drained`).
+async fn release_drained(daemon: Shared) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        daemon.lock().unwrap().release_drained();
+    }
 }
 
 async fn shutdown_signal() {

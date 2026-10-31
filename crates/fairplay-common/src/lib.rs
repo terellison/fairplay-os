@@ -155,6 +155,11 @@ pub enum Hook {
     /// files (`oom_score_adj`, `oom_adj`, `autogroup`) for writing. `mode`
     /// is the file's `FMODE_*` bits, `file` its name.
     ProcTuneWrite = 34,
+    // Milestone 8 follow-ups (#23), numbered 40 and up.
+    /// `bprm_check_security`: a protected process exec'ing an ELF file
+    /// that is not on its executable-mapping allowlist. `execve` fails with
+    /// EACCES; `mode` is 0.
+    BprmCheck = 40,
 }
 
 /// [`Violation::flags`]: the kernel let it happen and only reports it
@@ -197,8 +202,9 @@ pub struct Violation {
     /// captured in the kernel; user space adds the full path if the caller
     /// is still alive.
     pub exe: [u8; EXE_NAME_LEN],
-    /// For file hooks ([`Hook::MmapFile`], [`Hook::FileMprotect`]): file
-    /// name (no directory) of the file it tried to map, same format as
+    /// For file hooks ([`Hook::MmapFile`], [`Hook::FileMprotect`],
+    /// [`Hook::BprmCheck`]): file name (no directory) of the file it tried
+    /// to map or exec, same format as
     /// `exe`. For [`Hook::UinputCreate`]: the name the caller gave the new
     /// device (sysfs `name`). For [`Hook::UhidCreate`],
     /// [`Hook::EvdevWrite`] and [`Hook::UinputWrite`]: the device node's

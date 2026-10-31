@@ -38,6 +38,13 @@ const FIELDS: &[(&str, &str, &str, &str)] = &[
     ("sb_dev", "super_block", "s_dev", "u32"),
     // Readers by exec (readers.rs).
     ("bprm_file", "linux_binprm", "file", "*mut file"),
+    // Exec pre-check (hooks/bprm_check_security.rs): the file's first bytes.
+    (
+        "bprm_buf",
+        "linux_binprm",
+        "buf",
+        "[::aya_ebpf::cty::c_char; 256usize]",
+    ),
     // Self-protection (hooks/bpf_map.rs, hooks/bpf_prog.rs).
     ("map_id", "bpf_map", "id", "u32"),
     ("prog_aux", "bpf_prog", "aux", "*mut bpf_prog_aux"),
