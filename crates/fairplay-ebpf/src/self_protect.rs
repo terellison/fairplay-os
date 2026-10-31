@@ -74,8 +74,10 @@ pub fn guard_task(p: *const task_struct, hook: Hook, mode: u32) -> i32 {
     let Some((caller, fairplayd)) = outsider() else {
         return 0;
     };
+    // Unreadable: deny, like the other self-protection checks. Only an
+    // outsider gets here, and only while self-protection is on.
     let Ok(tgid) = (unsafe { bpf_probe_read_kernel(addr_of!((*p).tgid)) }) else {
-        return 0;
+        return -EPERM;
     };
     if tgid as u32 != fairplayd {
         return 0;
