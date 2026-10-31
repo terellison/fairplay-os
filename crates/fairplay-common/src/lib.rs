@@ -16,6 +16,37 @@ pub const MAP_EXEC_TRUSTED_FS: &str = "EXEC_TRUSTED_FS";
 /// Name of the map from protection domain to the number of processes started
 /// in it that could not be protected (PROTECTED was full).
 pub const MAP_UNFOLLOWED: &str = "UNFOLLOWED";
+/// Name of the one-entry array holding fairplayd's own tgid while it
+/// protects itself, 0 otherwise (milestone 6).
+pub const MAP_SELF_PROTECT: &str = "SELF_PROTECT";
+/// Name of the set of fairplayd's own BPF objects ([`self_object_key`] ->
+/// 1) that no other process may open while it protects itself.
+pub const MAP_SELF_OBJECTS: &str = "SELF_OBJECTS";
+
+/// [`self_object_key`] kind: a BPF map.
+pub const SELF_MAP: u32 = 1;
+/// [`self_object_key`] kind: a BPF program.
+pub const SELF_PROG: u32 = 2;
+/// [`self_object_key`] kind: a BPF link (an attached program).
+pub const SELF_LINK: u32 = 3;
+
+/// Key in [`MAP_SELF_OBJECTS`]: the object's kind (`SELF_*`) and its
+/// kernel id, the one `bpftool` shows.
+pub const fn self_object_key(kind: u32, id: u32) -> u64 {
+    (kind as u64) << 32 | id as u64
+}
+
+/// `bpf(2)` commands (`enum bpf_cmd` in `<linux/bpf.h>`) that only
+/// fairplayd may use while it protects itself.
+pub const BPF_PROG_LOAD: u32 = 5;
+pub const BPF_PROG_DETACH: u32 = 9;
+pub const BPF_LINK_GET_FD_BY_ID: u32 = 30;
+pub const BPF_LINK_DETACH: u32 = 34;
+
+/// `PTRACE_MODE_NOAUDIT` (`<linux/ptrace.h>`, kernel-internal): the kernel
+/// is only checking, e.g. to decide which `/proc/<pid>/stat` fields `ps`
+/// may see, not acting on a request to access the process.
+pub const PTRACE_MODE_NOAUDIT: u32 = 0x04;
 /// Name of the map of executables allowed to make virtual input
 /// (remappers, accessibility tools): [`ExecKey`] with [`ANY_DOMAIN`] ->
 /// [`ExecAllow`], milestone 7.
@@ -37,19 +68,34 @@ pub enum Hook {
     /// `file_mprotect`: a protected process making a file-backed mapping
     /// executable after the fact, same allowlist (milestone 8).
     FileMprotect = 4,
-    // Milestone 7, virtual input. These are machine-wide: the kernel records
-    // every one, with [`VIOLATION_REPORTED`] unless a session asked for
-    // blocking, and fairplayd decides which sessions hear about it.
+    // Milestone 6, fairplayd protecting itself. Numbered apart so that other
+    // milestones' hooks can take the next small numbers. The target is
+    // fairplayd's own pid. Tracing or reading fairplayd's memory is
+    // `PtraceAccess` with fairplayd as the target.
+    /// `task_kill`: a signal to fairplayd from another process.
+    TaskKill = 16,
+    /// `bpf_map`: another process opening one of fairplayd's maps (by id,
+    /// or from a pin).
+    BpfMap = 17,
+    /// `bpf_prog`: another process opening one of fairplayd's programs.
+    BpfProg = 18,
+    /// `bpf`: another process using a `bpf(2)` command reserved for
+    /// fairplayd (loading a program, detaching, opening a link by id).
+    Bpf = 19,
+    // Milestone 7, virtual input, numbered after milestone 6. These are
+    // machine-wide: the kernel records every one, with
+    // [`VIOLATION_REPORTED`] unless a session asked for blocking, and
+    // fairplayd decides which sessions hear about it. The target is 0.
     // (Value 2 was a placeholder for this milestone and is unused.)
     /// `file_ioctl` / `file_ioctl_compat`: `UI_DEV_CREATE` on `/dev/uinput`,
     /// which creates a virtual input device.
-    UinputCreate = 16,
+    UinputCreate = 20,
     /// `file_permission`: the first write on an open `/dev/uhid`, which is
     /// the one that creates the virtual HID device (`UHID_CREATE2`).
-    UhidCreate = 17,
+    UhidCreate = 21,
     /// `file_permission`: the first write on an open `/dev/input/event*`
     /// node, which injects events into an existing device.
-    EvdevWrite = 18,
+    EvdevWrite = 22,
 }
 
 /// [`Violation::flags`]: the kernel let it happen and only reports it
@@ -73,9 +119,10 @@ pub struct Violation {
     /// A [`Hook`] value.
     pub hook: u32,
     /// The ptrace access mode bits the caller asked for, or for
-    /// [`Hook::MmapFile`] and [`Hook::FileMprotect`] the `PROT_*` bits, or
-    /// for the input hooks the device node's kernel `dev_t`
-    /// (`major << 20 | minor`).
+    /// [`Hook::MmapFile`] and [`Hook::FileMprotect`] the `PROT_*` bits. For
+    /// [`Hook::TaskKill`] the signal, for [`Hook::BpfMap`] the `FMODE_*`
+    /// bits asked for, and for [`Hook::Bpf`] the `bpf(2)` command. For the
+    /// input hooks, the device node's kernel `dev_t` (`major << 20 | minor`).
     pub mode: u32,
     /// [`VIOLATION_REPORTED`], [`VIOLATION_ALLOWLISTED`]; 0 for a denial.
     pub flags: u32,

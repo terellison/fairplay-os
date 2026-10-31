@@ -14,8 +14,8 @@ use fairplay_common::{Hook, Violation, EXE_NAME_LEN};
 use crate::{
     maps::{PROTECTED, VIOLATIONS},
     vmlinux::{
-        dentry, file, inode, kuid_t, mm_struct, path, qstr, super_block, task_struct,
-        vm_area_struct,
+        bpf_map, bpf_prog, bpf_prog_aux, dentry, file, inode, kuid_t, mm_struct, path, qstr,
+        super_block, task_struct, vm_area_struct,
     },
 };
 

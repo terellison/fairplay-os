@@ -145,10 +145,17 @@ pub fn write_verdict(f: *const file, mask: i32) -> i32 {
     let private =
         unsafe { bpf_probe_read_kernel(file_private(f)) }.unwrap_or(core::ptr::null_mut()) as u64;
     let key = [f as u64, private];
+    let seen = unsafe { INPUT_SEEN.get(&key) }.copied().unwrap_or(0);
+    // A uhid fd whose first write (the create) went through has its device:
+    // later writes are that device's own input, like writes to a uinput fd,
+    // and blocking stops new devices, not existing ones. Writes into evdev
+    // nodes inject into other devices, so each is checked.
+    if hook == Hook::UhidCreate && seen == SEEN_ALLOWED {
+        return 0;
+    }
     let (flags, ret) = decide();
     // Record the first write on this fd, and the first denied one (blocking
     // may have started after the fd's first write went through).
-    let seen = unsafe { INPUT_SEEN.get(&key) }.copied().unwrap_or(0);
     let state = if ret != 0 { SEEN_DENIED } else { SEEN_ALLOWED };
     if seen == 0 || (state == SEEN_DENIED && seen != SEEN_DENIED) {
         record(current_tgid(), 0, hook, rdev, flags, Name::File(f));

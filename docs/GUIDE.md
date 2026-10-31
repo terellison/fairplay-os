@@ -28,7 +28,7 @@ the parts that need a real gaming PC come later.
 | 3 | Protected process | Done | `cheatsim` + `fairplayd` (README) |
 | 4 | fairplayd socket API | Done | `./vm/test-milestone4.sh` |
 | 5 | Protection follows the game's child processes | Done | `./vm/test-milestone5.sh` |
-| 6 | fairplayd protects itself from root | Not started | |
+| 6 | fairplayd protects itself from root | Done (opt-in: `--self-protect`) | `./vm/test-milestone6.sh` |
 | 7 | Report fake input devices and who made them | Done | `./vm/test-milestone7.sh` |
 | 8 | Only approved code may load into the game | Done | `./vm/test-milestone8.sh` |
 | 9 | Vendor anti-cheat: signed and sandboxed | Not started | |
@@ -307,6 +307,48 @@ never reached it, that its entry is gone while it's still a zombie, that the
 same game started without `fairplayd` leaks 3/3, and that a full `PROTECTED`
 shows up as `protection_degraded`.
 
+### fairplayd protects itself (milestone 6)
+
+Everything above is enforced by `fairplayd`'s programs and maps. If root
+could kill `fairplayd`, delete the game from `PROTECTED`, or unhook the
+checkpoints, the protection would be one command away. In player mode root
+might be the cheater, so `fairplayd --self-protect` turns on four more
+checkpoints that guard `fairplayd` itself, from every other process, root
+included:
+
+| Checkpoint | What it stops |
+| --- | --- |
+| `task_kill` | sending `fairplayd` any **signal**, even `kill -9` (SIGKILL) and SIGSTOP |
+| `ptrace_access_check` | tracing it, reading its memory, or copying its open files (`pidfd_getfd`) |
+| `bpf_map`, `bpf_prog` | opening its maps or programs, which is the first step of reading or changing them (`bpftool map dump`) |
+| `bpf` | loading any new BPF program, and detaching attached ones |
+
+Why refuse *every* new BPF program? Because a BPF program loaded by root can
+read the memory of whatever process it happens to run in, and the
+`ptrace_access_check` checkpoint never sees that. The cost is that nothing
+else can load BPF programs while it's on (systemd uses a few for firewall
+and device rules), so player mode will have to load those first.
+
+It's **off unless asked for**: developer mode keeps normal root, and so does
+the shared test VM. Nothing over the socket turns it off. For tests,
+`--self-protect-for 30` turns it off after 30 seconds and exits.
+
+What it doesn't stop, on purpose (other layers cover these): root changing
+the kernel itself (lockdown's job), rebooting into something else
+(attestation's job), reading the swap disk (encrypted swap), and a handful
+of ways root can make the *kernel* stop `fairplayd` for it, such as killing
+its whole **cgroup** or provoking the out-of-memory killer. Those don't pass
+through `task_kill`; the README lists them with their fixes.
+
+**Milestone 6's test** (`vm/test-milestone6.sh`) shows root killing an
+unprotected `fairplayd`, then, against one started with
+`--self-protect-for 60`, tries as root: `kill -9`, `kill -STOP`,
+`kill -TERM`, `bpftool` dumping and changing its maps (including the switch
+that turns self-protection off) and detaching a program, and `cheatsim
+self-attack` (ptrace, memory reads, stealing a file descriptor, loading a
+BPF program, detaching). Every attempt fails with one `DENIED` line; then
+`fairplayd` switches itself off on time and leaves nothing loaded.
+
 ### Only approved code loads into the game (milestone 8)
 
 Reading the game's memory is blocked, but a cheat could still get its code
@@ -386,7 +428,10 @@ which device the file is.
   and whether that program is allowlisted.
 - A game whose server wants more can launch with `block_virtual_input`:
   while it runs, fake input from programs not on the allowlist is refused
-  (**EPERM**) and shows up as `DENIED`.
+  (**EPERM**) and shows up as `DENIED`. Players should know this covers the
+  **whole computer**, not just the game, because input devices aren't
+  per-program: until that game exits, only allowlisted tools can make new
+  fake devices. Ones that already exist keep working.
 - With no protected game running, nothing is reported.
 
 **Milestone 7's test** (`vm/test-milestone7.sh`) starts a protected game,
@@ -413,6 +458,11 @@ this VM the uhid steps are skipped: its kernel module isn't installed.
   binary adapt at load time). So `lsm-hello-ebpf/build.rs` works out where
   the field lives at build time. Prefer fields that rarely move, like
   `task_struct.tgid`.
+- Hook *arguments* change too. A BPF LSM program gets the hook's arguments
+  and then the verdict of the programs before it, so which argument is the
+  verdict depends on the kernel. On the VM's 6.8 the `bpf` hook is
+  `(cmd, attr, size)` and the verdict is argument 3; newer kernels (around 6.15) add a
+  fourth argument (`kernel`), which moves it to 4. `hooks/bpf.rs` says so.
 
 ## Part C: resource lanes
 
@@ -536,6 +586,30 @@ deliberate change to both files.
   or writes, like "create the device now" (`UI_DEV_CREATE`) on uinput.
 - **lockdown**: a kernel mode that stops even root from changing the running
   kernel.
+- **bpf()**: the one system call for everything BPF: loading a program
+  (`BPF_PROG_LOAD`), opening a map or program by its id, attaching and
+  detaching. Milestone 6's `bpf` checkpoint sees each call's command.
+- **Link**: the kernel object that keeps a BPF program attached to its hook.
+  Closing the last file descriptor to it, or **detaching** it, unhooks the
+  program.
+- **bpftool**: the standard command-line tool to list, dump and change BPF
+  programs, maps and links. What a cheater with root would reach for.
+- **fdinfo**: `/proc/<pid>/fdinfo/<fd>`, a text file describing one open
+  file descriptor; for a BPF map, program or link it includes the kernel id.
+- **`bpf_probe_read_user`**: a BPF helper that reads memory of the process
+  the program is running in. Why `fairplayd` refuses other BPF programs while
+  it protects itself.
+- **Self-protection**: milestone 6; `fairplayd` refusing every other
+  process, root included, the ways to stop or change it.
+- **kexec**: starting a different kernel straight from the running one,
+  without a reboot through the firmware. Lockdown blocks it.
+- **Hibernation**: saving all of memory to disk and powering off. Editing
+  that image would change the kernel on resume, so lockdown blocks it.
+- **Swap**: disk space the kernel moves memory pages to when RAM is short.
+  Whoever can read the swap disk can read those pages, unless it's
+  encrypted.
+- **OOM killer**: the kernel's last resort when memory runs out: it kills
+  the process with the highest score (`oom_score_adj` raises a process's).
 
 **Processes**
 
@@ -547,6 +621,14 @@ deliberate change to both files.
   as root.
 - **ptrace**: the debugging interface that lets one process stop, read and
   modify another.
+- **Signal**: a short message the kernel delivers to a process, sent with
+  `kill`. **SIGTERM** asks it to stop; **SIGKILL** (`kill -9`) and
+  **SIGSTOP** can't be caught or ignored by the process, so only a security
+  checkpoint can refuse them. **SIGCHLD** is the one the kernel sends a
+  parent when its child exits.
+- **pidfd / pidfd_getfd**: a file descriptor that stands for a process.
+  `pidfd_getfd` uses one to copy another process's open file into your own,
+  with the same permission check as ptrace.
 - **inode**: the file itself, as opposed to its name. A program that has a
   file open keeps the old inode even after the name points somewhere new.
 - **Inode-based allowlist**: a list of approved files by inode (plus the

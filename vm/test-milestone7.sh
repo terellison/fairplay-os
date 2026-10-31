@@ -183,6 +183,7 @@ step "(d) a uhid device"
 if [ "$HAVE_UHID" = 1 ]; then
   run uhid "$CHEAT" uhid --name "m7 uhid"
   check "CREATED" grep -q "^CREATED uhid m7 uhid$" "$T/uhid.out"
+  check "and moved (input through its own fd)" wait_for "$T/uhid.out" "^MOVED 3$"
   check "REPORTED line: hook=uhid_create file=uhid" \
     wait_for "$T/daemon.out" "^REPORTED .*exe=$CHEAT target=0 hook=uhid_create .*file=uhid$"
   for _ in $(seq 30); do status "$SESSION"; [ -n "$(device "m7 uhid")" ] && break; sleep 0.1; done
@@ -195,6 +196,11 @@ else
 fi
 
 step "(e) a second session asks for block_virtual_input"
+if [ "$HAVE_UHID" = 1 ]; then
+  # Made before blocking and still sending input (5 s of moves) while it starts.
+  run early "$CHEAT" uhid --name "m7 uhid early" --moves 250
+  check "a second uhid device, made before blocking" grep -q "^CREATED uhid m7 uhid early$" "$T/early.out"
+fi
 sudo "$CTL" --socket "$SOCK" launch --no-stdio --block-virtual-input --run-as "$ME_UID" -- "$T/game/cheatsim" game >"$T/game2.out" 2>&1
 SESSION2="$(jq -r '.ok.launched.session' "$T/game2.out")"
 GPID2="$(jq -r '.ok.launched.pid' "$T/game2.out")"
@@ -221,6 +227,11 @@ fi
 status "$SESSION"
 check "the clicker made before blocking is still listed (blocking stops new devices only)" \
   test -n "$(device "m7 clicker")"
+if [ "$HAVE_UHID" = 1 ]; then
+  check "a uhid device made before blocking kept sending input through it" \
+    wait_for "$T/early.out" "^MOVED 250$"
+  check_not "... and none of its writes was refused" grep -q "MOVE-FAILED" "$T/early.out"
+fi
 sudo "$CTL" --socket "$SOCK" status "$SESSION2" >"$T/status2.json"
 check "the blocking session has its own violations (the attempts above)" \
   jqt '.ok.status.session.violations >= 2' "$T/status2.json"
@@ -238,6 +249,7 @@ grep '"violation"' "$T/events.jsonl" >"$T/v.jsonl"
 jq -c '.event.violation | {caller, exe, target, hook, outcome, file}' "$T/v.jsonl" | indent
 if [ "$HAVE_UHID" = 1 ]; then
   WANT='[["uinput_create","reported","m7 clicker"],["evdev_write","reported",$ev],["uhid_create","reported","uhid"],
+         ["uhid_create","reported","uhid"],
          ["uinput_create","denied","m7 blocked"],["evdev_write","denied",$ev],["uhid_create","denied","uhid"],
          ["uinput_create","reported","m7 after"]]'
 else

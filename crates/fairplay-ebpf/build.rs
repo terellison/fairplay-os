@@ -26,6 +26,10 @@ const FIELDS: &[(&str, &str, &str, &str)] = &[
     ("inode_uid", "inode", "i_uid", "kuid_t"),
     ("inode_generation", "inode", "i_generation", "u32"),
     ("sb_dev", "super_block", "s_dev", "u32"),
+    // Self-protection (hooks/bpf_map.rs, hooks/bpf_prog.rs).
+    ("map_id", "bpf_map", "id", "u32"),
+    ("prog_aux", "bpf_prog", "aux", "*mut bpf_prog_aux"),
+    ("prog_aux_id", "bpf_prog_aux", "id", "u32"),
     // Virtual input (input.rs): which device node a file is, and the
     // driver's per-open state.
     ("inode_rdev", "inode", "i_rdev", "u32"),
