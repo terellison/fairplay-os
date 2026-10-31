@@ -18,6 +18,9 @@
 //! itself: processes that exec'd a manifest-named reader file. Its tracing
 //! program is in `TRACING_PROGRAMS` too.
 //!
+//! `members` (issue #21) caps how many processes one domain may fork into
+//! PROTECTED, for the `task_alloc` and `task_free` hooks and `follow`.
+//!
 //! `self_protect` (milestone 6) keeps every other process, root included,
 //! away from fairplayd itself while it runs with `--self-protect`.
 //!
@@ -26,6 +29,10 @@
 
 #![no_std]
 #![no_main]
+// `core::intrinsics::atomic_xadd`: the BPF target has atomic add but no
+// compare-and-swap, so `AtomicU64::fetch_add` is not available (`members`).
+#![feature(core_intrinsics)]
+#![allow(internal_features)]
 
 #[allow(
     non_upper_case_globals,
@@ -42,6 +49,7 @@ mod follow;
 mod hooks;
 mod input;
 mod maps;
+mod members;
 mod readers;
 mod self_protect;
 

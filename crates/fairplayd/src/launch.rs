@@ -301,6 +301,11 @@ unsafe fn child_main(a: &ChildArgs) -> ! {
             if let Err(stage) = sb.enter() {
                 fail(a, stage);
             }
+            // While we still hold CAP_SETPCAP: no later exec, even as
+            // root, gets more than the sandbox's one kept capability.
+            if let Err(stage) = sb.drop_bounding() {
+                fail(a, stage);
+            }
         }
 
         // Our own session: not in the daemon's terminal's process group.
@@ -321,6 +326,13 @@ unsafe fn child_main(a: &ChildArgs) -> ! {
         }
         if libc::setuid(a.uid) != 0 {
             fail(a, 4);
+        }
+        // A root anti-cheat keeps no root powers it doesn't need (setuid to
+        // anyone else has already cleared them).
+        if let Some(sb) = a.sandbox {
+            if let Err(stage) = sb.drop_caps() {
+                fail(a, stage);
+            }
         }
         // No setuid/file-capability elevation from here on: a protected
         // process (which even root can't inspect) shouldn't become privileged.

@@ -192,7 +192,7 @@ read another's memory:
   was our program that did it.
 - **`lsm-hello`**: milestone 1's smoke test. It logs every file `cat` opens,
   which proves the whole BPF LSM toolchain works end to end.
-- **`fairplay-attest`**: milestone 10, outline only. The plan: the **TPM** chip
+- **`fairplay-attest`**: milestone 10, tested against a software TPM. The **TPM** chip
   records what booted (**measured boot**) and **IMA** records which programs
   ran. On request, the TPM signs those records (a **quote**) and the game
   company's server checks them: was it a known kernel, was `fairplayd` running,
@@ -229,9 +229,11 @@ machine can connect to. Each request and each answer is one line of
 - **`violations`**: a live **stream**. The caller subscribes once, and every
   denied attempt is pushed to it as it happens: which process, which
   executable, which hook. Vendors get detection signal without a driver.
-- **`attest`**: will return the TPM's signed report (milestone 10). The VM has
-  no TPM, so for now it answers `unavailable`, honestly, and echoes the
-  nonce it was given.
+- **`attest`**: returns the TPM's signed report (milestone 10), which also
+  says whether the machine booted in player or developer mode. The VM has
+  no TPM, so there it answers `unavailable`, honestly, and echoes the nonce
+  it was given; `vm/test-attest-swtpm.sh` shows the rest working against a
+  software TPM.
 
 **How it knows who's calling.** The kernel tells it. When a program
 connects, `fairplayd` asks the kernel for the caller's process ID, user and
@@ -290,8 +292,20 @@ they're **tracepoints**, which only watch:
 `fairplayd` still removes the game it launched itself; the kernel has
 usually done it already, and removing twice is harmless.
 
-**When the list is full.** `PROTECTED` holds 1024 processes. If a new child
-doesn't fit, it runs unprotected. Rather than let that happen silently, the
+**A game that forks without end.** The list is shared by every game on the
+machine, so one game that keeps starting processes (a *fork bomb*, on
+purpose or by a bug) could fill it for everyone. Each game may therefore
+have at most a set number of processes it started itself (the *member
+cap*, 1024 unless `fairplayd --member-cap` says otherwise) alive at once.
+Past that, the kernel refuses the game's next fork with `EAGAIN` ("try
+again"), the same error Linux gives a user over their process limit, and
+reports it as a `task_alloc` violation, at most 8 a second so a fork bomb
+can't drown everything else. The list is sized so the caps of all games
+`fairplayd` will run at once fit; `session_status` shows the cap, how many
+processes the game has started, and how many forks were refused.
+
+**When the list is full.** If a new child still doesn't fit, it runs
+unprotected. Rather than let that happen silently, the
 kernel counts it per domain (the `UNFOLLOWED` map) and `session_status`
 reports **`protection_degraded`**, with how many. What a game server does
 about that is its own policy.
@@ -307,7 +321,10 @@ nothing and print three `DENIED` lines. It also checks that the grandchild
 is in `PROTECTED` with the game's domain, that the Wine and `LD_` variables
 never reached it, that its entry is gone while it's still a zombie, that the
 same game started without `fairplayd` leaks 3/3, and that a full `PROTECTED`
-shows up as `protection_degraded`.
+shows up as `protection_degraded`. And it launches a fork bomb (`cheatsim
+forkbomb`) with a cap of 64: it gets exactly 64 processes and then `EAGAIN`,
+a second game still launches and is protected, and killing the bomb leaves
+nothing behind.
 
 ### fairplayd protects itself (milestone 6)
 
@@ -509,15 +526,13 @@ with nothing started.
 
 The design doc promises something no kernel anti-cheat can: the vendor's
 anti-cheat sees the game, and nothing else of your PC. Two walls make that
-true.
+true, and a few smaller rules close the gaps around them.
 
 - **Memory.** The kernel checkpoint that guards reading another process's
   memory now also works the other way round: the anti-cheat (and the game,
   and anything they start) may only reach processes of its own game. Your
   browser, Discord or password manager are off limits, even though they run
   as the same user. Every attempt is refused and reported in the session.
-  What it can still see of other programs is their names and command lines
-  in `/proc`, the same as `ps` shows.
 - **Files.** `fairplayd` starts the anti-cheat in its own **mount
   namespace**: a private view of the file system. It builds a fresh, empty
   root, puts in only what's needed using **bind mounts** (system libraries
@@ -527,18 +542,88 @@ true.
   into it with **pivot_root**. Your home folder simply isn't there. The
   network is, because the vendor talks to its server.
 
+The kernel has to know which processes those rules are for. That's the
+**`SANDBOXED`** list (a BPF map): `fairplayd` adds the anti-cheat to it
+before it runs a single instruction of its own, everything the anti-cheat
+starts is added automatically, and each entry goes when its process exits.
+On top of the two walls, everything on that list gets a few more rules:
+
+- **It may look, not touch.** The anti-cheat needs to *read* the game's
+  memory and its list of loaded modules, never change them. A **seccomp**
+  filter (secure computing mode: a list of **system calls** the kernel
+  refuses for that process and everything it starts) blocks the ways to
+  write to, debug or steer the game: `ptrace`, `process_vm_writev`,
+  `pidfd_getfd` and `process_madvise`. The one way seccomp can't see,
+  opening the game's `/proc/<pid>/mem` file for writing, is refused by the
+  kernel's `file_open` checkpoint. Signals (stop, continue, kill) to
+  anything outside the sandbox, the game included, are refused too: what
+  happens to a cheater's game is the server's decision.
+- **Defence in depth.** The same filter also refuses system calls that
+  nothing reading a game needs, but that could be used to reshape the
+  sandbox from inside: making new **namespaces** (`unshare`, `setns`, and
+  `clone` asking for one), attaching, detaching or changing **mounts**
+  (`mount`, `umount2`, `pivot_root`, `chroot` and the newer `open_tree`
+  family), the kernel **keyring** (`keyctl`, `add_key`, `request_key`),
+  `bpf`, and a few large, bug-prone kernel features nothing here needs
+  (`io_uring`, `perf_event_open`, `userfaultfd`). Most of these already need privileges the anti-cheat normally
+  lacks, so the filter is a second lock on the same door. The exception is
+  a new *user* namespace, which many distributions let any user create:
+  inside it they count as root and may mount things of their own. One
+  wrinkle: `clone3`, the newer way to start a thread or process,
+  keeps its settings where seccomp can't read them, so it's answered with
+  **ENOSYS** ("not implemented"). The standard C library (glibc) then quietly
+  uses the older `clone`, which seccomp *can* check.
+- **No back doors through `/proc`.** Linux's `/proc` folder has a
+  subfolder per process, with special shortcuts (**magic links**) such as
+  `cwd` (the folder it's working in), `root` (its `/`) and `fd/3` (a file
+  it has open). Following one goes straight to that process's view of the
+  files, whatever the follower's mount namespace says. So the game's `cwd`,
+  often your home folder, would be a way out. The kernel refuses the
+  anti-cheat these links for any process outside its sandbox, the game
+  included, and reports each try.
+- **No X11 sockets.** X11 (and XWayland) listen on an **abstract Unix
+  socket**, which has no file, so the mount namespace can't hide it. Any
+  program that connects can log keys and take screenshots. The kernel
+  refuses the anti-cheat every abstract socket and reports the name it
+  tried.
+- **Other programs don't even show up.** The sandbox's `/proc` is mounted
+  with **hidepid**, which lists only the processes the viewer is allowed to
+  inspect. For the anti-cheat that's itself and the game. It can't see the
+  names, command lines or settings of anything else you're running.
+  (Those quiet look-ups aren't reported: a single `ls /proc` would
+  otherwise file hundreds of violations.)
+
 Why not **Landlock**, the obvious tool? A Landlocked program isn't allowed
 to read the memory of anything outside its Landlock sandbox, and the game
 isn't in one, so the anti-cheat couldn't do its job. We checked this on the
 VM's kernel.
 
 **Milestone 9 part B's test** (`vm/test-milestone9b.sh`) has a mock vendor
-read the game (works), try to read a stand-in "browser" (blocked, reported),
-look for a file in your home folder (not there), write to its data folder
-(works, and the file lands in the real folder), and ask `fairplayd` about
-its session (works). It also checks two part A rules: a reader's child, and
-a reader that turns itself into a shell, can't read the game. And the game
-itself isn't sandboxed: it still sees your home folder.
+read the game (works), try to change the game's memory or stop it (blocked,
+reported), try each system call on the seccomp list (all refused, while the
+game, outside the sandbox, gets the kernel's ordinary answers), try to read
+a stand-in "browser" (blocked, reported, and it isn't in the vendor's
+`/proc`), look for a file in your home folder (not there), reach that file
+through the game's `/proc` links (blocked, reported), connect to an abstract
+socket (blocked, reported), list `/proc` (only itself and the game), write
+to its data folder (works, and the file lands in the real folder), and ask
+`fairplayd` about its session (works). It also checks two part A rules: a
+reader's child, and a reader that turns itself into a shell, can't read the
+game. And the game itself isn't sandboxed: it still sees your home folder.
+
+**No root powers either.** If the anti-cheat is started as root, the
+sandbox takes away root's **capabilities** before it runs, all but one:
+the one that lets it read the game's memory (`CAP_SYS_PTRACE`), which the
+kernel rules above already keep to its own game. The system settings in
+`/proc/sys`, and the file that can crash or reboot the machine
+(`/proc/sysrq-trigger`), are made read-only, because root can write them
+on file permissions alone.
+
+**Known weakness.** Under Ubuntu's default **Yama** setting, an
+anti-cheat running as you (not root) can't read your game's memory at all,
+because it isn't the game's parent and has no `CAP_SYS_PTRACE`. The tests
+run it as root for that reason. Fixing this is a design decision that
+hasn't been made yet.
 
 ### Lessons learned writing BPF programs
 
@@ -668,7 +753,30 @@ deliberate change to both files.
   compiled program adapt to each kernel's struct layout at load time. We don't
   use it yet, so programs are built per kernel.
 - **EPERM** / **EACCES**: "operation not permitted" / "permission denied"
-  error codes.
+  error codes. **ENOSYS** is "not implemented": the answer a program gets
+  for a system call the kernel doesn't have.
+- **System call**: a request a program makes to the kernel, such as "open
+  this file" or "start a process". Every program's contact with the
+  outside world goes through them.
+- **seccomp** (secure computing mode): a filter a process installs on
+  itself, and passes on to everything it starts, that makes the kernel
+  refuse chosen system calls. It sees only which call it is and its plain
+  number arguments, not file names or memory. The anti-cheat's sandbox has
+  one.
+- **Defence in depth**: adding a second, independent barrier against
+  something that's already blocked, in case the first one turns out to
+  have a hole.
+- **Capabilities**: root's powers, split into about 40 separate ones (such
+  as "mount file systems" or "load kernel modules") that a process can hold
+  or drop one by one. The **bounding set** is the most a process, and
+  anything it starts, can ever hold again. `CAP_SYS_PTRACE` is the one for
+  reading other processes' memory.
+- **Yama**: a small Linux security module. At Ubuntu's default setting
+  (`ptrace_scope` 1) a process may read another's memory only if it
+  started that process (directly or not) or holds `CAP_SYS_PTRACE`.
+- **Keyring**: the kernel's store of secrets (passwords, encryption keys)
+  for a user or process, shared across that user's programs whatever
+  sandbox they're in.
 - **cgroup** (control group, v2): the kernel's way to group processes and give
   each group a share of CPU, memory and I/O.
 - **uinput**: `/dev/uinput` lets a program create a fake keyboard or mouse.
@@ -772,9 +880,30 @@ deliberate change to both files.
   full), so it runs unprotected.
 - **Session**: one `launch_protected` game plus anything launched into its
   domain, as `fairplayd` tracks it.
+- **Mount**: attaching a file system (a disk, a folder, a memory-only one)
+  at a folder, so its contents appear there. Unmounting detaches it.
+- **Namespace**: a private copy of one part of what a process sees of the
+  system: its mounts, its network, its process list, its users. A **user
+  namespace** gives a process its own set of users, in which it may be
+  root (with powers only over things inside that namespace).
 - **Mount namespace**: a process's own private view of which file systems
   are attached where. Changes inside one (attaching, detaching) don't show
   anywhere else. The anti-cheat's sandbox is one.
+- **clone / clone3**: the system calls under `fork` and new threads.
+  Either can also put the new process in fresh namespaces. `clone3` is the
+  newer one; its options are in memory, which seccomp can't read.
+- **/proc (procfs)**: a folder the kernel fills with one subfolder per
+  running process, showing its command line, memory map, open files and
+  so on. Tools like `ps` read it.
+- **Magic link**: a shortcut in `/proc/<pid>/` (`cwd`, `root`, `exe`,
+  `fd/N`) that leads straight to the process's actual folder or open file,
+  even from inside a different mount namespace. The anti-cheat may follow
+  them only for its own processes.
+- **hidepid**: a `/proc` mount option that lists only the processes the
+  viewer is allowed to inspect. The anti-cheat's `/proc` uses it, so
+  other programs don't appear at all.
+- **`SANDBOXED`**: the BPF map listing the anti-cheat and everything it
+  starts, which the kernel's sandbox rules apply to.
 - **Bind mount**: making a file or folder that already exists appear at a
   second place too, optionally read-only. It's the same file, not a copy:
   what the anti-cheat writes in its bound data folder lands in the real one.
@@ -785,7 +914,8 @@ deliberate change to both files.
   unmounted. The sandbox's empty root, `/tmp` and `/dev` are tmpfs.
 - **Abstract Unix socket**: a Unix socket with a name but no file (written
   `@name`). It belongs to the network side of the system, so a mount
-  namespace can't hide it.
+  namespace can't hide it. X11 listens on one, which is why the anti-cheat
+  is refused them all.
 
 **The socket API**
 
