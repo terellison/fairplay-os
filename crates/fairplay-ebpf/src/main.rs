@@ -6,6 +6,10 @@
 //! one new file in `hooks/`, one `mod` line in `hooks/mod.rs`, and one entry
 //! in fairplayd's `LSM_PROGRAMS`.
 //!
+//! `follow` (milestone 5) keeps PROTECTED in step with the game's process
+//! tree. Its tracing programs are attached from fairplayd's
+//! `TRACING_PROGRAMS`.
+//!
 //! Needs `src/vmlinux.rs` for kernel struct layouts. Generate it on the VM:
 //!     aya-tool generate task_struct > src/vmlinux.rs
 
@@ -22,6 +26,7 @@
 mod vmlinux;
 
 mod domain;
+mod follow;
 mod hooks;
 mod maps;
 

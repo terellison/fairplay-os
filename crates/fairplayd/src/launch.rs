@@ -65,10 +65,7 @@ pub fn prepare(
         let Some((key, _)) = kv.split_once('=') else {
             return Err(bad(format!("env entry {kv:?} is not KEY=VALUE")));
         };
-        // The dynamic loader's variables (LD_PRELOAD, LD_LIBRARY_PATH,
-        // LD_AUDIT, ...) load arbitrary code into the process we are
-        // about to protect: the design doc's "clean launch environment".
-        if key.starts_with("LD_") {
+        if injects_code(key) {
             dropped_env.push(key.to_owned());
             continue;
         }
@@ -81,6 +78,20 @@ pub fn prepare(
         cwd: c(cwd)?,
         dropped_env,
     })
+}
+
+/// Wine's DLL variables: `WINEDLLOVERRIDES` swaps a game's DLL for a
+/// "native" one from its directory, and `WINEDLLPATH` adds directories to
+/// load DLLs from. Either puts a cheat's code inside a Proton game.
+const WINE_DLL_VARS: &[&str] = &["WINEDLLOVERRIDES", "WINEDLLPATH"];
+
+/// Environment variables that load arbitrary code into the process we are
+/// about to protect, dropped for the design doc's "clean launch
+/// environment": the dynamic loader's (LD_PRELOAD, LD_LIBRARY_PATH,
+/// LD_AUDIT, ...) and Wine's DLL variables. Children inherit the clean
+/// environment.
+fn injects_code(key: &str) -> bool {
+    key.starts_with("LD_") || WINE_DLL_VARS.contains(&key)
 }
 
 /// A forked child waiting for [`Paused::release`].
@@ -376,6 +387,48 @@ mod tests {
         let env: Vec<_> = p.envp.iter().map(|c| c.to_str().unwrap()).collect();
         assert_eq!(env, vec!["HOME=/h", "OLD_X=1"]);
         assert_eq!(p.dropped_env, vec!["LD_PRELOAD", "LD_LIBRARY_PATH"]);
+    }
+
+    #[test]
+    fn prepare_drops_wine_dll_variables() {
+        let p = prepare(
+            "/bin/game",
+            &s(&["game"]),
+            &s(&[
+                "WINEDLLOVERRIDES=dxgi=n,b",
+                "WINEPREFIX=/h/pfx",
+                "WINEDLLPATH=/tmp/cheat",
+                "LD_PRELOAD=/tmp/cheat.so",
+                // Exact names only: these are not Wine's DLL variables.
+                "WINEDLLOVERRIDES_X=1",
+                "MY_WINEDLLPATH=1",
+            ]),
+            "/",
+        )
+        .unwrap();
+        let env: Vec<_> = p.envp.iter().map(|c| c.to_str().unwrap()).collect();
+        assert_eq!(
+            env,
+            vec![
+                "WINEPREFIX=/h/pfx",
+                "WINEDLLOVERRIDES_X=1",
+                "MY_WINEDLLPATH=1"
+            ]
+        );
+        assert_eq!(
+            p.dropped_env,
+            vec!["WINEDLLOVERRIDES", "WINEDLLPATH", "LD_PRELOAD"]
+        );
+    }
+
+    #[test]
+    fn code_injecting_variables() {
+        for k in ["LD_PRELOAD", "LD_AUDIT", "WINEDLLOVERRIDES", "WINEDLLPATH"] {
+            assert!(injects_code(k), "{k}");
+        }
+        for k in ["HOME", "WINEPREFIX", "winedlloverrides", "OLD_X", "WINEDLL"] {
+            assert!(!injects_code(k), "{k}");
+        }
     }
 
     fn me() -> Identity {

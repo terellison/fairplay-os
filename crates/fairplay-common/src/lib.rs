@@ -7,6 +7,9 @@
 pub const MAP_PROTECTED: &str = "PROTECTED";
 /// Name of the ring buffer of denied attempts.
 pub const MAP_VIOLATIONS: &str = "VIOLATIONS";
+/// Name of the map from protection domain to the number of processes started
+/// in it that could not be protected (PROTECTED was full).
+pub const MAP_UNFOLLOWED: &str = "UNFOLLOWED";
 
 /// Which LSM hook denied the attempt.
 #[repr(u32)]
@@ -27,6 +30,8 @@ pub struct Violation {
     pub caller: u32,
     /// tgid of the protected process it targeted (0 for non-process targets).
     pub target: u32,
+    /// The target's protection domain, or 0 if it was no longer in the map.
+    pub domain: u32,
     /// A [`Hook`] value.
     pub hook: u32,
     /// The ptrace access mode bits the caller asked for.

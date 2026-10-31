@@ -1,6 +1,7 @@
 //! cheatsim: the attacker for milestone 3.
 //!
 //! Terminal 1:  cheatsim game            # prints its pid and the secret's address
+//!              cheatsim game --depth 2  # same, from a grandchild (milestone 5)
 //! Terminal 2:  sudo fairplayd --obj ... --protect <pid>
 //! Terminal 3:  sudo cheatsim attack --pid <pid> --addr <addr>
 //!
@@ -21,11 +22,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nix::{
     sys::{
-        ptrace,
+        prctl, ptrace,
+        signal::Signal,
         uio::{process_vm_readv, RemoteIoVec},
-        wait::waitpid,
+        wait::{waitpid, WaitStatus},
     },
-    unistd::Pid,
+    unistd::{fork, getpid, getppid, ForkResult, Pid},
 };
 
 #[derive(Parser)]
@@ -37,7 +39,13 @@ struct Args {
 #[derive(Subcommand)]
 enum Cmd {
     /// A stand-in game holding a secret value in memory.
-    Game,
+    Game {
+        /// Fork this many levels first; the deepest descendant holds the
+        /// secret and prints its pid and address (milestone 5: a Proton game
+        /// is a chain of processes). Every level dies with its parent.
+        #[arg(long, default_value_t = 0)]
+        depth: u32,
+    },
     /// Try every read path against the target.
     Attack {
         #[arg(long)]
@@ -58,12 +66,45 @@ fn parse_hex(s: &str) -> Result<u64, String> {
 
 fn main() -> ExitCode {
     match Args::parse().cmd {
-        Cmd::Game => game(),
+        Cmd::Game { depth } => game(depth),
         Cmd::Attack { pid, addr } => attack(Pid::from_raw(pid), addr),
     }
 }
 
-fn game() -> ExitCode {
+fn game(depth: u32) -> ExitCode {
+    for level in 1..=depth {
+        let parent = getpid();
+        // SAFETY: single-threaded so far; the child just carries on here.
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // Die with the parent, so killing the game stops the chain.
+                if let Err(e) = prctl::set_pdeathsig(Signal::SIGTERM) {
+                    eprintln!("cheatsim: PR_SET_PDEATHSIG: {e}");
+                    return ExitCode::FAILURE;
+                }
+                // The parent may have died before the line above.
+                if getppid() != parent {
+                    return ExitCode::FAILURE;
+                }
+            }
+            Ok(ForkResult::Parent { child }) => {
+                eprintln!(
+                    "cheatsim: level {} (pid {}) started level {level} (pid {child})",
+                    level - 1,
+                    std::process::id()
+                );
+                // Wait for it, then leave with its status.
+                return match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, 0)) => ExitCode::SUCCESS,
+                    _ => ExitCode::FAILURE,
+                };
+            }
+            Err(e) => {
+                eprintln!("cheatsim: fork: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let secret = Box::new(SECRET);
     println!(
         "pid={} addr={:#x}",

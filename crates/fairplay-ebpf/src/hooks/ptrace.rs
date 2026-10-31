@@ -1,13 +1,14 @@
 //! `ptrace_access_check` guards every way one process reads or writes
 //! another's memory: ptrace attach, process_vm_readv/writev, and
-//! /proc/<pid>/mem. If the target is registered in PROTECTED and the caller
-//! is not in the same protection domain, the access is denied and logged.
+//! /proc/<pid>/mem. If the target is protected (see `task_domain`) and the
+//! caller is not in the same protection domain, the access is denied and
+//! logged.
 
-use aya_ebpf::{helpers::bpf_probe_read_kernel, macros::lsm, programs::LsmContext};
+use aya_ebpf::{macros::lsm, programs::LsmContext};
 use fairplay_common::Hook;
 
 use crate::{
-    domain::{denied_caller, record_violation, EPERM},
+    domain::{denied_caller_in, record_violation, task_domain, EPERM},
     vmlinux::task_struct,
 };
 
@@ -33,8 +34,10 @@ fn should_deny(ctx: &LsmContext) -> Result<bool, i64> {
     let child: *const task_struct = unsafe { ctx.arg(0) };
     let mode: u32 = unsafe { ctx.arg(1) };
 
-    let target = unsafe { bpf_probe_read_kernel(&(*child).tgid)? } as u32;
-    let Some(caller) = denied_caller(target) else {
+    let Some((target, domain)) = task_domain(child)? else {
+        return Ok(false);
+    };
+    let Some(caller) = denied_caller_in(target, domain) else {
         return Ok(false);
     };
     record_violation(caller, target, Hook::PtraceAccess, mode);

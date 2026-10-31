@@ -24,12 +24,12 @@ use std::{
 use anyhow::{bail, Context, Result};
 use aya::{
     maps::{HashMap, MapData, MapError, RingBuf},
-    programs::Lsm,
+    programs::{BtfTracePoint, Lsm},
     Btf, Ebpf,
 };
 use clap::Parser;
 use fairplay_api::{ProcessState, ViolationEvent, DEFAULT_LAUNCHER_GROUP, DEFAULT_SOCKET};
-use fairplay_common::{Violation, MAP_PROTECTED, MAP_VIOLATIONS};
+use fairplay_common::{Violation, MAP_PROTECTED, MAP_UNFOLLOWED, MAP_VIOLATIONS};
 use tokio::{io::unix::AsyncFd, sync::broadcast};
 
 use crate::state::{c_str, hook_name, Daemon, ProtectedMap, CLI_DOMAIN};
@@ -47,7 +47,7 @@ struct Args {
     #[arg(long, default_value = DEFAULT_LAUNCHER_GROUP)]
     launcher_group: String,
     /// Also protect this already-running process (milestone 3; not tracked
-    /// as a session, and not removed if it exits).
+    /// as a session). Processes it starts from now on join its domain.
     #[arg(long)]
     protect: Vec<u32>,
     /// Process allowed into the --protect processes' domain.
@@ -55,18 +55,27 @@ struct Args {
     allow: Vec<u32>,
 }
 
-/// The kernel's PROTECTED map.
-pub struct BpfMap(HashMap<MapData, u32, u32>);
+/// The kernel's PROTECTED map, and UNFOLLOWED beside it.
+pub struct BpfMap {
+    protected: HashMap<MapData, u32, u32>,
+    unfollowed: HashMap<MapData, u32, u64>,
+}
 
 impl ProtectedMap for BpfMap {
     fn insert(&mut self, pid: u32, domain: u32) -> Result<()> {
-        Ok(self.0.insert(pid, domain, 0)?)
+        Ok(self.protected.insert(pid, domain, 0)?)
     }
     fn remove(&mut self, pid: u32) -> Result<()> {
-        match self.0.remove(&pid) {
+        match self.protected.remove(&pid) {
             Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+    fn unfollowed(&self, domain: u32) -> u64 {
+        self.unfollowed.get(&domain, 0).unwrap_or(0)
+    }
+    fn forget_domain(&mut self, domain: u32) {
+        let _ = self.unfollowed.remove(&domain);
     }
 }
 
@@ -78,6 +87,15 @@ pub type Shared = Arc<Mutex<Daemon<BpfMap>>>;
 const LSM_PROGRAMS: &[(&str, &str)] = &[
     // (program name, LSM hook), one line per hook.
     ("ptrace_access_check", "ptrace_access_check"),
+];
+
+/// Tracing programs that keep PROTECTED in step with the processes in it,
+/// as (program name, tracepoint), from `crates/fairplay-ebpf/src/follow.rs`:
+/// every process a protected process starts joins its domain, and each
+/// leaves the map when it exits. Attached and kept like the LSM programs.
+const TRACING_PROGRAMS: &[(&str, &str)] = &[
+    ("follow_fork", "sched_process_fork"),
+    ("unfollow_exit", "sched_process_exit"),
 ];
 
 fn main() -> Result<()> {
@@ -97,9 +115,20 @@ fn main() -> Result<()> {
         prog.attach().with_context(|| format!("attaching {name}"))?;
     }
 
-    let mut map = BpfMap(HashMap::try_from(
-        ebpf.take_map(MAP_PROTECTED).context("PROTECTED map")?,
-    )?);
+    for &(name, tracepoint) in TRACING_PROGRAMS {
+        let prog: &mut BtfTracePoint = ebpf
+            .program_mut(name)
+            .with_context(|| format!("program {name} missing from object"))?
+            .try_into()?;
+        prog.load(tracepoint, &btf)
+            .with_context(|| format!("loading {name} on tracepoint {tracepoint}"))?;
+        prog.attach().with_context(|| format!("attaching {name}"))?;
+    }
+
+    let mut map = BpfMap {
+        protected: HashMap::try_from(ebpf.take_map(MAP_PROTECTED).context("PROTECTED map")?)?,
+        unfollowed: HashMap::try_from(ebpf.take_map(MAP_UNFOLLOWED).context("UNFOLLOWED map")?)?,
+    };
     for &pid in args.protect.iter().chain(&args.allow) {
         map.insert(pid, CLI_DOMAIN)?;
     }
