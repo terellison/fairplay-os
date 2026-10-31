@@ -2,6 +2,7 @@
 //!
 //!     fairplayctl launch -- cheatsim game       # launcher group or root
 //!     fairplayctl launch --join 1 -- anticheat  # into session 1's domain
+//!     fairplayctl launch --block-virtual-input -- game
 //!     fairplayctl status 1
 //!     fairplayctl violations 1                  # streams until Ctrl-C
 //!     fairplayctl list
@@ -52,11 +53,16 @@ enum Cmd {
         /// [default: the program's directory]. Relative to the current one.
         #[arg(long)]
         install_dir: Option<PathBuf>,
+        /// While this session runs, deny (not just report) virtual input
+        /// from executables not on fairplayd's input allowlist.
+        #[arg(long)]
+        block_virtual_input: bool,
         /// Program and its arguments.
         #[arg(required = true, last = true)]
         command: Vec<String>,
     },
-    /// Is a session protected? Also lockdown mode and virtual input devices.
+    /// Is a session protected? Also lockdown mode and virtual input devices
+    /// (with who made each).
     /// Without SESSION: the session this process belongs to, if any.
     Status { session: Option<SessionId> },
     /// Stream denied attempts as they happen. Without SESSION: your own
@@ -103,12 +109,21 @@ fn run() -> Result<Option<fairplay_api::ApiError>> {
             run_as,
             join,
             install_dir,
+            block_virtual_input,
             command,
         } => {
             if !no_stdio {
                 fds = vec![0, 1, 2];
             }
-            launch_request(command, run_as, join, install_dir)?
+            let mut req = launch_request(command, run_as, join, install_dir)?;
+            if let Request::LaunchProtected {
+                block_virtual_input: b,
+                ..
+            } = &mut req
+            {
+                *b = block_virtual_input;
+            }
+            req
         }
         Cmd::Status { session } => Request::SessionStatus { session },
         Cmd::Violations { session, count } => {
@@ -175,6 +190,7 @@ fn launch_request(
         run_as,
         join,
         install_dir,
+        block_virtual_input: false,
     })
 }
 

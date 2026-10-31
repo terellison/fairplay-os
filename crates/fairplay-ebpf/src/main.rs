@@ -6,6 +6,10 @@
 //! one new file in `hooks/`, one `mod` line in `hooks/mod.rs`, and one entry
 //! in fairplayd's `LSM_PROGRAMS`.
 //!
+//! `input` (milestone 7) records who creates virtual input devices or
+//! writes events into input devices, for the `file_ioctl`,
+//! `file_ioctl_compat` and `file_permission` hooks.
+//!
 //! `follow` (milestone 5) keeps PROTECTED in step with the game's process
 //! tree. Its tracing programs are attached from fairplayd's
 //! `TRACING_PROGRAMS`.
@@ -32,6 +36,7 @@ mod domain;
 mod exec_allow;
 mod follow;
 mod hooks;
+mod input;
 mod maps;
 mod self_protect;
 

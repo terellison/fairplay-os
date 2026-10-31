@@ -10,11 +10,15 @@ use std::{
 
 use anyhow::Result;
 use fairplay_api::{
-    ApiError, ErrorCode, ProcessInfo, ProcessState, Reply, SessionId, SessionInfo, ViolationEvent,
+    ApiError, ErrorCode, Outcome, ProcessInfo, ProcessState, Reply, SessionId, SessionInfo,
+    ViolationEvent,
 };
 use fairplay_common::{ExecAllow, ExecKey, Hook, Violation};
 
-use crate::exec_allow::{ExecEntries, FileId};
+use crate::{
+    exec_allow::{ExecEntries, FileId},
+    input::{InputLog, InputRecord},
+};
 
 /// The kernel's PROTECTED map (tgid -> protection domain), with UNFOLLOWED
 /// and EXEC_ALLOWED (files a domain may map executable), or a fake in tests.
@@ -30,6 +34,9 @@ pub trait ProtectedMap {
     fn forget_domain(&mut self, domain: u32);
     fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()>;
     fn disallow_exec(&mut self, key: ExecKey) -> Result<()>;
+    /// INPUT_BLOCK: deny virtual input from executables not on the input
+    /// allowlist (milestone 7).
+    fn set_input_block(&mut self, on: bool) -> Result<()>;
 }
 
 /// Who is on the other end of a connection, as the kernel reported it
@@ -160,6 +167,8 @@ struct Session {
     members: Vec<Proc>,
     started_at: u64,
     violations: u64,
+    /// Asked for `block_virtual_input` (milestone 7).
+    block_input: bool,
 }
 
 impl Session {
@@ -169,6 +178,10 @@ impl Session {
 
     fn procs_mut(&mut self) -> impl Iterator<Item = &mut Proc> {
         std::iter::once(&mut self.game).chain(&mut self.members)
+    }
+
+    fn running(&self) -> bool {
+        self.procs().any(Proc::running)
     }
 
     /// `unfollowed`: the domain's count from [`ProtectedMap::unfollowed`].
@@ -194,6 +207,10 @@ pub struct Ticket {
     pub domain: u32,
     /// Joining an existing session rather than starting one.
     pub join: bool,
+    /// The launch asked for `block_virtual_input` (milestone 7): until the
+    /// session ends, the kernel denies virtual input from executables not
+    /// on the allowlist. Set by the caller before [`Daemon::register`].
+    pub block_input: bool,
 }
 
 /// What a `violations` subscriber receives.
@@ -220,6 +237,10 @@ pub struct Daemon<M> {
     next_domain: u32,
     /// What this daemon put in EXEC_ALLOWED, per domain (milestone 8).
     exec: ExecEntries,
+    /// Recent virtual input records (milestone 7).
+    input: InputLog,
+    /// What INPUT_BLOCK is set to.
+    input_block: bool,
 }
 
 impl<M: ProtectedMap> Daemon<M> {
@@ -230,6 +251,8 @@ impl<M: ProtectedMap> Daemon<M> {
             next_session: 1,
             next_domain: CLI_DOMAIN + 1,
             exec: ExecEntries::default(),
+            input: InputLog::default(),
+            input_block: false,
         }
     }
 
@@ -315,12 +338,14 @@ impl<M: ProtectedMap> Daemon<M> {
                 session: id,
                 domain: s.domain,
                 join: true,
+                block_input: false,
             });
         }
         let t = Ticket {
             session: self.next_session,
             domain: self.next_domain,
             join: false,
+            block_input: false,
         };
         self.next_session += 1;
         self.next_domain = self.next_domain.checked_add(1).unwrap_or(CLI_DOMAIN + 1);
@@ -343,15 +368,26 @@ impl<M: ProtectedMap> Daemon<M> {
             argv,
             state: ProcessState::Running,
         };
+        if t.join && !self.sessions.contains_key(&t.session) {
+            anyhow::bail!("session {} vanished", t.session);
+        }
+        // Blocking is on before the program runs, or the launch fails.
+        if t.block_input && !self.input_block {
+            self.map
+                .set_input_block(true)
+                .map_err(|e| e.context("turning on virtual input blocking"))?;
+            self.input_block = true;
+            log_input_block(true);
+        }
+        if let Err(e) = self.map.insert(pid, t.domain) {
+            self.sync_input_block();
+            return Err(e);
+        }
         if t.join {
-            let s = self
-                .sessions
-                .get_mut(&t.session)
-                .ok_or_else(|| anyhow::anyhow!("session {} vanished", t.session))?;
-            self.map.insert(pid, t.domain)?;
+            let s = self.sessions.get_mut(&t.session).expect("checked above");
+            s.block_input |= t.block_input;
             s.members.push(proc);
         } else {
-            self.map.insert(pid, t.domain)?;
             self.sessions.insert(
                 t.session,
                 Session {
@@ -362,6 +398,7 @@ impl<M: ProtectedMap> Daemon<M> {
                     members: vec![],
                     started_at: now(),
                     violations: 0,
+                    block_input: t.block_input,
                 },
             );
         }
@@ -387,8 +424,64 @@ impl<M: ProtectedMap> Daemon<M> {
         if !s.procs().any(Proc::running) {
             self.exec.release(&mut self.map, s.domain);
         }
+        self.sync_input_block();
         self.prune_ended();
         Some(id)
+    }
+
+    /// Sets INPUT_BLOCK to whether any running session asked for blocking.
+    fn sync_input_block(&mut self) {
+        let want = self.sessions.values().any(|s| s.block_input && s.running());
+        if want == self.input_block {
+            return;
+        }
+        match self.map.set_input_block(want) {
+            Ok(()) => {
+                self.input_block = want;
+                log_input_block(want);
+            }
+            Err(e) => eprintln!("fairplayd: setting INPUT_BLOCK: {e:#}"),
+        }
+    }
+
+    /// Whether the kernel is denying non-allowlisted virtual input.
+    pub fn input_blocked(&self) -> bool {
+        self.input_block
+    }
+
+    /// Keeps a virtual input record for `session_status`, and turns it into
+    /// one event per running session: virtual input affects every game on
+    /// the machine. None for allowlisted tools, or when no session runs.
+    pub fn record_input(&mut self, r: InputRecord) -> Vec<ViolationEvent> {
+        let mut events = vec![];
+        if r.reportable() {
+            for (&id, s) in self.sessions.iter_mut().filter(|(_, s)| s.running()) {
+                s.violations += 1;
+                events.push(ViolationEvent {
+                    session: Some(id),
+                    caller: r.pid,
+                    comm: r.comm.clone(),
+                    exe: r.exe.clone(),
+                    exe_path: r.exe_path.clone(),
+                    target: 0,
+                    hook: input_hook_name(r.mechanism).into(),
+                    outcome: if r.denied {
+                        Outcome::Denied
+                    } else {
+                        Outcome::Reported
+                    },
+                    mode: r.rdev,
+                    file: Some(r.name.clone()).filter(|f| !f.is_empty()),
+                    seen_at: r.at,
+                });
+            }
+        }
+        self.input.push(r);
+        events
+    }
+
+    pub fn input_log(&self) -> &InputLog {
+        &self.input
     }
 
     fn prune_ended(&mut self) {
@@ -442,6 +535,7 @@ impl<M: ProtectedMap> Daemon<M> {
             exe_path,
             target: v.target,
             hook: hook_name(v.hook).into(),
+            outcome: Outcome::Denied,
             mode: v.mode,
             file: Some(c_str(&v.file)).filter(|f| !f.is_empty()),
             seen_at: now(),
@@ -507,6 +601,13 @@ impl<M: ProtectedMap> Daemon<M> {
     }
 }
 
+fn log_input_block(on: bool) {
+    eprintln!(
+        "fairplayd: virtual input from executables not on the allowlist is now {}",
+        if on { "denied" } else { "reported only" }
+    );
+}
+
 fn not_found(id: SessionId) -> ApiError {
     ApiError::new(ErrorCode::NotFound, format!("no session {id}"))
 }
@@ -514,15 +615,34 @@ fn not_found(id: SessionId) -> ApiError {
 pub fn hook_name(hook: u32) -> &'static str {
     match hook {
         x if x == Hook::PtraceAccess as u32 => "ptrace_access_check",
-        x if x == Hook::UinputOpen as u32 => "file_open(/dev/uinput)",
         x if x == Hook::MmapFile as u32 => "mmap_file",
         x if x == Hook::FileMprotect as u32 => "file_mprotect",
         x if x == Hook::TaskKill as u32 => "task_kill",
         x if x == Hook::BpfMap as u32 => "bpf_map",
         x if x == Hook::BpfProg as u32 => "bpf_prog",
         x if x == Hook::Bpf as u32 => "bpf",
-        _ => "unknown",
+        x => match crate::input::Mechanism::of_hook(x) {
+            Some(m) => input_hook_name(m),
+            None => "unknown",
+        },
     }
+}
+
+/// The `hook` vendors see for virtual input: what was done, not which LSM
+/// hook saw it.
+pub fn input_hook_name(m: crate::input::Mechanism) -> &'static str {
+    use crate::input::Mechanism::*;
+    match m {
+        Uinput => "uinput_create",
+        Uhid => "uhid_create",
+        Evdev => "evdev_write",
+        UinputWrite => "uinput_write",
+    }
+}
+
+/// Seconds since the Unix epoch.
+pub fn unix_now() -> u64 {
+    now()
 }
 
 /// A NUL-padded kernel string.
@@ -554,6 +674,8 @@ mod tests {
         exec: HashMap<ExecKey, ExecAllow>,
         /// Fail exec inserts once this many entries exist.
         exec_fail_at: Option<usize>,
+        input_block: bool,
+        fail_input_block: bool,
     }
 
     impl ProtectedMap for FakeMap {
@@ -582,6 +704,11 @@ mod tests {
         }
         fn disallow_exec(&mut self, key: ExecKey) -> Result<()> {
             self.exec.remove(&key);
+            Ok(())
+        }
+        fn set_input_block(&mut self, on: bool) -> Result<()> {
+            anyhow::ensure!(!self.fail_input_block, "map update failed");
+            self.input_block = on;
             Ok(())
         }
     }
@@ -711,6 +838,7 @@ mod tests {
             domain: 0,
             hook: Hook::PtraceAccess as u32,
             mode: 0x11,
+            flags: 0,
             comm,
             exe,
             file: [0; EXE_NAME_LEN],
@@ -1087,9 +1215,13 @@ mod tests {
     fn kernel_strings_and_hook_names() {
         assert_eq!(c_str(b"cat\0\0\0\0\0\0\0\0\0\0\0\0\0"), "cat");
         assert_eq!(c_str(b"0123456789abcdef"), "0123456789abcdef");
-        assert_eq!(hook_name(Hook::UinputOpen as u32), "file_open(/dev/uinput)");
         assert_eq!(hook_name(Hook::TaskKill as u32), "task_kill");
         assert_eq!(hook_name(Hook::Bpf as u32), "bpf");
+        assert_eq!(hook_name(Hook::UinputCreate as u32), "uinput_create");
+        assert_eq!(hook_name(Hook::UhidCreate as u32), "uhid_create");
+        assert_eq!(hook_name(Hook::EvdevWrite as u32), "evdev_write");
+        assert_eq!(hook_name(Hook::UinputWrite as u32), "uinput_write");
+        assert_eq!(hook_name(2), "unknown");
         assert_eq!(hook_name(77), "unknown");
     }
 
@@ -1110,5 +1242,115 @@ mod tests {
         assert_eq!(hook_name(Hook::FileMprotect as u32), "file_mprotect");
         // Process hooks have no file.
         assert_eq!(d.record_violation(&denied(1, 4242), None).file, None);
+        assert_eq!(ev.outcome, Outcome::Denied);
+    }
+
+    fn input_rec(pid: u32, allowlisted: bool, denied: bool) -> InputRecord {
+        InputRecord {
+            mechanism: crate::input::Mechanism::Uinput,
+            pid,
+            comm: "cheatsim".into(),
+            exe: "cheatsim".into(),
+            exe_path: Some("/usr/bin/cheatsim".into()),
+            name: "clicker".into(),
+            rdev: (10 << 20) | 223,
+            allowlisted,
+            denied,
+            at: 9,
+        }
+    }
+
+    #[test]
+    fn virtual_input_goes_to_every_running_session_unless_allowlisted() {
+        let mut d = Daemon::new(FakeMap::default());
+        // No session: kept for status, reported to nobody.
+        assert!(d.record_input(input_rec(50, false, false)).is_empty());
+        assert_eq!(d.input_log().len(), 1);
+        let alice = launcher(1000);
+        let a = launch(&mut d, &alice, 4242).session;
+        let b = launch(&mut d, &alice, 4243).session;
+        let evs = d.record_input(input_rec(51, false, false));
+        assert_eq!(
+            evs.iter().map(|e| e.session).collect::<Vec<_>>(),
+            [Some(a), Some(b)]
+        );
+        let ev = &evs[0];
+        assert_eq!(ev.hook, "uinput_create");
+        assert_eq!(ev.outcome, Outcome::Reported);
+        assert_eq!((ev.caller, ev.target), (51, 0));
+        assert_eq!(ev.file.as_deref(), Some("clicker"));
+        assert_eq!(ev.exe_path.as_deref(), Some("/usr/bin/cheatsim"));
+        // An allowlisted remapper: nobody hears about it.
+        assert!(d.record_input(input_rec(52, true, false)).is_empty());
+        // Denied creations say so.
+        assert_eq!(
+            d.record_input(input_rec(53, false, true))[0].outcome,
+            Outcome::Denied
+        );
+        // Ended sessions hear nothing more.
+        d.child_exited(4242, EXITED_0);
+        let evs = d.record_input(input_rec(54, false, false));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].session, Some(b));
+        assert_eq!(d.input_log().len(), 5);
+        assert_eq!(d.status(&alice, Some(b)).unwrap().1.unwrap().violations, 3);
+    }
+
+    #[test]
+    fn input_blocking_lasts_as_long_as_a_session_that_asked() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        launch(&mut d, &alice, 4242);
+        assert!(!d.map.input_block);
+        let mut strict = d.begin_launch(&alice, None).unwrap();
+        strict.block_input = true;
+        d.register(strict, 4243, &alice, 1000, vec!["game".into()])
+            .unwrap();
+        assert!(d.map.input_block && d.input_blocked());
+        // The anti-cheat joining keeps the session (and blocking) alive.
+        let j = d.begin_launch(&alice, Some(strict.session)).unwrap();
+        d.register(j, 4244, &alice, 1000, vec!["ac".into()])
+            .unwrap();
+        d.child_exited(4243, EXITED_0);
+        assert!(d.map.input_block, "a member still runs");
+        d.child_exited(4244, EXITED_0);
+        assert!(!d.map.input_block, "the session that asked has ended");
+        // A session that didn't ask never turns it on.
+        d.child_exited(4242, EXITED_0);
+        assert!(!d.map.input_block);
+        // A member can ask on joining; it lasts while the session runs.
+        launch(&mut d, &alice, 4245);
+        let s = d.session_of_pid(4245).unwrap();
+        let mut j = d.begin_launch(&alice, Some(s)).unwrap();
+        j.block_input = true;
+        d.register(j, 4246, &alice, 1000, vec!["ac".into()])
+            .unwrap();
+        d.child_exited(4246, EXITED_0);
+        assert!(d.map.input_block, "the game still runs");
+        d.child_exited(4245, EXITED_0);
+        assert!(!d.map.input_block);
+    }
+
+    #[test]
+    fn input_blocking_that_cannot_be_set_fails_the_launch() {
+        let mut d = Daemon::new(FakeMap {
+            fail_input_block: true,
+            ..Default::default()
+        });
+        let alice = launcher(1000);
+        let mut t = d.begin_launch(&alice, None).unwrap();
+        t.block_input = true;
+        assert!(d.register(t, 4242, &alice, 1000, vec![]).is_err());
+        assert!(!d.input_blocked());
+        assert!(d.map.entries.is_empty(), "nothing protected, nothing runs");
+        // A failed PROTECTED insert turns blocking back off.
+        let mut d = Daemon::new(FakeMap {
+            fail_insert: true,
+            ..Default::default()
+        });
+        let mut t = d.begin_launch(&alice, None).unwrap();
+        t.block_input = true;
+        assert!(d.register(t, 4242, &alice, 1000, vec![]).is_err());
+        assert!(!d.map.input_block && !d.input_blocked());
     }
 }

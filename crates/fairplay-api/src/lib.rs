@@ -83,6 +83,13 @@ pub enum Request {
         /// session; files added or replaced later may not (milestone 8).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         install_dir: Option<String>,
+        /// Deny, not just report, new virtual input (uinput or uhid
+        /// devices, writes into `/dev/input/event*`) from executables not on
+        /// fairplayd's input allowlist, for as long as this session runs
+        /// (milestone 7). Machine-wide while it lasts. Off by default:
+        /// Steam Input and accessibility tools rely on virtual devices.
+        #[serde(default, skip_serializing_if = "is_false")]
+        block_virtual_input: bool,
     },
     /// Whether a session is protected, plus machine state a vendor cares
     /// about. Without `session`: the session the calling process belongs to.
@@ -138,9 +145,56 @@ pub struct StatusReport {
     /// Kernel lockdown mode (`none`, `integrity`, `confidentiality`), or
     /// `None` if the kernel doesn't report one.
     pub lockdown: Option<String>,
-    /// Names of virtual input devices that exist right now (e.g. ones made
-    /// through `/dev/uinput`). Reported, not blocked (milestone 7).
-    pub virtual_input_devices: Vec<String>,
+    /// Virtual input devices that exist right now (made through
+    /// `/dev/uinput` or `/dev/uhid`), with who made them (milestone 7).
+    pub virtual_input_devices: Vec<VirtualInputDevice>,
+}
+
+/// One virtual input device, and the process that made it as far as
+/// fairplayd can tell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualInputDevice {
+    /// The kernel's name for it, e.g. `input7`.
+    pub device: String,
+    /// The name its creator gave it (sysfs `name`).
+    pub name: String,
+    pub kind: InputKind,
+    /// The process that created it: from the kernel's record of the
+    /// creation, matched to this device by name (uinput) or to the live
+    /// processes that opened `/dev/uhid` (uhid). `None` if it was made
+    /// before fairplayd started or the record was forgotten.
+    pub created_by: Option<InputCreator>,
+    /// The creator's executable is on fairplayd's input allowlist. False
+    /// when the creator is unknown.
+    pub allowlisted: bool,
+    /// More than one live process could have made it (the same device name
+    /// twice, or several uhid users); `created_by` is the newest, and
+    /// `allowlisted` holds only if every candidate is allowlisted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ambiguous: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputKind {
+    /// Made through `/dev/uinput`.
+    Uinput,
+    /// Made through `/dev/uhid` (a virtual HID device).
+    Uhid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputCreator {
+    /// tgid (the process id).
+    pub pid: u32,
+    /// Captured in the kernel when it created the device.
+    pub comm: String,
+    /// File name of its executable, captured in the kernel.
+    pub exe: String,
+    /// Full path, if it was running when fairplayd looked.
+    pub exe_path: Option<String>,
+    /// Seconds since the Unix epoch.
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +253,8 @@ pub enum Event {
     },
 }
 
-/// One attempt the kernel denied.
+/// One attempt the kernel denied, or (virtual input, milestone 7) one it
+/// let through and reports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViolationEvent {
     /// Session whose process was targeted (`None` for processes protected
@@ -214,21 +269,43 @@ pub struct ViolationEvent {
     /// Full path of its executable, if it was still running when fairplayd
     /// looked. Best-effort; `exe` is the reliable one.
     pub exe_path: Option<String>,
-    /// The protected process it targeted.
+    /// The protected process it targeted; 0 for virtual input, which
+    /// targets the whole machine.
     pub target: u32,
     /// LSM hook that denied it, e.g. `ptrace_access_check`, or `mmap_file`
     /// / `file_mprotect` for code the game tried to map that isn't on its
-    /// allowlist (then `caller` and `target` are both the game).
+    /// allowlist (then `caller` and `target` are both the game). For
+    /// virtual input: `uinput_create`, `uhid_create`, `evdev_write`, or
+    /// `uinput_write` (input through a uinput device, refused while a
+    /// session blocks virtual input).
     pub hook: String,
+    /// Whether the kernel stopped it. Virtual input is `reported` unless a
+    /// session asked for `block_virtual_input`; everything else is
+    /// `denied`.
+    #[serde(default)]
+    pub outcome: Outcome,
     /// ptrace access mode bits the caller asked for, or for `mmap_file` and
-    /// `file_mprotect` the `PROT_*` bits.
+    /// `file_mprotect` the `PROT_*` bits, or for virtual input the device
+    /// node's kernel `dev_t` (`major << 20 | minor`).
     pub mode: u32,
     /// File name (no directory) of the file it tried to map, for
-    /// `mmap_file` and `file_mprotect`.
+    /// `mmap_file` and `file_mprotect`. For `uinput_create`, the name the
+    /// caller gave the device; for the others, the device node (`uhid`,
+    /// `event3`, `uinput`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// Seconds since the Unix epoch, when fairplayd read the record.
     pub seen_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// The kernel refused it.
+    #[default]
+    Denied,
+    /// The kernel let it happen; this is a report, not a denial.
+    Reported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +377,10 @@ impl From<Result<Reply, ApiError>> for Response {
     }
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Serializes a message as one line, newline included.
 pub fn encode<T: Serialize>(msg: &T) -> Vec<u8> {
     let mut line = serde_json::to_vec(msg).expect("protocol types always serialize");
@@ -354,8 +435,12 @@ mod tests {
                 run_as: None,
                 join: None,
                 install_dir: None,
+                block_virtual_input: false,
             }
         );
+        assert!(!String::from_utf8(encode(&launch))
+            .unwrap()
+            .contains("block_virtual_input"));
     }
 
     #[test]
@@ -369,6 +454,7 @@ mod tests {
                 run_as: Some(1000),
                 join: Some(3),
                 install_dir: Some("/games/x".into()),
+                block_virtual_input: true,
             },
             Request::SessionStatus { session: Some(1) },
             Request::SessionStatus { session: None },
@@ -452,9 +538,34 @@ mod tests {
                 unprotected_children: 2,
             }),
             lockdown: Some("none".into()),
-            virtual_input_devices: vec![],
+            virtual_input_devices: vec![
+                VirtualInputDevice {
+                    device: "input7".into(),
+                    name: "clicker".into(),
+                    kind: InputKind::Uinput,
+                    created_by: Some(InputCreator {
+                        pid: 77,
+                        comm: "cheatsim".into(),
+                        exe: "cheatsim".into(),
+                        exe_path: None,
+                        created_at: 4,
+                    }),
+                    allowlisted: false,
+                    ambiguous: false,
+                },
+                VirtualInputDevice {
+                    device: "input9".into(),
+                    name: "pad".into(),
+                    kind: InputKind::Uhid,
+                    created_by: None,
+                    allowlisted: false,
+                    ambiguous: true,
+                },
+            ],
         }));
         let text = String::from_utf8(encode(&status)).unwrap();
+        assert!(text.contains("\"kind\":\"uinput\""), "{text}");
+        assert_eq!(text.matches("\"ambiguous\"").count(), 1, "{text}");
         assert_eq!(serde_json::from_str::<Response>(&text).unwrap(), status);
     }
 
@@ -468,6 +579,7 @@ mod tests {
             exe_path: None,
             target: 9,
             hook: "ptrace_access_check".into(),
+            outcome: Outcome::Denied,
             mode: 0x11,
             file: None,
             seen_at: 5,
@@ -488,13 +600,23 @@ mod tests {
             exe_path: None,
             target: 9,
             hook: "mmap_file".into(),
+            outcome: Outcome::Denied,
             mode: 0x5,
             file: Some("cheat.so".into()),
             seen_at: 5,
         }));
         let text = String::from_utf8(encode(&mapping)).unwrap();
         assert!(text.contains("\"file\":\"cheat.so\""), "{text}");
+        assert!(text.contains("\"outcome\":\"denied\""), "{text}");
         assert_eq!(serde_json::from_str::<Response>(&text).unwrap(), mapping);
+
+        // An event from before milestone 7 (no outcome) reads as a denial.
+        let old = text.replace(",\"outcome\":\"denied\"", "");
+        assert_eq!(serde_json::from_str::<Response>(&old).unwrap(), mapping);
+        assert_eq!(
+            serde_json::to_string(&Outcome::Reported).unwrap(),
+            "\"reported\""
+        );
     }
 
     #[test]

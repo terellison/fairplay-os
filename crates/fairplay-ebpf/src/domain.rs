@@ -69,7 +69,7 @@ pub fn task_domain(task: *const task_struct) -> Result<Option<(u32, u32)>, i64> 
 /// Writes a [`Violation`] for the current task to VIOLATIONS. Drops it if the
 /// ring buffer is full.
 pub fn record_violation(caller: u32, target: u32, hook: Hook, mode: u32) {
-    record_violation_on_file(caller, target, hook, mode, core::ptr::null());
+    record(caller, target, hook, mode, 0, Name::None);
 }
 
 /// [`record_violation`] for a file hook: also names the file (`file` may be
@@ -81,6 +81,22 @@ pub fn record_violation_on_file(
     mode: u32,
     file: *const file,
 ) {
+    record(caller, target, hook, mode, 0, Name::File(file));
+}
+
+/// What goes in [`Violation::file`].
+pub enum Name {
+    None,
+    /// This file's name (may be null).
+    File(*const file),
+    /// A NUL-terminated kernel string (may be null).
+    Str(*const u8),
+}
+
+/// The general form of [`record_violation`]: any `flags` (`VIOLATION_*`)
+/// and any [`Name`].
+#[inline(always)]
+pub fn record(caller: u32, target: u32, hook: Hook, mode: u32, flags: u32, name: Name) {
     let Some(mut entry) = VIOLATIONS.reserve::<Violation>(0) else {
         return;
     };
@@ -95,15 +111,34 @@ pub fn record_violation_on_file(
         (*v).domain = PROTECTED.get(&target).copied().unwrap_or(0);
         (*v).hook = hook as u32;
         (*v).mode = mode;
+        (*v).flags = flags;
         (*v).comm = bpf_get_current_comm().unwrap_or([0; 16]);
         (*v).exe = [0; EXE_NAME_LEN];
         (*v).file = [0; EXE_NAME_LEN];
         let _ = current_exe_name(&mut (*v).exe);
-        if !file.is_null() {
-            let _ = file_name(file, &mut (*v).file);
+        match name {
+            Name::File(f) if !f.is_null() => {
+                let _ = file_name(f, &mut (*v).file);
+            }
+            Name::Str(s) if !s.is_null() => kernel_str(s, &mut (*v).file),
+            _ => {}
         }
     }
     entry.submit(0);
+}
+
+/// The current task's executable (`current->mm->exe_file`), or null for
+/// kernel threads.
+pub fn current_exe() -> Result<*const file, i64> {
+    unsafe {
+        let task = bpf_get_current_task() as *const task_struct;
+        let mm: *const mm_struct = bpf_probe_read_kernel(task_mm(task))?;
+        if mm.is_null() {
+            return Ok(core::ptr::null());
+        }
+        let exe: *mut file = bpf_probe_read_kernel(mm_exe_file(mm))?;
+        Ok(exe)
+    }
 }
 
 /// The file name of the current task's executable
@@ -111,18 +146,11 @@ pub fn record_violation_on_file(
 /// short-lived caller is usually gone by the time user space could look at
 /// `/proc/<pid>/exe`. Leaves `out` zeroed on failure (e.g. kernel threads).
 fn current_exe_name(out: &mut [u8; EXE_NAME_LEN]) -> Result<(), i64> {
-    unsafe {
-        let task = bpf_get_current_task() as *const task_struct;
-        let mm: *const mm_struct = bpf_probe_read_kernel(task_mm(task))?;
-        if mm.is_null() {
-            return Ok(());
-        }
-        let exe: *const file = bpf_probe_read_kernel(mm_exe_file(mm))?;
-        if exe.is_null() {
-            return Ok(());
-        }
-        file_name(exe, out)
+    let exe = current_exe()?;
+    if exe.is_null() {
+        return Ok(());
     }
+    file_name(exe, out)
 }
 
 /// `file->f_path.dentry->d_name`, NUL-terminated, cut to fit `out`.
@@ -130,12 +158,19 @@ fn file_name(f: *const file, out: &mut [u8; EXE_NAME_LEN]) -> Result<(), i64> {
     unsafe {
         let dentry: *const dentry = bpf_probe_read_kernel(addr_of!((*file_path(f)).dentry))?;
         let name: *const u8 = bpf_probe_read_kernel(addr_of!((*dentry_name(dentry)).name))?;
-        // Room for the NUL, so the result is always terminated.
+        kernel_str(name, out);
+    }
+    Ok(())
+}
+
+/// Copies a NUL-terminated kernel string into `out`, cut to fit and always
+/// terminated.
+fn kernel_str(s: *const u8, out: &mut [u8; EXE_NAME_LEN]) {
+    unsafe {
         bpf_probe_read_kernel_str(
             out.as_mut_ptr() as *mut c_void,
             (EXE_NAME_LEN - 1) as u32,
-            name as *const c_void,
+            s as *const c_void,
         );
     }
-    Ok(())
 }

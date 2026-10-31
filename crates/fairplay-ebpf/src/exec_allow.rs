@@ -85,20 +85,52 @@ fn allowed(file: *const file, domain: u32) -> Result<bool, i64> {
             }
             _ => {}
         }
-        let ino: u64 = bpf_probe_read_kernel(inode_ino(inode))?;
-        let generation: u32 = bpf_probe_read_kernel(inode_generation(inode))?;
-        for d in [domain, ANY_DOMAIN] {
-            let key = ExecKey {
-                domain: d,
-                dev,
-                ino,
-            };
-            if let Some(v) = EXEC_ALLOWED.get(&key) {
-                if v.flags & EXEC_CHECK_GENERATION == 0 || v.generation == generation {
-                    return Ok(true);
-                }
-            }
+        let (ino, generation) = inode_id(inode)?;
+        Ok([domain, ANY_DOMAIN]
+            .into_iter()
+            .any(|d| listed(&EXEC_ALLOWED, d, dev, ino, generation)))
+    }
+}
+
+/// `file`'s identity as the allowlist maps key it: (superblock device,
+/// inode number, inode generation). Shared with the input allowlist.
+#[inline(always)]
+pub fn file_id(file: *const file) -> Result<(u32, u64, u32), i64> {
+    unsafe {
+        let inode: *const inode = bpf_probe_read_kernel(file_inode(file))?;
+        if inode.is_null() {
+            return Err(0);
         }
-        Ok(false)
+        let sb: *const super_block = bpf_probe_read_kernel(inode_sb(inode))?;
+        let dev: u32 = bpf_probe_read_kernel(sb_dev(sb))?;
+        let (ino, generation) = inode_id(inode)?;
+        Ok((dev, ino, generation))
+    }
+}
+
+#[inline(always)]
+unsafe fn inode_id(inode: *const inode) -> Result<(u64, u32), i64> {
+    unsafe {
+        Ok((
+            bpf_probe_read_kernel(inode_ino(inode))?,
+            bpf_probe_read_kernel(inode_generation(inode))?,
+        ))
+    }
+}
+
+/// Whether `map` (EXEC_ALLOWED or INPUT_ALLOWED) has this file for
+/// `domain`, with a matching generation if the entry recorded one.
+#[inline(always)]
+pub fn listed(
+    map: &HashMap<ExecKey, ExecAllow>,
+    domain: u32,
+    dev: u32,
+    ino: u64,
+    generation: u32,
+) -> bool {
+    let key = ExecKey { domain, dev, ino };
+    match unsafe { map.get(&key) } {
+        Some(v) => v.flags & EXEC_CHECK_GENERATION == 0 || v.generation == generation,
+        None => false,
     }
 }
