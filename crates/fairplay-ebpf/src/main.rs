@@ -10,6 +10,9 @@
 //! tree. Its tracing programs are attached from fairplayd's
 //! `TRACING_PROGRAMS`.
 //!
+//! `self_protect` (milestone 6) keeps every other process, root included,
+//! away from fairplayd itself while it runs with `--self-protect`.
+//!
 //! Needs `src/vmlinux.rs` for kernel struct layouts. Generate it on the VM:
 //!     aya-tool generate task_struct > src/vmlinux.rs
 
@@ -30,6 +33,7 @@ mod exec_allow;
 mod follow;
 mod hooks;
 mod maps;
+mod self_protect;
 
 #[cfg(not(test))]
 #[panic_handler]

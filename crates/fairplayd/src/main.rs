@@ -1,4 +1,4 @@
-//! fairplayd (milestones 3, 4 and 8).
+//! fairplayd (milestones 3, 4, 5, 6 and 8).
 //!
 //! Loads the BPF LSM program, owns the PROTECTED map, and serves the design
 //! doc's vendor-facing API on a Unix socket (see the `fairplay-api` crate):
@@ -10,6 +10,10 @@
 //!     sudo fairplayd --obj fairplay.o                    # socket API only
 //!     sudo fairplayd --obj fairplay.o --protect <pid>    # milestone 3 style
 //!     sudo fairplayd --obj fairplay.o --overlay /usr/local/lib/overlay.so
+//!     sudo fairplayd --obj fairplay.o --self-protect-for 60
+//!
+//! With `--self-protect` (milestone 6, see `self_protect`) not even root may
+//! kill, trace or detach it, or touch its maps. It is off by default.
 //!
 //! The kernel enforces, fairplayd decides who is protected, and the vendor's
 //! server sets policy. Protection ends when fairplayd exits (fails open).
@@ -17,6 +21,7 @@
 mod exec_allow;
 mod host;
 mod launch;
+mod self_protect;
 mod server;
 mod state;
 
@@ -65,6 +70,16 @@ struct Args {
     /// fairplayd starts, so replacing the file un-approves it.
     #[arg(long)]
     overlay: Vec<PathBuf>,
+    /// Protect fairplayd itself (milestone 6): no other process, root
+    /// included, may signal or trace it, open its BPF maps or programs,
+    /// load a BPF program, or detach one. Nothing turns it off but
+    /// fairplayd exiting: Ctrl-C at its terminal, or a reboot.
+    #[arg(long)]
+    self_protect: bool,
+    /// --self-protect for this many seconds, then turn it off and exit
+    /// normally. For tests on a shared machine.
+    #[arg(long, value_name = "SECONDS", conflicts_with = "self_protect")]
+    self_protect_for: Option<u64>,
 }
 
 /// The kernel's PROTECTED map, UNFOLLOWED beside it, and EXEC_ALLOWED.
@@ -111,6 +126,11 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("ptrace_access_check", "ptrace_access_check"),
     ("mmap_file", "mmap_file"),
     ("file_mprotect", "file_mprotect"),
+    // Self-protection (milestone 6); inert unless --self-protect.
+    ("task_kill", "task_kill"),
+    ("bpf", "bpf"),
+    ("bpf_map", "bpf_map"),
+    ("bpf_prog", "bpf_prog"),
 ];
 
 /// Tracing programs that keep PROTECTED in step with the processes in it,
@@ -199,6 +219,17 @@ fn main() -> Result<()> {
     }
     let ring = RingBuf::try_from(ebpf.take_map(MAP_VIOLATIONS).context("VIOLATIONS map")?)?;
 
+    // Last, once every program is attached and every map taken.
+    let mut guard = if args.self_protect || args.self_protect_for.is_some() {
+        Some(self_protect::SelfProtect::enable(&mut ebpf)?)
+    } else {
+        None
+    };
+    let protect_for = args.self_protect_for.map(std::time::Duration::from_secs);
+    if let Some(d) = protect_for {
+        eprintln!("fairplayd: will turn self-protection off and exit in {d:?}");
+    }
+
     let launcher_gid = host::group_gid(&args.launcher_group);
     match launcher_gid {
         Some(g) => eprintln!(
@@ -238,9 +269,19 @@ fn main() -> Result<()> {
             system_devs,
         };
         tokio::spawn(read_violations(ring, daemon, events));
+        let deadline = async {
+            match protect_for {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             r = server::serve(listener, ctx) => r?,
             _ = shutdown_signal() => {}
+            _ = deadline => eprintln!("fairplayd: self-protection time is up"),
+        }
+        if let Some(g) = guard.as_mut() {
+            g.disable()?;
         }
         let _ = std::fs::remove_file(&args.socket);
         eprintln!("fairplayd: stopping; protected processes still running are no longer protected");

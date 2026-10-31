@@ -13,6 +13,12 @@
 //! Milestone 8: `cheatsim game --dlopen <lib>` (or `--dlopen-stdin`) has the
 //! game load a library after startup, as a game tricked into loading a
 //! dropped cheat would, and prints LOADED or BLOCKED.
+//!
+//! Milestone 6: `cheatsim self-attack --pid <fairplayd>` tries, as root, to
+//! get at fairplayd itself the ways `kill` and `bpftool` don't cover: read
+//! its memory or steal its file descriptors, load a BPF program of its own,
+//! and detach programs. Each attempt prints BLOCKED (EPERM or EACCES) or
+//! WORKED.
 
 use std::{
     fs::File,
@@ -25,6 +31,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nix::{
+    errno::Errno,
     sys::{
         prctl, ptrace,
         signal::Signal,
@@ -72,6 +79,15 @@ enum Cmd {
         #[arg(long, value_parser = parse_hex)]
         addr: u64,
     },
+    /// Try to get around a self-protecting fairplayd (milestone 6).
+    SelfAttack {
+        /// fairplayd's pid.
+        #[arg(long)]
+        pid: i32,
+        /// Also try to open this BPF program of fairplayd's by id.
+        #[arg(long)]
+        prog_id: Option<u32>,
+    },
 }
 
 const SECRET: u64 = 0x5EC2_E713_37C0_DE11;
@@ -90,6 +106,7 @@ fn main() -> ExitCode {
             dlopen_stdin,
         } => game(depth, &dlopen, dlopen_stdin),
         Cmd::Attack { pid, addr } => attack(Pid::from_raw(pid), addr),
+        Cmd::SelfAttack { pid, prog_id } => self_attack(Pid::from_raw(pid), prog_id),
     }
 }
 
@@ -304,4 +321,135 @@ fn via_proc_mem(pid: Pid, addr: u64) -> Result<u64> {
     let mut buf = [0u8; 8];
     f.read_exact(&mut buf).context("read")?;
     Ok(u64::from_ne_bytes(buf))
+}
+
+/// One attempt against fairplayd: Ok if it worked, else the errno.
+type SelfAttempt = Box<dyn Fn() -> Result<(), Errno>>;
+
+fn self_attack(pid: Pid, prog_id: Option<u32>) -> ExitCode {
+    let mut attempts: Vec<(&str, SelfAttempt)> = vec![
+        (
+            "ptrace attach",
+            Box::new(move || {
+                ptrace::attach(pid)?;
+                let _ = waitpid(pid, None);
+                let _ = ptrace::detach(pid, None);
+                Ok(())
+            }),
+        ),
+        (
+            "process_vm_readv",
+            Box::new(move || {
+                let mut buf = [0u8; 8];
+                // Any address: the access check comes first.
+                let remote = [RemoteIoVec {
+                    base: 0x1000,
+                    len: 8,
+                }];
+                process_vm_readv(pid, &mut [IoSliceMut::new(&mut buf)], &remote).map(drop)
+            }),
+        ),
+        (
+            "open /proc/<pid>/mem",
+            Box::new(move || {
+                File::open(format!("/proc/{pid}/mem"))
+                    .map(drop)
+                    .map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(0)))
+            }),
+        ),
+        (
+            "pidfd_getfd (copy its fd 3)",
+            Box::new(move || steal_fd(pid, 3)),
+        ),
+        (
+            "bpf(BPF_PROG_LOAD) socket filter",
+            Box::new(load_trivial_prog),
+        ),
+        (
+            "bpf(BPF_LINK_DETACH)",
+            // link_fd = -1: without the LSM this fails with EBADF.
+            Box::new(|| bpf_cmd(BPF_LINK_DETACH, &u32::MAX.to_ne_bytes()).map(drop)),
+        ),
+        (
+            "bpf(BPF_PROG_DETACH)",
+            // Without the LSM: EBADF or EINVAL, from the zeroed attributes.
+            Box::new(|| bpf_cmd(BPF_PROG_DETACH, &[]).map(drop)),
+        ),
+    ];
+    if let Some(id) = prog_id {
+        attempts.push((
+            "bpf(BPF_PROG_GET_FD_BY_ID)",
+            Box::new(move || {
+                let fd = bpf_cmd(BPF_PROG_GET_FD_BY_ID, &id.to_ne_bytes())?;
+                // SAFETY: a fresh fd we own.
+                unsafe { libc::close(fd) };
+                Ok(())
+            }),
+        ));
+    }
+    let mut got_past = 0;
+    for (name, f) in &attempts {
+        match f() {
+            Ok(()) => {
+                got_past += 1;
+                println!("WORKED  {name}");
+            }
+            Err(e @ (Errno::EPERM | Errno::EACCES)) => println!("BLOCKED {name}: {e}"),
+            // Refused for some other reason: not the protection.
+            Err(e) => {
+                got_past += 1;
+                println!("FAILED  {name}: {e} (not a permission error)");
+            }
+        }
+    }
+    println!("{got_past}/{} attempts got past fairplayd", attempts.len());
+    if got_past == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+const BPF_PROG_LOAD: libc::c_long = 5;
+const BPF_PROG_DETACH: libc::c_long = 9;
+const BPF_PROG_GET_FD_BY_ID: libc::c_long = 13;
+const BPF_LINK_DETACH: libc::c_long = 34;
+
+/// `bpf(cmd, attr, sizeof attr)` with `prefix` as the first bytes of an
+/// otherwise zeroed `union bpf_attr`.
+fn bpf_cmd(cmd: libc::c_long, prefix: &[u8]) -> Result<i32, Errno> {
+    let mut attr = [0u8; 128];
+    attr[..prefix.len()].copy_from_slice(prefix);
+    // SAFETY: attr is a fully initialised buffer the size we pass.
+    let rc = unsafe { libc::syscall(libc::SYS_bpf, cmd, attr.as_ptr(), attr.len() as u32) };
+    Errno::result(rc).map(|fd| fd as i32)
+}
+
+/// Loads `r0 = 0; exit` as a socket filter, about the smallest program
+/// there is, and closes it again.
+fn load_trivial_prog() -> Result<(), Errno> {
+    // BPF_MOV64_IMM(BPF_REG_0, 0), BPF_EXIT_INSN(), as little-endian words.
+    let insns: [u64; 2] = [0xb7, 0x95];
+    let license = c"GPL";
+    let mut attr = [0u8; 24];
+    attr[0..4].copy_from_slice(&1u32.to_ne_bytes()); // BPF_PROG_TYPE_SOCKET_FILTER
+    attr[4..8].copy_from_slice(&2u32.to_ne_bytes()); // insn_cnt
+    attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
+    attr[16..24].copy_from_slice(&(license.as_ptr() as u64).to_ne_bytes());
+    let fd = bpf_cmd(BPF_PROG_LOAD, &attr)?;
+    // SAFETY: a fresh fd we own.
+    unsafe { libc::close(fd) };
+    Ok(())
+}
+
+/// `pidfd_getfd`: copy one of the target's file descriptors.
+fn steal_fd(pid: Pid, fd: i32) -> Result<(), Errno> {
+    // SAFETY: plain syscalls; the fds they return are closed here.
+    unsafe {
+        let pidfd = Errno::result(libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0))? as i32;
+        let copy = Errno::result(libc::syscall(libc::SYS_pidfd_getfd, pidfd, fd, 0));
+        libc::close(pidfd);
+        libc::close(copy? as i32);
+    }
+    Ok(())
 }

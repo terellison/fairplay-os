@@ -517,6 +517,10 @@ pub fn hook_name(hook: u32) -> &'static str {
         x if x == Hook::UinputOpen as u32 => "file_open(/dev/uinput)",
         x if x == Hook::MmapFile as u32 => "mmap_file",
         x if x == Hook::FileMprotect as u32 => "file_mprotect",
+        x if x == Hook::TaskKill as u32 => "task_kill",
+        x if x == Hook::BpfMap as u32 => "bpf_map",
+        x if x == Hook::BpfProg as u32 => "bpf_prog",
+        x if x == Hook::Bpf as u32 => "bpf",
         _ => "unknown",
     }
 }
@@ -1084,6 +1088,8 @@ mod tests {
         assert_eq!(c_str(b"cat\0\0\0\0\0\0\0\0\0\0\0\0\0"), "cat");
         assert_eq!(c_str(b"0123456789abcdef"), "0123456789abcdef");
         assert_eq!(hook_name(Hook::UinputOpen as u32), "file_open(/dev/uinput)");
+        assert_eq!(hook_name(Hook::TaskKill as u32), "task_kill");
+        assert_eq!(hook_name(Hook::Bpf as u32), "bpf");
         assert_eq!(hook_name(77), "unknown");
     }
 
