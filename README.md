@@ -17,11 +17,11 @@ each piece does, how they fit, and a glossary.
 | `crates/fairplay-api` | 4 | The socket protocol (JSON types), a client, and `fairplayctl` |
 | `crates/lsm-hello-ebpf` | 1 | Smoke-test LSM program: logs every `file_open` by `cat` |
 | `crates/lsm-hello` | 1 | Loads it and prints its log |
-| `crates/fairplay-ebpf` | 3, 5, 8 | LSM programs on `ptrace_access_check`, `mmap_file` and `file_mprotect` (executable-mapping allowlist), plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
-| `crates/fairplayd` | 3-5, 8 | Loads the programs, owns the PROTECTED and EXEC_ALLOWED maps, serves the socket API, streams violations |
-| `crates/cheatsim` | 3, 5, 8 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant; `game --dlopen` loads libraries like a tricked game |
+| `crates/fairplay-ebpf` | 3, 5, 6, 8 | LSM programs on `ptrace_access_check`, `mmap_file` and `file_mprotect` (executable-mapping allowlist), `task_kill`, `bpf`, `bpf_map` and `bpf_prog` (self-protection), plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
+| `crates/fairplayd` | 3-6, 8 | Loads the programs, owns the PROTECTED and EXEC_ALLOWED maps, serves the socket API, streams violations; `--self-protect` fences root away from it |
+| `crates/cheatsim` | 3, 5, 6, 8 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant; `game --dlopen` loads libraries like a tricked game; `self-attack` goes after fairplayd itself |
 | `crates/fairplay-attest` | 10 | API shape only |
-| `vm/` | 1-5, 8 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5 and 8 tests |
+| `vm/` | 1-6, 8 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5, 6 and 8 tests |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
 
@@ -175,6 +175,99 @@ still an unreaped zombie. As controls, the same game started without
 `fairplayd` leaks 3/3, and with `PROTECTED` filled up a new child is reported
 as `protection_degraded`.
 
+## Milestone 6: fairplayd protects itself
+
+In player mode root may be the cheater, and the cheapest cheat is to switch
+the protection off: kill `fairplayd`, edit `PROTECTED`, or detach its
+programs. With `--self-protect`, `fairplayd` fences every other process,
+root included, away from itself, with four more LSM programs
+(`crates/fairplay-ebpf/src/hooks/`, shared logic in `self_protect.rs`):
+
+| Hook | What it refuses from any other process | DENIED `mode=` |
+| --- | --- | --- |
+| `task_kill` | any signal to `fairplayd`, SIGKILL and SIGSTOP included (signal 0, "does it exist?", is allowed) | the signal |
+| `ptrace_access_check` | ptrace, `/proc/<pid>/mem`, `process_vm_readv`/`writev`, `pidfd_getfd`, `/proc/<pid>/fd` | ptrace mode bits |
+| `bpf_map` | a file descriptor for any of `fairplayd`'s maps (`bpftool map dump/update id N`, a pin) | requested `FMODE_*` |
+| `bpf_prog` | a file descriptor for any of its programs | 0 |
+| `bpf` | `BPF_PROG_LOAD` (every program type), `BPF_LINK_GET_FD_BY_ID`, `BPF_LINK_DETACH`, `BPF_PROG_DETACH` | the command |
+
+It is keyed on `fairplayd`'s tgid in a one-entry map, `SELF_PROTECT`, which
+is 0 (all four hooks inert) unless asked for. "Its maps and programs" are
+every BPF object `fairplayd` holds an fd for when it turns protection on
+(read from `/proc/self/fdinfo`), listed by kernel id in `SELF_OBJECTS`;
+`SELF_PROTECT` and `SELF_OBJECTS` are on that list themselves. The ids are
+logged at startup (`self-protection on for pid N: maps PROTECTED=12 ...`),
+since `bpftool` can no longer show them.
+
+Why **all** program loads: a tracing program reads the memory of whatever
+process it runs in with `bpf_probe_read_user`, which no LSM hook sees, and
+most other program types (socket filters, cgroup programs) get the same
+helper when root loads them, some running in the game's context when it
+sends or connects. A competing LSM program could also deny what
+`fairplayd` needs. The cost: while self-protection is on, nothing else can
+load BPF programs, including systemd's `IPAddressDeny=`, `DeviceAllow=`,
+`RestrictFileSystems=` and socket-bind filters. Player mode will have to
+start those before `fairplayd`, or have `fairplayd` load them.
+
+Signals the kernel raises itself (SIGCHLD from a game exiting, SIGPIPE, a
+terminal's Ctrl-C) don't go through `task_kill`, so they still arrive.
+Kernel-internal ptrace checks (`PTRACE_MODE_NOAUDIT`: `ps` reading
+`/proc/<pid>/stat`) are refused quietly for `fairplayd`, without a DENIED
+line.
+
+**Off unless asked for.** Developer mode, and this shared VM, keep normal
+root. There is no socket call to turn it off. The ways out:
+
+    sudo fairplayd --obj ... --self-protect            # until it exits: Ctrl-C at its terminal, or reboot
+    sudo fairplayd --obj ... --self-protect-for 60     # tests: off after 60 s, then exits normally
+
+**Not covered here**, and what covers it instead:
+
+- Changing the running kernel: modules, `/dev/mem`, `/proc/kcore`, `kexec`,
+  hibernating and editing the image. Kernel lockdown (integrity), player
+  mode.
+- Rebooting into another kernel or developer mode: attestation.
+- Kernel-raised signals root can provoke: `cgroup.kill` or `cgroup.freeze`
+  on `fairplayd`'s cgroup, the OOM killer (raise its `oom_score_adj`, then
+  exhaust memory or lower `memory.max`), `RLIMIT_CPU` via `prlimit`
+  (SIGXCPU, then SIGKILL), and its controlling terminal (SIGINT, SIGHUP).
+  None of these pass through `task_kill`. Player mode should run it as a
+  service with no terminal in its own cgroup, and later hooks can refuse
+  writes to that cgroup's files and to `/proc/<pid>/oom_score_adj`, and
+  `task_setrlimit` on it.
+- Slowing it down rather than stopping it: `nice`, scheduler policy, CPU
+  affinity, I/O priority (`task_setnice`, `task_setscheduler`,
+  `task_setioprio` hooks could refuse those).
+- Reading the swap device (pages of `fairplayd` or the game swapped out):
+  encrypted swap, or zram only.
+- File descriptors to its BPF objects taken before self-protection started,
+  and BPF programs loaded before it and attached later: player mode starts
+  `fairplayd` early in boot, before any login.
+- CPU-wide `perf_event_open` sampling the user stack and registers of
+  whatever runs (no ptrace check when no pid is named): a `perf_event_open`
+  LSM hook, or `perf_event_paranoid` with lockdown.
+- Its socket: root can delete `/run/fairplayd.sock` and serve a fake one.
+  Clients should check the peer (`SO_PEERCRED`) or rely on attestation.
+- Replacing `fairplayd` or its BPF object on disk for the next start: the
+  signed read-only image and attestation.
+
+The exit test, inside the VM, as your normal user:
+
+    flock /run/lock/fairplay-vm-tests ./vm/test-milestone6.sh
+
+First, without `--self-protect`, root's `kill -9` ends `fairplayd` (developer
+mode is unchanged). Then it starts `fairplayd --self-protect-for 60` and, as
+root, tries `kill -9`, `kill -STOP` and `kill -TERM`; `bpftool map dump` and
+`map update` on `PROTECTED`, `map update` on `SELF_PROTECT` (switching it
+off), `prog dump` of a `fairplayd` program and `link detach`; and
+`cheatsim self-attack`: ptrace attach, `process_vm_readv`, opening
+`/proc/<pid>/mem`, `pidfd_getfd`, loading a trivial socket filter, raw
+`BPF_LINK_DETACH` and `BPF_PROG_DETACH`, and opening a program by id. Each
+must fail with one `DENIED` line. A game launched meanwhile is still
+protected, and its exit still reaches `fairplayd`. Finally `fairplayd` turns
+self-protection off on its own, exits with status 0, and leaves no program
+loaded.
+
 ## Milestone 8: executable-mapping allowlist
 
 `LD_PRELOAD` and Wine's DLL variables are dropped at launch, but a game can
@@ -259,7 +352,7 @@ exits.
 
 CI (`.github/workflows/ci.yml`) runs on every PR: fmt, clippy, unit tests,
 both eBPF builds, the full milestone 2 test, and shellcheck. It can't load BPF
-programs, so milestones 1, 3, 4, 5 and 8 still need a run on the VM; see
+programs, so milestones 1, 3, 4, 5, 6 and 8 still need a run on the VM; see
 [docs/GUIDE.md](docs/GUIDE.md#what-ci-checks).
 
 User-space crates build and test anywhere Linux runs: `cargo test --workspace`.

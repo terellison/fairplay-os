@@ -16,6 +16,37 @@ pub const MAP_EXEC_TRUSTED_FS: &str = "EXEC_TRUSTED_FS";
 /// Name of the map from protection domain to the number of processes started
 /// in it that could not be protected (PROTECTED was full).
 pub const MAP_UNFOLLOWED: &str = "UNFOLLOWED";
+/// Name of the one-entry array holding fairplayd's own tgid while it
+/// protects itself, 0 otherwise (milestone 6).
+pub const MAP_SELF_PROTECT: &str = "SELF_PROTECT";
+/// Name of the set of fairplayd's own BPF objects ([`self_object_key`] ->
+/// 1) that no other process may open while it protects itself.
+pub const MAP_SELF_OBJECTS: &str = "SELF_OBJECTS";
+
+/// [`self_object_key`] kind: a BPF map.
+pub const SELF_MAP: u32 = 1;
+/// [`self_object_key`] kind: a BPF program.
+pub const SELF_PROG: u32 = 2;
+/// [`self_object_key`] kind: a BPF link (an attached program).
+pub const SELF_LINK: u32 = 3;
+
+/// Key in [`MAP_SELF_OBJECTS`]: the object's kind (`SELF_*`) and its
+/// kernel id, the one `bpftool` shows.
+pub const fn self_object_key(kind: u32, id: u32) -> u64 {
+    (kind as u64) << 32 | id as u64
+}
+
+/// `bpf(2)` commands (`enum bpf_cmd` in `<linux/bpf.h>`) that only
+/// fairplayd may use while it protects itself.
+pub const BPF_PROG_LOAD: u32 = 5;
+pub const BPF_PROG_DETACH: u32 = 9;
+pub const BPF_LINK_GET_FD_BY_ID: u32 = 30;
+pub const BPF_LINK_DETACH: u32 = 34;
+
+/// `PTRACE_MODE_NOAUDIT` (`<linux/ptrace.h>`, kernel-internal): the kernel
+/// is only checking, e.g. to decide which `/proc/<pid>/stat` fields `ps`
+/// may see, not acting on a request to access the process.
+pub const PTRACE_MODE_NOAUDIT: u32 = 0x04;
 
 /// Which LSM hook denied the attempt.
 #[repr(u32)]
@@ -32,6 +63,20 @@ pub enum Hook {
     /// `file_mprotect`: a protected process making a file-backed mapping
     /// executable after the fact, same allowlist (milestone 8).
     FileMprotect = 4,
+    // Milestone 6, fairplayd protecting itself. Numbered apart so that other
+    // milestones' hooks can take the next small numbers. The target is
+    // fairplayd's own pid. Tracing or reading fairplayd's memory is
+    // `PtraceAccess` with fairplayd as the target.
+    /// `task_kill`: a signal to fairplayd from another process.
+    TaskKill = 16,
+    /// `bpf_map`: another process opening one of fairplayd's maps (by id,
+    /// or from a pin).
+    BpfMap = 17,
+    /// `bpf_prog`: another process opening one of fairplayd's programs.
+    BpfProg = 18,
+    /// `bpf`: another process using a `bpf(2)` command reserved for
+    /// fairplayd (loading a program, detaching, opening a link by id).
+    Bpf = 19,
 }
 
 /// One denied attempt, written by the BPF program into the ring buffer.
@@ -47,7 +92,9 @@ pub struct Violation {
     /// A [`Hook`] value.
     pub hook: u32,
     /// The ptrace access mode bits the caller asked for, or for
-    /// [`Hook::MmapFile`] and [`Hook::FileMprotect`] the `PROT_*` bits.
+    /// [`Hook::MmapFile`] and [`Hook::FileMprotect`] the `PROT_*` bits. For
+    /// [`Hook::TaskKill`] the signal, for [`Hook::BpfMap`] the `FMODE_*`
+    /// bits asked for, and for [`Hook::Bpf`] the `bpf(2)` command.
     pub mode: u32,
     /// The caller's comm, NUL-padded. Captured in the kernel because the
     /// caller has often exited by the time user space reads the event.
