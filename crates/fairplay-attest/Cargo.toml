@@ -10,9 +10,10 @@ default = []
 # Real TPM access for `collect`. Needs libtss2 (apt install libtss2-dev) and a
 # TPM: /dev/tpmrm0, or swtpm over its socket TCTI (libtss2-tcti-swtpm0).
 # `verify` is pure Rust and works without this feature.
-tpm = ["dep:tss-esapi"]
+tpm = ["dep:tss-esapi", "dep:libc"]
 
 [dependencies]
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 sha2 = "0.10"
+libc = { version = "0.2", optional = true }
 tss-esapi = { version = "7", optional = true }

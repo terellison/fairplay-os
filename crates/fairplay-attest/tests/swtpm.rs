@@ -1,142 +1,29 @@
 //! Quote and verify against a software TPM. Each test starts its own `swtpm`
-//! on free local ports with a temporary state directory.
+//! (see `fairplay_attest::testing::Swtpm`).
 //!
 //! Needs the `tpm` feature and `swtpm` on PATH (`apt install swtpm`); without
 //! either, the tests print why and pass, so plain `cargo test` keeps working.
 #![cfg(feature = "tpm")]
 
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
-use fairplay_attest::testing::{ima_ng_entry, sha256_extend_value};
-use fairplay_attest::{collect_with, verify, CollectOptions, Evidence, Rejection, IMA_PCR};
-use tss_esapi::{
-    handles::PcrHandle,
-    interface_types::algorithm::HashingAlgorithm,
-    structures::{Digest, DigestValues},
-    tcti_ldr::TctiNameConf,
-    Context,
+use fairplay_attest::testing::{ima_ng_entry, sha256_extend_value, Swtpm};
+use fairplay_attest::{
+    collect_with, mode_event, verify, CollectOptions, Error, Evidence, MeasuredMode, Mode,
+    Rejection, IMA_PCR, MODE_PCR,
 };
 
-struct Swtpm {
-    child: Child,
-    dir: PathBuf,
-    port: u16,
-}
-
-impl Swtpm {
-    /// Start swtpm, or `None` (test skipped) if it isn't installed.
-    fn start(name: &str) -> Option<Swtpm> {
-        if Command::new("swtpm")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
-            eprintln!("skipping {name}: swtpm is not installed");
-            return None;
-        }
-        let dir =
-            std::env::temp_dir().join(format!("fairplay-attest-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Tests run in parallel threads. Pick ports and wait for swtpm to own
-        // them under one lock, so two tests never race for the same pair.
-        static START: Mutex<()> = Mutex::new(());
-        let _guard = START.lock().unwrap_or_else(|e| e.into_inner());
-        for _ in 0..5 {
-            let port = free_port_pair();
-            let mut child = Command::new("swtpm")
-                .args(["socket", "--tpm2", "--flags", "not-need-init,startup-clear"])
-                .arg("--tpmstate")
-                .arg(format!("dir={}", dir.display()))
-                .arg("--server")
-                .arg(format!("type=tcp,bindaddr=127.0.0.1,port={port}"))
-                .arg("--ctrl")
-                .arg(format!("type=tcp,bindaddr=127.0.0.1,port={}", port + 1))
-                .stdout(Stdio::null())
-                .spawn()
-                .expect("spawn swtpm");
-            if wait_ready(&mut child, port) {
-                return Some(Swtpm { child, dir, port });
-            }
-            // swtpm exited, most likely because another process took a port
-            // between our probe and its bind: try another pair.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        panic!("swtpm did not start");
+fn options(tpm: &Swtpm, ima_log: Option<PathBuf>) -> CollectOptions {
+    CollectOptions {
+        tcti: tpm.tcti(),
+        ima_log,
     }
-
-    fn tcti(&self) -> String {
-        format!("swtpm:host=127.0.0.1,port={}", self.port)
-    }
-
-    fn options(&self, ima_log: Option<PathBuf>) -> CollectOptions {
-        CollectOptions {
-            tcti: self.tcti(),
-            ima_log,
-        }
-    }
-
-    /// Extend the SHA-256 bank of PCR 10, as IMA would.
-    fn extend_pcr10(&self, value: [u8; 32]) {
-        let mut ctx = Context::new(self.tcti().parse::<TctiNameConf>().unwrap()).unwrap();
-        let mut digests = DigestValues::new();
-        digests.set(
-            HashingAlgorithm::Sha256,
-            Digest::try_from(value.to_vec()).unwrap(),
-        );
-        ctx.execute_with_nullauth_session(|c| c.pcr_extend(PcrHandle::Pcr10, digests))
-            .unwrap();
-    }
-}
-
-impl Drop for Swtpm {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Both ports accept connections and our swtpm is still running (it exits
-/// on a bind error, so a listener then belongs to someone else).
-fn wait_ready(child: &mut Child, port: u16) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let up = |p: u16| TcpStream::connect(("127.0.0.1", p)).is_ok();
-    loop {
-        if !matches!(child.try_wait(), Ok(None)) {
-            return false;
-        }
-        if up(port) && up(port + 1) {
-            std::thread::sleep(Duration::from_millis(50));
-            return matches!(child.try_wait(), Ok(None));
-        }
-        assert!(Instant::now() < deadline, "swtpm did not start listening");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Two consecutive free ports (swtpm's TCTI uses port + 1 for control).
-fn free_port_pair() -> u16 {
-    for _ in 0..100 {
-        let a = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = a.local_addr().unwrap().port();
-        if port < u16::MAX && TcpListener::bind(("127.0.0.1", port + 1)).is_ok() {
-            return port;
-        }
-    }
-    panic!("no free port pair");
 }
 
 const NONCE: &[u8] = b"server-nonce-0123456789abcdef";
 
 fn fresh(tpm: &Swtpm, ima_log: Option<PathBuf>) -> Evidence {
-    collect_with(NONCE, &tpm.options(ima_log)).expect("collect")
+    collect_with(NONCE, &options(tpm, ima_log)).expect("collect")
 }
 
 /// Write a synthetic IMA log, extend PCR 10 to match it, return its path.
@@ -147,10 +34,10 @@ fn synthetic_ima_log(tpm: &Swtpm) -> PathBuf {
         .enumerate()
     {
         let (entry, data) = ima_ng_entry(u32::from(IMA_PCR), &[i as u8 + 1; 32], path);
-        tpm.extend_pcr10(sha256_extend_value(&data));
+        tpm.extend(IMA_PCR, sha256_extend_value(&data));
         log.extend_from_slice(&entry);
     }
-    let path = tpm.dir.join("binary_runtime_measurements");
+    let path = tpm.dir().join("binary_runtime_measurements");
     std::fs::write(&path, log).unwrap();
     path
 }
@@ -166,6 +53,8 @@ fn fresh_quote_verifies() {
     assert!(verdict.quote_valid);
     assert!(!verdict.ima_log_verified);
     assert_eq!(verdict.pcrs.len(), fairplay_attest::QUOTED_PCRS.len());
+    // Nothing extended the mode PCR.
+    assert_eq!(verdict.mode, MeasuredMode::Unmeasured);
 
     // The AK is a primary: the same TPM derives the same key every time.
     let again = fresh(&tpm, None);
@@ -293,4 +182,50 @@ fn tampered_ima_log_rejected() {
         verify(&garbage, NONCE, &ev.ak_public),
         Err(Rejection::MalformedImaLog(_))
     ));
+}
+
+#[test]
+fn mode_is_measured() {
+    for (name, events, want) in [
+        ("mode-player", &[Mode::Player][..], MeasuredMode::Player),
+        ("mode-dev", &[Mode::Developer][..], MeasuredMode::Developer),
+        // Root on a developer boot extending "player" doesn't make it one.
+        (
+            "mode-upgrade",
+            &[Mode::Developer, Mode::Player][..],
+            MeasuredMode::Unrecognized,
+        ),
+    ] {
+        let Some(tpm) = Swtpm::start(name) else {
+            return;
+        };
+        for &m in events {
+            tpm.extend(MODE_PCR, mode_event(m));
+        }
+        let ev = fresh(&tpm, None);
+        let verdict = verify(&ev, NONCE, &ev.ak_public).expect("verify");
+        assert_eq!(verdict.mode, want, "{name}");
+    }
+
+    // The reported mode PCR is covered by the quote like any other.
+    let Some(tpm) = Swtpm::start("mode-forged") else {
+        return;
+    };
+    tpm.extend(MODE_PCR, mode_event(Mode::Developer));
+    let mut ev = fresh(&tpm, None);
+    ev.pcrs
+        .insert(MODE_PCR, fairplay_attest::mode_pcr_value(Mode::Player));
+    assert_eq!(
+        verify(&ev, NONCE, &ev.ak_public),
+        Err(Rejection::PcrDigestMismatch)
+    );
+}
+
+#[test]
+fn missing_device_is_no_tpm() {
+    let opts = CollectOptions {
+        tcti: "device:/dev/fairplay-no-such-tpm".into(),
+        ima_log: None,
+    };
+    assert!(matches!(collect_with(NONCE, &opts), Err(Error::NoTpm)));
 }

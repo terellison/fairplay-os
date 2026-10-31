@@ -20,8 +20,8 @@ each piece does, how they fit, and a glossary.
 | `crates/fairplay-ebpf` | 3, 5-8 | LSM programs on `ptrace_access_check`, `mmap_file` and `file_mprotect` (executable-mapping allowlist), `task_kill`, `bpf`, `bpf_map` and `bpf_prog` (self-protection), `file_ioctl`, `file_ioctl_compat` and `file_permission` (virtual input), plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
 | `crates/fairplayd` | 3-9 | Loads the programs, owns the PROTECTED, EXEC_ALLOWED and INPUT_* maps, serves the socket API, streams violations, says who made each virtual input device; `--self-protect` fences root away from it; launches from signed manifests and sandboxes the anti-cheat (milestone 9) |
 | `crates/cheatsim` | 3, 5-8 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant; `game --dlopen` loads libraries like a tricked game; `self-attack` goes after fairplayd itself; `clicker`, `uhid`, `inject` fake input |
-| `crates/fairplay-attest` | 10 | API shape only |
-| `vm/` | 1-9 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5, 6, 7, 8 and 9 (parts A and B) tests |
+| `crates/fairplay-attest` | 10 | TPM quote collection and the server-side verifier (pure Rust), including the boot mode from a provisional mode PCR; tested against swtpm |
+| `vm/` | 1-10 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5, 6, 7, 8 and 9 (parts A and B) tests, and `attest` end to end against swtpm |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
 
@@ -104,7 +104,7 @@ one JSON object per line:
 | `launch_protected` | root, or the `fairplay-launcher` group | Starts a program protected from its first instruction, as the launcher (never as root by default). Since milestone 9, only a program a signed game manifest names. `join` starts the manifest's anti-cheat inside an existing session, as a reader: that's how the vendor's anti-cheat gets in. |
 | `session_status` | the session's launcher or user, its own processes, root | Protected or not, the game's state and exit code, members, violation count, kernel lockdown mode, virtual input devices present |
 | `violations` | same | A stream: one event per denied attempt (process, its executable, the hook), pushed as it happens |
-| `attest` | anyone | `unavailable` until milestone 10 (no TPM in the VM); echoes the nonce |
+| `attest` | anyone | A TPM quote over the boot PCRs plus the IMA log, for the caller's nonce (versioned JSON, see `fairplay_api::attest`). `unavailable` without a TPM, as in the VM; echoes the nonce |
 | `list_sessions` | anyone (sees their own) | For humans |
 
 The exit test, inside the VM, as your normal user:
@@ -137,6 +137,22 @@ By hand:
     sudo ./target/release/cheatsim attack --pid <pid> --addr <addr>
     ./target/release/fairplayctl status 1
     ./target/release/fairplayctl attest
+
+### Attestation against a software TPM (milestone 10 groundwork)
+
+The VM has no TPM, so `attest` answers `unavailable` there. To see the whole
+path work, `vm/test-attest-swtpm.sh` starts `swtpm`, extends the mode PCR as a
+player-mode (then developer-mode) boot would, points `fairplayd` at it with
+`--tpm-tcti`, and checks the answer with `fairplayctl verify-evidence`, the
+vendor server's side:
+
+    flock -o /run/lock/fairplay-vm-tests ./vm/test-attest-swtpm.sh
+
+The verifier accepts the quote and reads the mode, and refuses a replayed
+nonce, a PCR value the quote doesn't cover, and an unknown evidence version.
+If root extends the mode PCR after boot, the mode reads `unrecognized`, never
+`player`. Not yet: AK enrollment (the test trusts the AK the evidence names),
+and which PCR the real boot extends with the mode is still provisional.
 
 ## Milestone 5: the domain follows the game
 

@@ -192,7 +192,7 @@ read another's memory:
   was our program that did it.
 - **`lsm-hello`**: milestone 1's smoke test. It logs every file `cat` opens,
   which proves the whole BPF LSM toolchain works end to end.
-- **`fairplay-attest`**: milestone 10, outline only. The plan: the **TPM** chip
+- **`fairplay-attest`**: milestone 10, tested against a software TPM. The **TPM** chip
   records what booted (**measured boot**) and **IMA** records which programs
   ran. On request, the TPM signs those records (a **quote**) and the game
   company's server checks them: was it a known kernel, was `fairplayd` running,
@@ -229,9 +229,11 @@ machine can connect to. Each request and each answer is one line of
 - **`violations`**: a live **stream**. The caller subscribes once, and every
   denied attempt is pushed to it as it happens: which process, which
   executable, which hook. Vendors get detection signal without a driver.
-- **`attest`**: will return the TPM's signed report (milestone 10). The VM has
-  no TPM, so for now it answers `unavailable`, honestly, and echoes the
-  nonce it was given.
+- **`attest`**: returns the TPM's signed report (milestone 10), which also
+  says whether the machine booted in player or developer mode. The VM has
+  no TPM, so there it answers `unavailable`, honestly, and echoes the nonce
+  it was given; `vm/test-attest-swtpm.sh` shows the rest working against a
+  software TPM.
 
 **How it knows who's calling.** The kernel tells it. When a program
 connects, `fairplayd` asks the kernel for the caller's process ID, user and

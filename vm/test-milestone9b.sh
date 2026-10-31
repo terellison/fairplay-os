@@ -8,7 +8,8 @@
 # fairplayd socket, and nothing else: not the user's home directory, not
 # another program's memory, not the game's files or open files through
 # /proc, not abstract Unix sockets (X11). It reads the game but can't write
-# to it or signal it, and its /proc lists only its own processes and the
+# to it or signal it, it can't make namespaces or mounts or use keyrings or
+# bpf (seccomp), and its /proc lists only its own processes and the
 # game. Run inside the VM, as your normal user (not root), from the repo
 # root, under the shared VM lock:
 #   flock /run/lock/fairplay-vm-tests ./vm/test-milestone9b.sh
@@ -35,7 +36,7 @@
 #              the same user (root, like session 1's anti-cheat).
 # The mock vendor is `anticheat game --dlopen-stdin`, which takes commands
 # on a pipe (attack, forkattack, become, poke, signal, hold, connect, dgram,
-# read, ls, write, exec: see cheatsim's --help).
+# read, ls, write, exec, syscalls: see cheatsim's --help).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -228,6 +229,24 @@ check "a signal (SIGCONT) to the game: refused" grep -q "^EXEC-ERR signal $G1_PI
 wait_for "$T/daemon.out" "^DENIED caller=$AC1_PID .*target=$G1_PID hook=task_kill"
 check "with a DENIED line (task_kill)" grep -q "^DENIED caller=$AC1_PID .*target=$G1_PID hook=task_kill mode=0x12" "$T/daemon.out"
 
+step "(5) seccomp: no namespaces, mounts, keyrings or bpf, even as root"
+# cheatsim's `syscalls` makes each call with arguments that fail harmlessly
+# if it runs (a missing path, a bad fd); EPERM means seccomp refused it.
+SECCOMP_DENIED="setns unshare unshare_none mount umount2 open_tree move_mount fsopen fsconfig fsmount fspick
+  mount_setattr pivot_root chroot keyctl add_key request_key bpf clone_newuser clone_newns clone_newnet clone_newpid"
+all_eperm() {
+  local n
+  for n in $SECCOMP_DENIED; do grep -qE "^EXEC-SYSCALLS .*\b$n=EPERM\b" "$1" || { echo "      $n: not EPERM"; return 1; }; done
+  grep -qE '^EXEC-SYSCALLS .*\bclone3=ENOSYS\b' "$1" || { echo "      clone3: not ENOSYS"; return 1; }
+}
+ask 3 "$T/G1.out" "syscalls"
+check "control: the game (root, not sandboxed) gets as far as the kernel's own checks (no EPERM, no ENOSYS)" \
+  sh -c "grep -q '^EXEC-SYSCALLS ' '$T/last' && ! grep -qE '=(EPERM|ENOSYS)\b' '$T/last'"
+ask 4 "$T/AC1.out" "syscalls"
+check "the anti-cheat (root, sandboxed): EPERM for each, clone3 ENOSYS" all_eperm "$T/last"
+# (Plain fork and exec still work in the sandbox: forkattack in (f), and
+# (e) execs fairplayctl, whose spawn falls back from clone3 to clone.)
+
 step "(c) it can't read an ordinary program of the same user (the browser)"
 sudo "$CHEATSIM" game >"$T/browser.out" 2>&1 &
 disown   # cleanup kills it; no "Killed" notice
@@ -384,6 +403,9 @@ ask 6 "$T/AC2.out" "exec $T/vendor/fairplayctl --socket $SOCK status $G2_SESSION
 grep '^{' "$T/last" | jq -c '.ok.status | {protected, session: .session.session, members: [.session.members[].pid]}' 2>/dev/null | indent
 check "session_status from inside the sandbox answers for its session" \
   sh -c "grep '^{' '$T/last' | jq -e --argjson s $G2_SESSION '.ok.status.protected and .ok.status.session.session==\$s' >/dev/null"
+
+ask 6 "$T/AC2.out" "syscalls"
+check "as you, too: EPERM for each, clone3 ENOSYS" all_eperm "$T/last"
 
 step "(g) the game itself is not sandboxed"
 ask 5 "$T/G2.out" "read $MARKER"

@@ -89,7 +89,11 @@ enum Cmd {
         /// (`process_vm_writev`, then writing `/proc/<pid>/mem`); `signal
         /// <pid> <signum>`; `hold <path>` opens a file and keeps it open;
         /// `connect <name>` and `dgram <name>` reach an abstract Unix
-        /// socket (`@name`). Each prints an EXEC- line when done.
+        /// socket (`@name`); `syscalls` tries the namespace, mount, keyring
+        /// and bpf system calls the sandbox's seccomp filter refuses, each
+        /// with arguments that make it fail harmlessly if it does run, and
+        /// prints `EXEC-SYSCALLS name=<errno> ...`. Each prints an EXEC-
+        /// line when done.
         #[arg(long)]
         dlopen_stdin: bool,
     },
@@ -278,6 +282,8 @@ fn game(depth: u32, dlopen: &[String], dlopen_stdin: bool) -> ExitCode {
                     }
                     Err(e) => println!("EXEC-ERR ls {dir}: {e}"),
                 }
+            } else if line == "syscalls" {
+                println!("EXEC-SYSCALLS {}", try_syscalls());
             } else if let Some(rest) = line.strip_prefix("poke ") {
                 poke(rest);
             } else if let Some(rest) = line.strip_prefix("signal ") {
@@ -438,6 +444,158 @@ fn poke(args: &str) {
         Err(e) => e.to_string(),
     };
     println!("EXEC-POKE process_vm_writev: {pvw}; /proc/{pid}/mem: {mem}");
+}
+
+/// Tries each system call the anti-cheat sandbox's seccomp filter refuses
+/// beyond the memory ones (#30), with arguments that make the call itself
+/// fail (a missing path, a bad fd, an unknown command) if it runs, so a
+/// control run outside the sandbox changes nothing, even as root. Returns
+/// `name=<errno>` for each (`ok` if one somehow succeeds): EPERM means
+/// refused before it ran (or, for an ordinary user, for lack of privilege:
+/// the test runs it as root). clone3 should be ENOSYS in the sandbox.
+fn try_syscalls() -> String {
+    const NOPE: &std::ffi::CStr = c"/nonexistent-fairplay-m9b";
+    let n = NOPE.as_ptr();
+    let null = std::ptr::null::<libc::c_char>();
+    // (name, returns an fd to close, call)
+    let probes: [(&str, bool, &dyn Fn() -> libc::c_long); 23] = [
+        ("setns", false, &|| unsafe {
+            libc::syscall(libc::SYS_setns, -1, 0)
+        }),
+        // Bit 0 is no unshare flag: EINVAL before anything is done.
+        ("unshare", false, &|| unsafe {
+            libc::syscall(libc::SYS_unshare, 1)
+        }),
+        ("mount", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_mount,
+                c"none".as_ptr(),
+                n,
+                c"tmpfs".as_ptr(),
+                0,
+                null,
+            )
+        }),
+        ("umount2", false, &|| unsafe {
+            libc::syscall(libc::SYS_umount2, n, 0)
+        }),
+        ("open_tree", true, &|| unsafe {
+            libc::syscall(libc::SYS_open_tree, -1, n, 0)
+        }),
+        ("move_mount", false, &|| unsafe {
+            libc::syscall(libc::SYS_move_mount, -1, n, -1, n, 0)
+        }),
+        ("fsopen", true, &|| unsafe {
+            libc::syscall(libc::SYS_fsopen, c"fairplay-no-such-fs".as_ptr(), 0)
+        }),
+        ("fsconfig", false, &|| unsafe {
+            libc::syscall(libc::SYS_fsconfig, -1, 0, null, null, 0)
+        }),
+        ("fsmount", true, &|| unsafe {
+            libc::syscall(libc::SYS_fsmount, -1, 0, 0)
+        }),
+        ("fspick", true, &|| unsafe {
+            libc::syscall(libc::SYS_fspick, -1, n, 0)
+        }),
+        ("mount_setattr", false, &|| unsafe {
+            libc::syscall(libc::SYS_mount_setattr, -1, n, 0, null, 0)
+        }),
+        ("pivot_root", false, &|| unsafe {
+            libc::syscall(libc::SYS_pivot_root, n, n)
+        }),
+        ("chroot", false, &|| unsafe {
+            libc::syscall(libc::SYS_chroot, n)
+        }),
+        ("keyctl", false, &|| unsafe {
+            libc::syscall(libc::SYS_keyctl, 9999, 0, 0, 0, 0)
+        }),
+        ("add_key", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_add_key,
+                c"fairplay-no-such-type".as_ptr(),
+                c"x".as_ptr(),
+                null,
+                0,
+                0,
+            )
+        }),
+        ("request_key", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_request_key,
+                c"fairplay-no-such-type".as_ptr(),
+                c"x".as_ptr(),
+                null,
+                0,
+            )
+        }),
+        ("bpf", false, &|| unsafe {
+            libc::syscall(libc::SYS_bpf, 9999, null, 0)
+        }),
+        // CLONE_NEWUSER with CLONE_FS is invalid: EINVAL, no child.
+        ("clone_newuser", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                libc::CLONE_NEWUSER | libc::CLONE_FS | libc::SIGCHLD,
+                0,
+                0,
+                0,
+                0,
+            )
+        }),
+        ("clone_newns", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                libc::CLONE_NEWNS | libc::CLONE_FS | libc::SIGCHLD,
+                0,
+                0,
+                0,
+                0,
+            )
+        }),
+        ("clone_newnet", false, &|| unsafe {
+            // CLONE_SIGHAND without CLONE_VM is invalid too.
+            libc::syscall(
+                libc::SYS_clone,
+                libc::CLONE_NEWNET | libc::CLONE_SIGHAND | libc::SIGCHLD,
+                0,
+                0,
+                0,
+                0,
+            )
+        }),
+        ("clone_newpid", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                libc::CLONE_NEWPID | libc::CLONE_SIGHAND | libc::SIGCHLD,
+                0,
+                0,
+                0,
+                0,
+            )
+        }),
+        // A NULL argument block smaller than any version: EINVAL.
+        ("clone3", false, &|| unsafe {
+            libc::syscall(libc::SYS_clone3, null, 0)
+        }),
+        ("unshare_none", false, &|| unsafe {
+            libc::syscall(libc::SYS_unshare, 0)
+        }),
+    ];
+    let mut out = Vec::new();
+    for (name, fd, call) in probes {
+        let r = call();
+        let what = if r >= 0 {
+            if fd {
+                // SAFETY: an fd the call just returned.
+                unsafe { libc::close(r as libc::c_int) };
+            }
+            "ok".to_string()
+        } else {
+            format!("{:?}", Errno::last())
+        };
+        out.push(format!("{name}={what}"));
+    }
+    out.join(" ")
 }
 
 /// Execs `cmd` (split on whitespace) in place of this process: the same
