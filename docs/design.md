@@ -209,8 +209,8 @@ flowchart TB
   subgraph user["User space"]
     other["Other process<br/>a cheat trying to read or write memory"]
     subgraph domain["protection domain"]
-      game["Game process and its children<br/>protected, started by fairplayd"]
-      ac["Vendor anti-cheat<br/>verified, sandboxed, calls fairplayd API"]
+      game["Game process and its children<br/>protected members, started by fairplayd"]
+      ac["Vendor anti-cheat (a reader)<br/>named by the signed manifest, sandboxed"]
     end
     fpd["fairplayd<br/>launch, status, attest, violations<br/>protects itself"]
   end
@@ -243,7 +243,7 @@ attestation says so.
 | Reading game memory (wallhacks, ESP) | `ptrace`, `process_vm_readv`, `/proc/<pid>/mem` | Deny in one BPF LSM hook, for the game and every process it starts | Yes |
 | Writing memory or injecting code | Same paths, plus `LD_PRELOAD`, or `WINEDLLOVERRIDES` / `WINEDLLPATH` under Proton | Same hook; clean launch environment; executable-mapping allowlist | Yes |
 | Synthetic input (aimbots, triggerbots) | A virtual device via `/dev/uinput`; XTest under X11/XWayland | Report virtual devices and who made them; Wayland only, no XTest during a session | Yes |
-| A cheat joining the protection domain | Ask the launcher to add it next to the game | Only a vendor-signed anti-cheat binary may join | Yes |
+| A cheat inside the protection domain | Ask the launcher to add it next to the game, or launch a wrapper (`python3 wrapper.py`) that starts the game as its child | Only readers named by the signed game manifest may read the game; other members are protected but can't read; the manifest names what may be launched | Yes |
 | Disabling the protection from user space | Root kills `fairplayd`, edits its map, or detaches the program | Player mode: fenced by lockdown and self-protection hooks. Developer mode: detected by attestation | Yes |
 | Disabling the protection by rebooting | Boot a patched kernel or developer mode | Detected by attestation | Detected only |
 | Anti-cheat overreach | A kernel driver that can see the whole machine | No vendor kernel code; the vendor's process is sandboxed to the game | Yes |
@@ -253,22 +253,65 @@ attestation says so.
 
 A privileged launcher starts the game and registers its process ID in a kernel
 map. A BPF LSM program on the `ptrace_access_check` hook denies any access to a
-registered process from outside its protection domain. That one hook covers
-ptrace attach, `process_vm_readv` and `process_vm_writev`, and reads of
-`/proc/<pid>/mem`, because the kernel routes all of them through the same
-access check.
+registered process unless the caller is the process itself or one of its
+domain's readers. That one hook covers ptrace attach, `process_vm_readv` and
+`process_vm_writev`, and reads of `/proc/<pid>/mem`, because the kernel routes
+all of them through the same access check.
 
-The protection domain is the game, every process it starts, and the vendor's
-anti-cheat process. Following children matters for Proton, where one game is a
-chain (Steam, proton, wine, `game.exe`) plus `wineserver`, which needs access
-to the game. The launch environment drops `LD_*` and Wine's DLL variables, and
-the executable-mapping allowlist catches injection however it is attempted.
+A protection domain has two kinds of member:
+
+- **Protected members**: the game and every process it starts, followed in the
+  kernel from fork to exit. Proton needs this: one game is a chain (Steam,
+  proton, wine, `game.exe`). Nothing reads or writes a protected member's
+  memory except the member itself and the domain's readers. Protected members
+  can't read each other.
+- **Readers**: the vendor's anti-cheat, and runtime helpers the game's
+  manifest names, such as Proton's `wineserver`, which implements Windows'
+  cross-process memory calls. A process becomes a reader only by being started
+  from a file the manifest names and verifies, never by being the game's child.
+
+**Why the split.** If every member could read every other, the launch root
+would be a reader, and on a player's PC the player chooses the launch root. A
+wrapper such as `python3 wrapper.py` could start the real game as its child
+and read it freely. The executable-mapping allowlist doesn't stop that:
+`python3` is a system file, and a script is data, not mapped code. Separating
+"protected" from "may read" closes this, and the game manifest (below) decides
+what may be launched in the first place.
+
+The launch environment drops `LD_*` and Wine's DLL variables, and the
+executable-mapping allowlist catches injection however it is attempted.
+
+### The game manifest
+
+Each game ships a manifest, signed by its publisher or anti-cheat vendor.
+`fairplayd` launches a protected game only from a manifest, and protects only
+what the manifest describes:
+
+- **Launch executables**: what `launch_protected` may start as the root of the
+  domain, by hash. A wrapper can't be the root. Launch wrappers such as
+  `gamemoderun` or MangoHud become OS features or approved overlays instead.
+- **The anti-cheat**: the vendor's binary and signing key. It joins as a
+  reader, in its sandbox.
+- **The runtime**: for Proton games, the accepted Proton builds and which of
+  their helpers are readers (`wineserver`). Proton lives in the player's Steam
+  folder, which the player can write to, so it is verified by hash or
+  signature like the game, never trusted for its location.
+- **Options**: overlays the game accepts, and whether the session blocks
+  virtual input devices.
+
+The OS stays neutral: it doesn't keep a list of approved publishers. It
+enforces whichever manifest it was given, records the manifest's hash and
+signer in the session, and measures it for attestation. The vendor's server
+then checks that its own key signed the manifest the session used. A cheater
+can write a manifest of their own, but the server will see that the vendor
+didn't sign it. Games without a manifest still run, unprotected, and
+`session_status` says so.
 
 ### The vendor's anti-cheat
 
-- **Who may join.** Only a binary the vendor signed, with its key named by the
-  game's own manifest, may join a game's domain. Being the launcher isn't
-  enough: on a player's PC the launcher is the player.
+- **Who may join.** Only the binary the game's manifest names, signed with the
+  key it names, joins a game's domain, and it joins as a reader. Being the
+  launcher isn't enough: on a player's PC the launcher is the player.
 - **What it may see.** The anti-cheat runs in a sandbox (Landlock or a
   Flatpak-style namespace) with the game's memory, the game's install
   directory, its own data, and the `fairplayd` socket. Not the home directory,
@@ -303,10 +346,10 @@ genuine TPM" without saying which one) or an anonymizing attestation service.
 
 A small local socket API, owned by a daemon called `fairplayd`:
 
-- `launch_protected(exe, args)`: start a game in a protection domain; launcher
-  only.
-- `session_status()`: protected or not, mode, lockdown state, virtual input
-  devices present and who made them.
+- `launch_protected(manifest, args)`: start the game a signed manifest names in
+  a new protection domain; launcher only.
+- `session_status()`: protected or not, the manifest's hash and signer, mode,
+  lockdown state, virtual input devices present and who made them.
 - `attest(nonce)`: the TPM quote and event log for the vendor's server.
 - `violations()`: a stream of denied attempts: which process, which
   executable, which hook. Vendors get detection signal without a driver.
@@ -404,17 +447,21 @@ Milestones 1 to 4 are done. VM-testable work comes first.
    from files outside its install, system library paths, and approved
    overlays. Exit: cheatsim's injected library fails to map, and an approved
    overlay loads.
-9. **Vendor anti-cheat: verified and sandboxed.** Exit: an unsigned binary
-   cannot join a game's domain; a signed mock vendor can read the game's
-   memory but not the user's home directory.
+9. **Game manifest, readers, and the vendor anti-cheat.** `fairplayd` launches
+   only what a signed manifest names; only the readers it names may read
+   protected members; the anti-cheat runs sandboxed. Exit: a wrapper that
+   starts the game as its child can't read it; a binary the manifest doesn't
+   name can't join; a signed mock vendor can read the game's memory but not
+   the user's home directory; `session_status` reports the manifest's signer.
 10. **Attestation v0.** Exit: the verifier accepts a quote from a clean
     player-mode boot and rejects one from developer mode or a different kernel.
+    The quote also covers the manifest the session used.
 11. **Player-mode image.** A signed, read-only image with lockdown on, Wayland
     only, and atomic rollback. Exit: a reboot into player mode attests as
     player mode, and a failed update rolls back on its own.
 12. **Proton end to end.** Exit: on x86 hardware, a Windows test game runs
-    under Proton in a protection domain (wineserver included), and cheatsim
-    leaks 0/3 against it.
+    under a manifest-verified Proton build in a protection domain, with
+    `wineserver` as a reader, and cheatsim leaks 0/3 against it.
 
 ## Risks and open questions
 
@@ -431,8 +478,12 @@ our self-protection hooks, and attestation; a kernel exploit beats all three.
   report the kernel version so servers can refuse unpatched ones.
 - **Taint flag.** If we build the one-way flag, which actions count as
   tainting, and can we keep everyday developer work off that list?
-- **Proton games.** Which Wine helper processes belong in the protection
-  domain, and does the hook break anything they do?
+- **Proton games.** Which Wine helpers need to be readers (`wineserver` at
+  least), and does the hook break anything the others do? Proton updates
+  often, so manifests need to accept a set of Proton builds, not one.
+- **Manifests for existing games.** Who writes and signs manifests for games
+  already shipping, and how fast can a vendor update one when a patch changes
+  the game's hash?
 - **Overlays and accessibility.** Who maintains the overlay and input-tool
   allowlists, and how does a small accessibility tool get onto them?
 - **Privacy.** Per-vendor keys or ECDAA: which do vendors' servers accept, and
