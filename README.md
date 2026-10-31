@@ -577,7 +577,7 @@ The milestone 4, 5, 6 and 8 tests now launch from manifests too.
 The design doc lets the vendor's anti-cheat see the game's memory, the
 game's install directory, its own data and the `fairplayd` socket: not the
 home directory, not other programs, not the browser. Two walls do that
-(memory and files, 1 and 2 below); 3 to 6 close the gaps around them.
+(memory and files, 1 and 2 below); 3 to 7 close the gaps around them.
 
 **Not Landlock.** A Landlock-sandboxed process may not ptrace (or
 `process_vm_readv`, or open `/proc/<pid>/mem` of) any process outside its
@@ -647,7 +647,7 @@ while the child is still paused, before it runs any of its own code. The
 fork tracepoint copies the entry to every process the anti-cheat starts,
 and the exit tracepoint removes it. Being in `SANDBOXED` doesn't let a
 process do anything extra. It only makes the BPF LSM (BPF programs on the
-kernel's Linux Security Module checkpoints) apply the four rules below as
+kernel's Linux Security Module checkpoints) apply the rules below as
 well. Every sandboxed process is in `PROTECTED` too.
 
 **3. It reads the game but can't change it.** A reader in the sandbox may
@@ -670,6 +670,9 @@ and its module list (`/proc/<game>/maps`), and nothing more:
     `mount_setattr`), `pivot_root`, `chroot`.
   - the kernel keyring: `keyctl`, `add_key`, `request_key`.
   - `bpf`.
+  - large kernel surfaces with a long record of bugs: `io_uring_setup`,
+    `io_uring_enter`, `io_uring_register`, `perf_event_open`,
+    `userfaultfd`.
 
   `clone3` gets ENOSYS ("not implemented") instead. It passes its flags in
   memory, where seccomp can't see them, and on ENOSYS glibc falls back to
@@ -712,13 +715,27 @@ look-only checks are denied quietly; one violation per process per
 directory scan would flood the stream. Attempts to *act* on a process are
 always recorded.
 
-**Known gaps.** The sandbox assumes the anti-cheat runs as the user. Run
-as root (as the memory tests do, to get past Yama), it keeps root's
-capabilities. Seccomp now stops it mounting or making namespaces, but
-other root-only calls aren't filtered, such as `open_by_handle_at`, which
-opens a file by its inode number from any mount namespace. Dropping
-capabilities is the real fix. If fairplayd restarts, a running anti-cheat
-keeps a bind of the old socket file.
+**7. No root powers.** Before the privilege drop, every capability (one
+of root's separate powers) except `CAP_SYS_PTRACE` leaves the bounding set
+(what any later exec can ever hold, root's included) and the ambient set
+is cleared; after it, the effective and permitted sets are cut to
+`CAP_SYS_PTRACE`, if held at all, and the inheritable set is emptied. A
+root anti-cheat ends up with `CAP_SYS_PTRACE` only, so no
+`open_by_handle_at` (opening a file by its inode number from any mount
+namespace), module loading or raw devices; one running as any other user
+has no capabilities. It keeps `CAP_SYS_PTRACE` because without it a root
+anti-cheat can't read a root game at all: a caller must hold every
+capability its target holds, and Yama (`ptrace_scope` 1) lets only the
+target's ancestors attach. Everything else that capability allows passes
+`ptrace_access_check` or is refused by seccomp. `/proc/sys`,
+`/proc/sysrq-trigger`, `/proc/bus`, `/proc/fs` and `/proc/irq` are bound
+read-only, since uid 0 may write many of them on file permissions alone.
+
+**Known gaps.** An anti-cheat running as the user can't read the user's
+game: it has no `CAP_SYS_PTRACE` and Yama refuses it (#39 has the
+options). It can write some of the game's `/proc/<pid>/` files that take
+no ptrace check, such as `oom_score_adj`. If fairplayd restarts, a running
+anti-cheat keeps a bind of the old socket file.
 
 The exit test, inside the VM, as your normal user:
 

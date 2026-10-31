@@ -537,7 +537,7 @@ The kernel has to know which processes those rules are for. That's the
 **`SANDBOXED`** list (a BPF map): `fairplayd` adds the anti-cheat to it
 before it runs a single instruction of its own, everything the anti-cheat
 starts is added automatically, and each entry goes when its process exits.
-On top of the two walls, everything on that list gets four more rules:
+On top of the two walls, everything on that list gets a few more rules:
 
 - **It may look, not touch.** The anti-cheat needs to *read* the game's
   memory and its list of loaded modules, never change them. A **seccomp**
@@ -554,8 +554,9 @@ On top of the two walls, everything on that list gets four more rules:
   sandbox from inside: making new **namespaces** (`unshare`, `setns`, and
   `clone` asking for one), attaching, detaching or changing **mounts**
   (`mount`, `umount2`, `pivot_root`, `chroot` and the newer `open_tree`
-  family), the kernel **keyring** (`keyctl`, `add_key`, `request_key`) and
-  `bpf`. Most of these already need privileges the anti-cheat normally
+  family), the kernel **keyring** (`keyctl`, `add_key`, `request_key`),
+  `bpf`, and a few large, bug-prone kernel features nothing here needs
+  (`io_uring`, `perf_event_open`, `userfaultfd`). Most of these already need privileges the anti-cheat normally
   lacks, so the filter is a second lock on the same door. The exception is
   a new *user* namespace, which many distributions let any user create:
   inside it they count as root and may mount things of their own. One
@@ -601,10 +602,19 @@ to its data folder (works, and the file lands in the real folder), and ask
 reader's child, and a reader that turns itself into a shell, can't read the
 game. And the game itself isn't sandboxed: it still sees your home folder.
 
-**Known weakness.** The sandbox assumes the anti-cheat runs as you, not as
-root. Root inside the sandbox keeps powers the filter doesn't cover. The
-fix, not done yet, is to drop those powers (Linux **capabilities**) when
-the sandbox starts.
+**No root powers either.** If the anti-cheat is started as root, the
+sandbox takes away root's **capabilities** before it runs, all but one:
+the one that lets it read the game's memory (`CAP_SYS_PTRACE`), which the
+kernel rules above already keep to its own game. The system settings in
+`/proc/sys`, and the file that can crash or reboot the machine
+(`/proc/sysrq-trigger`), are made read-only, because root can write them
+on file permissions alone.
+
+**Known weakness.** Under Ubuntu's default **Yama** setting, an
+anti-cheat running as you (not root) can't read your game's memory at all,
+because it isn't the game's parent and has no `CAP_SYS_PTRACE`. The tests
+run it as root for that reason. Fixing this is a design decision that
+hasn't been made yet.
 
 ### Lessons learned writing BPF programs
 
@@ -749,7 +759,12 @@ deliberate change to both files.
   have a hole.
 - **Capabilities**: root's powers, split into about 40 separate ones (such
   as "mount file systems" or "load kernel modules") that a process can hold
-  or drop one by one.
+  or drop one by one. The **bounding set** is the most a process, and
+  anything it starts, can ever hold again. `CAP_SYS_PTRACE` is the one for
+  reading other processes' memory.
+- **Yama**: a small Linux security module. At Ubuntu's default setting
+  (`ptrace_scope` 1) a process may read another's memory only if it
+  started that process (directly or not) or holds `CAP_SYS_PTRACE`.
 - **Keyring**: the kernel's store of secrets (passwords, encryption keys)
   for a user or process, shared across that user's programs whatever
   sandbox they're in.
