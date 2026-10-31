@@ -29,7 +29,7 @@ the parts that need a real gaming PC come later.
 | 4 | fairplayd socket API | Done | `./vm/test-milestone4.sh` |
 | 5 | Protection follows the game's child processes | Done | `./vm/test-milestone5.sh` |
 | 6 | fairplayd protects itself from root | Not started | |
-| 7 | Report fake input devices and who made them | Not started | |
+| 7 | Report fake input devices and who made them | Done | `./vm/test-milestone7.sh` |
 | 8 | Only approved code may load into the game | Done | `./vm/test-milestone8.sh` |
 | 9 | Vendor anti-cheat: signed and sandboxed | Not started | |
 | 10 | Attestation | Blocked: the VM has no TPM | |
@@ -219,8 +219,9 @@ machine can connect to. Each request and each answer is one line of
   that's how the vendor's anti-cheat gets permission to inspect the game.
 - **`session_status`**: is it protected? Plus the game's state (running, or
   its exit code), who's in its domain, how many attempts were blocked, the
-  kernel's **lockdown** mode, and whether any virtual input devices (fake
-  keyboards and mice, the kind aimbots make) exist. Called without a session,
+  kernel's **lockdown** mode, and the virtual input devices (fake keyboards
+  and mice, the kind aimbots make) that exist, with who made each (milestone
+  7). Called without a session,
   it answers about the caller's own session, which is what an anti-cheat
   sitting next to the game wants.
 - **`violations`**: a live **stream**. The caller subscribes once, and every
@@ -355,6 +356,46 @@ a dropped file executable with `mprotect` (blocked), and to start
 `/usr/bin/true` (works) and a dropped copy of it (killed). The same dropped
 library loads fine in an unprotected game.
 
+### Fake input is reported, with who made it (milestone 7)
+
+An aimbot or triggerbot doesn't need to touch the game's memory to cheat: it
+can click for you. On Linux a program fakes input in three ways:
+
+- **uinput**: create a fake keyboard or mouse (one **ioctl** call,
+  `UI_DEV_CREATE`, on `/dev/uinput`);
+- **uhid**: create a fake USB-style device (**HID**) by writing to
+  `/dev/uhid`;
+- write events straight into a real device's **evdev** node,
+  `/dev/input/eventN`.
+
+Blocking these would break Steam Input (which remaps controllers through
+uinput) and the accessibility tools disabled players rely on. So by default
+the OS **reports** instead of blocking. Three more checkpoints
+(`file_ioctl`, `file_ioctl_compat`, `file_permission`) record each one with
+the process and program that did it. They're cheap for everything else:
+an unrelated ioctl costs one comparison, and an unrelated write a look at
+which device the file is.
+
+- During a protected session, each one prints a `REPORTED` line and goes to
+  the vendor's violation stream marked `"outcome":"reported"`, so a vendor
+  can tell a report from a block.
+- Tools the machine's owner trusts are on an **allowlist**
+  (`fairplayd --input-allow <program>`, matched by inode). They're never
+  reported.
+- `session_status` lists every fake input device, which program made it,
+  and whether that program is allowlisted.
+- A game whose server wants more can launch with `block_virtual_input`:
+  while it runs, fake input from programs not on the allowlist is refused
+  (**EPERM**) and shows up as `DENIED`.
+- With no protected game running, nothing is reported.
+
+**Milestone 7's test** (`vm/test-milestone7.sh`) starts a protected game,
+then `cheatsim clicker` as root (listed as made by `cheatsim`, reported), an
+allowlisted copy of it (listed as allowlisted, not reported), an evdev
+write and a uhid device (reported), then a second game that asks for
+blocking (the cheats get `EPERM`, the allowlisted tool still works). On
+this VM the uhid steps are skipped: its kernel module isn't installed.
+
 ### Lessons learned writing BPF programs
 
 - **The verifier** checks every program before the kernel will run it. For LSM
@@ -483,7 +524,16 @@ deliberate change to both files.
   each group a share of CPU, memory and I/O.
 - **uinput**: `/dev/uinput` lets a program create a fake keyboard or mouse.
   Aimbots use it, but so do Steam Input and accessibility tools, so milestone
-  5 reports such devices (and who made them) rather than blocking them.
+  7 reports such devices (and who made them) rather than blocking them.
+- **uhid**: `/dev/uhid` lets a program create a fake **HID** device (HID,
+  Human Interface Device, is the USB standard for keyboards, mice and
+  controllers). The kernel then treats it like a plugged-in one.
+- **evdev**: the kernel's input event interface. Each keyboard, mouse or
+  controller gets a `/dev/input/eventN` file; reading it gives its key
+  presses and movements, and root (or the `input` group) can write fake
+  ones into it.
+- **ioctl**: a system call for device-specific commands that aren't reads
+  or writes, like "create the device now" (`UI_DEV_CREATE`) on uinput.
 - **lockdown**: a kernel mode that stops even root from changing the running
   kernel.
 

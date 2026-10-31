@@ -17,11 +17,11 @@ each piece does, how they fit, and a glossary.
 | `crates/fairplay-api` | 4 | The socket protocol (JSON types), a client, and `fairplayctl` |
 | `crates/lsm-hello-ebpf` | 1 | Smoke-test LSM program: logs every `file_open` by `cat` |
 | `crates/lsm-hello` | 1 | Loads it and prints its log |
-| `crates/fairplay-ebpf` | 3, 5, 8 | LSM programs on `ptrace_access_check`, `mmap_file` and `file_mprotect` (executable-mapping allowlist), plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
-| `crates/fairplayd` | 3-5, 8 | Loads the programs, owns the PROTECTED and EXEC_ALLOWED maps, serves the socket API, streams violations |
-| `crates/cheatsim` | 3, 5, 8 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant; `game --dlopen` loads libraries like a tricked game |
+| `crates/fairplay-ebpf` | 3, 5, 7, 8 | LSM programs on `ptrace_access_check`, `mmap_file` and `file_mprotect` (executable-mapping allowlist), `file_ioctl`, `file_ioctl_compat` and `file_permission` (virtual input), plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
+| `crates/fairplayd` | 3-5, 7, 8 | Loads the programs, owns the PROTECTED, EXEC_ALLOWED and INPUT_* maps, serves the socket API, streams violations, says who made each virtual input device |
+| `crates/cheatsim` | 3, 5, 7, 8 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant; `game --dlopen` loads libraries like a tricked game; `clicker`, `uhid`, `inject` fake input |
 | `crates/fairplay-attest` | 10 | API shape only |
-| `vm/` | 1-5, 8 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5 and 8 tests |
+| `vm/` | 1-5, 7, 8 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5, 7 and 8 tests |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
 
@@ -174,6 +174,73 @@ inside the domain), and that the grandchild's entry is gone while it is
 still an unreaped zombie. As controls, the same game started without
 `fairplayd` leaks 3/3, and with `PROTECTED` filled up a new child is reported
 as `protection_degraded`.
+
+## Milestone 7: virtual input, reported with who made it
+
+Aimbots and triggerbots fake input through the kernel, so the kernel says
+who did it. Three hooks record each way in, with the process (tgid), comm
+and executable that did it:
+
+- `file_ioctl` (and `file_ioctl_compat` for 32-bit callers, Linux 6.8+):
+  `UI_DEV_CREATE` on `/dev/uinput`, which creates a virtual input device.
+  The record carries the name the creator gave the device. Any other ioctl
+  costs one comparison.
+- `file_permission`: the first write on an open `/dev/uhid` (that write is
+  `UHID_CREATE2`, which creates a virtual HID device), and the first write
+  on an open `/dev/input/event*` node (injecting events into an existing
+  device). Once per open file, not per event. A read costs one bit test;
+  any other write, reading the inode's device number.
+
+Devices are recognized by device number (`i_rdev`: 10:223 uinput, 10:239
+uhid, 13:64+ evdev), not by path. **Reported, not blocked, by default**:
+Steam Input and accessibility tools rely on virtual devices.
+
+- `fairplayd --input-allow <path>` (repeatable) allowlists a remapper or
+  accessibility tool, by inode like `--overlay`. Its devices show as
+  allowlisted and never reach vendors.
+- During a session, anything else prints a `REPORTED caller=... exe=...
+  target=0 hook=uinput_create|uhid_create|evdev_write ... file=<device>`
+  line and goes to every running session's violation stream with
+  `"outcome":"reported"` (other hooks' events say `"denied"`).
+- `launch_protected` takes `block_virtual_input: true` (`fairplayctl launch
+  --block-virtual-input`): while that session runs, the kernel refuses
+  non-allowlisted creation and evdev writes with `EPERM`, printed as
+  `DENIED` and streamed with `"outcome":"denied"`. Machine-wide, since input
+  devices are.
+- With no session running nothing is reported; fairplayd still keeps the
+  records (the last 256) so it can name the creators of devices made
+  before a session started, such as Steam's virtual pads.
+
+`session_status.virtual_input_devices` lists each uinput and uhid device
+(from `/sys/class/input`) with `device` (`input7`), `name`, `kind`,
+`created_by` (pid, comm, exe, exe_path, created_at) and `allowlisted`. A
+uinput device is matched to its creation record by name; a uhid device to
+the live processes that created uhid devices (a uhid device lives as long
+as its fd, and the kernel can't see the HID device's name when it's
+created). If several live processes fit, the entry is `ambiguous`, names
+the newest, and is allowlisted only if all of them are, so a cheat can't
+hide behind a remapper's device name. The violation stream is always exact:
+it comes straight from the kernel's record.
+
+Known limits: the device name is read from uinput's private
+`struct uinput_device` and `struct input_dev`, whose first members (the
+`input_dev` pointer, then the name) have been the same since Linux 2.6 but
+aren't in the BTF we generate. Synthetic input through XTest (X11 /
+XWayland) is not covered here; the design doc handles that with Wayland
+only. uhid is a module (`modprobe uhid`; on Ubuntu it ships in
+`linux-modules-extra`).
+
+The exit test, inside the VM, as your normal user:
+
+    flock /run/lock/fairplay-vm-tests ./vm/test-milestone7.sh
+
+During a protected session it starts `cheatsim clicker` as root (listed in
+`session_status` as made by `cheatsim`, not allowlisted, and a `reported`
+event), an allowlisted copy of it (allowlisted, no event), an evdev write and
+a uhid device (reported; skipped if `/dev/uhid` can't be loaded), then a
+second session with `block_virtual_input` (the clicker, evdev write and uhid
+device get `EPERM` and `denied` events; the allowlisted one still works), and
+checks that nothing is reported with no session running.
 
 ## Milestone 8: executable-mapping allowlist
 

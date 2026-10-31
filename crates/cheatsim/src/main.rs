@@ -13,6 +13,13 @@
 //! Milestone 8: `cheatsim game --dlopen <lib>` (or `--dlopen-stdin`) has the
 //! game load a library after startup, as a game tricked into loading a
 //! dropped cheat would, and prints LOADED or BLOCKED.
+//!
+//! Milestone 7: `cheatsim clicker` makes a virtual mouse through
+//! `/dev/uinput` and clicks, `cheatsim uhid` makes one through `/dev/uhid`,
+//! and `cheatsim inject --device /dev/input/eventN` writes an event into an
+//! existing device (see `input`).
+
+mod input;
 
 use std::{
     fs::File,
@@ -72,6 +79,34 @@ enum Cmd {
         #[arg(long, value_parser = parse_hex)]
         addr: u64,
     },
+    /// Make a virtual mouse through /dev/uinput and click with it (an
+    /// autoclicker or triggerbot). Needs write access to /dev/uinput.
+    Clicker {
+        /// The device's name, as sysfs and session_status show it.
+        #[arg(long, default_value = "cheatsim clicker")]
+        name: String,
+        #[arg(long, default_value_t = 3)]
+        clicks: u32,
+        /// Seconds to keep the device after clicking.
+        #[arg(long, default_value_t = 3600)]
+        hold: u64,
+    },
+    /// Make a virtual HID mouse through /dev/uhid and move it.
+    Uhid {
+        #[arg(long, default_value = "cheatsim uhid mouse")]
+        name: String,
+        #[arg(long, default_value_t = 3)]
+        moves: u32,
+        /// Seconds to keep the device after moving.
+        #[arg(long, default_value_t = 3600)]
+        hold: u64,
+    },
+    /// Write one event (a SYN_REPORT, which changes nothing) into an
+    /// existing input device node.
+    Inject {
+        #[arg(long)]
+        device: String,
+    },
 }
 
 const SECRET: u64 = 0x5EC2_E713_37C0_DE11;
@@ -90,6 +125,9 @@ fn main() -> ExitCode {
             dlopen_stdin,
         } => game(depth, &dlopen, dlopen_stdin),
         Cmd::Attack { pid, addr } => attack(Pid::from_raw(pid), addr),
+        Cmd::Clicker { name, clicks, hold } => input::clicker(&name, clicks, hold),
+        Cmd::Uhid { name, moves, hold } => input::uhid(&name, moves, hold),
+        Cmd::Inject { device } => input::inject(&device),
     }
 }
 
