@@ -5,8 +5,10 @@
 # Milestone 8 exit test: the executable-mapping allowlist. A protected game
 # can't load a library dropped after launch (cheatsim's injected library),
 # can't load one swapped into its install directory after launch, and can't
-# mprotect a file mapping executable; its own libraries, the system's, and an
-# approved overlay still load. Every denial shows up as a DENIED line and in
+# mprotect a file mapping executable, and a process it starts can't exec a
+# binary dropped after launch (execve fails with EACCES); its own libraries,
+# the system's, and an approved overlay still load, also in a process it
+# started that outlives it. Every denial shows up as a DENIED line and in
 # the vendor's violation stream. Run inside the VM, as your normal user (not
 # root), from the repo root:  ./vm/test-milestone8.sh
 #
@@ -44,10 +46,11 @@ indent() { sed 's/^/      /'; }
 
 T="$(mktemp -d /tmp/fairplay-m8.XXXXXX)"
 chmod 755 "$T"
-DAEMON_PID=""; STREAM_PID=""
+DAEMON_PID=""; STREAM_PID=""; ORPHAN_PID=""
 cleanup() {
   exec 3>&-
   [ -n "$STREAM_PID" ] && sudo kill "$STREAM_PID" 2>/dev/null
+  [ -n "$ORPHAN_PID" ] && kill "$ORPHAN_PID" 2>/dev/null
   if [ -S "$SOCK" ]; then
     sudo "$T/bin/fairplayctl" --socket "$SOCK" list 2>/dev/null |
       jq -r '.ok.sessions[]? | (.game, .members[]) | select(.state=="running") | .pid' 2>/dev/null |
@@ -73,16 +76,16 @@ exec_entries() { sudo "$BPFTOOL" -j map dump name EXEC_ALLOWED 2>/dev/null | jq 
 # Wait up to ~10s for a file to match a pattern.
 wait_for() { for _ in $(seq 100); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 
-# Ask the game to load something; wait for its LOADED/BLOCKED line.
+# Ask the game to do something; wait for its LOADED/BLOCKED/EXEC-/SPAWNED line.
 ask() {
   local before
-  before="$(grep -cE '^(LOADED|BLOCKED|MPROTECT-|EXEC-)' "$T/game.out")"
+  before="$(grep -cE '^(LOADED|BLOCKED|MPROTECT-|EXEC-|SPAWNED)' "$T/game.out")"
   echo "$1" >&3
   for _ in $(seq 100); do
-    [ "$(grep -cE '^(LOADED|BLOCKED|MPROTECT-|EXEC-)' "$T/game.out")" -gt "$before" ] && break
+    [ "$(grep -cE '^(LOADED|BLOCKED|MPROTECT-|EXEC-|SPAWNED)' "$T/game.out")" -gt "$before" ] && break
     sleep 0.1
   done
-  grep -E '^(LOADED|BLOCKED|MPROTECT-|EXEC-)' "$T/game.out" | tail -1 | tee "$T/last" | indent
+  grep -E '^(LOADED|BLOCKED|MPROTECT-|EXEC-|SPAWNED)' "$T/game.out" | tail -1 | tee "$T/last" | indent
 }
 
 # A library whose cheatsim_marker() returns $2.
@@ -174,25 +177,31 @@ ask "exec /usr/bin/true"
 check "EXEC-OK for a system binary (/usr/bin/true)" grep -q "^EXEC-OK /usr/bin/true$" "$T/last"
 cp /usr/bin/true "$T/drop/helper"   # same code, but yours and dropped after launch
 ask "exec $T/drop/helper"
-check "EXEC-BLOCKED for a binary dropped after launch (the kernel kills the child)" \
-  grep -q "^EXEC-BLOCKED $T/drop/helper: killed by SIGSEGV" "$T/last"
-check "DENIED line: hook=mmap_file file=helper, by the child (not the game)" \
-  grep -qE "^DENIED caller=([0-9]+) .*target=\\1 hook=mmap_file .*file=helper$" "$T/daemon.out"
+check "EXEC-BLOCKED for a binary dropped after launch: execve fails with EACCES (no SIGSEGV)" \
+  grep -q "^EXEC-BLOCKED $T/drop/helper: execve failed: Permission denied" "$T/last"
+check "DENIED line: hook=bprm_check_security file=helper, by the child (not the game)" \
+  grep -qE "^DENIED caller=([0-9]+) .*target=\\1 hook=bprm_check_security .*file=helper$" "$T/daemon.out"
+check "... exactly one for it (mmap_file never saw it)" \
+  test "$(grep -c "^DENIED .*file=helper$" "$T/daemon.out")" -eq 1
 check_not "... and the child's caller pid is not the game's" \
   grep -q "^DENIED caller=$GPID .*file=helper$" "$T/daemon.out"
+printf '#!/bin/sh\nexit 0\n' >"$T/drop/script.sh" && chmod +x "$T/drop/script.sh"
+ask "exec $T/drop/script.sh"
+check "EXEC-OK for a dropped #! script: only its interpreter (/bin/sh, a system file) is mapped" \
+  grep -q "^EXEC-OK $T/drop/script.sh$" "$T/last"
 
 step "the vendor's stream"
 for _ in $(seq 50); do kill -0 "$STREAM_PID" 2>/dev/null || break; sleep 0.1; done
 grep '"violation"' "$T/events.jsonl" >"$T/v.jsonl"
 jq -c '.event.violation | {caller, target, hook, file, mode}' "$T/v.jsonl" | indent
-check "4 violation events: mmap_file cheat.so, mmap_file lib_swap.so, file_mprotect cheat.so, mmap_file helper" \
+check "4 violation events: mmap_file cheat.so, mmap_file lib_swap.so, file_mprotect cheat.so, bprm_check_security helper" \
   jqt -s --argjson s "$SESSION" '[.[].event.violation] |
     length == 4 and all(.[]; .session==$s and .caller==.target)
-    and ([.[] | [.hook, .file]] == [["mmap_file","cheat.so"],["mmap_file","lib_swap.so"],["file_mprotect","cheat.so"],["mmap_file","helper"]])' "$T/v.jsonl"
+    and ([.[] | [.hook, .file]] == [["mmap_file","cheat.so"],["mmap_file","lib_swap.so"],["file_mprotect","cheat.so"],["bprm_check_security","helper"]])' "$T/v.jsonl"
 check "the first three came from the game itself" \
   jqt -s --argjson g "$GPID" '[.[].event.violation][0:3] | all(.[]; .caller==$g and .comm=="cheatsim")' "$T/v.jsonl"
 check_not "no other DENIED lines (in particular none by fairplayd itself)" \
-  grep -v -e "hook=mmap_file" -e "hook=file_mprotect" <(grep '^DENIED' "$T/daemon.out")
+  grep -v -e "hook=mmap_file" -e "hook=file_mprotect" -e "hook=bprm_check_security" <(grep '^DENIED' "$T/daemon.out")
 "$CTL" status "$SESSION" >"$T/status.json" 2>/dev/null || sudo "$CTL" --socket "$SOCK" status "$SESSION" >"$T/status.json"
 check "session_status counts 4 violations" jqt '.ok.status.session.violations==4' "$T/status.json"
 
@@ -225,18 +234,53 @@ sudo "$CTL" --socket "$SOCK" launch --run-as "$ME_UID" --manifest "$MANIFEST" --
 check "--install-dir /proc is refused (bad_request), nothing launched" \
   jqt '.error.code=="bad_request"' "$T/proc.out"
 
-step "the game exits"
+step "the game exits, leaving behind a process it started"
+# The child (python3, a system file) waits for the go file, then loads one
+# of the game's libraries and tries the dropped one.
+cat >"$T/orphan.py" <<'EOF'
+import ctypes, os, sys, time
+go = sys.argv[1]
+for _ in range(300):
+    if os.path.exists(go):
+        break
+    time.sleep(0.1)
+for name in sys.argv[2:]:
+    try:
+        print("ORPHAN-LOADED", name, "marker=%d" % ctypes.CDLL(name).cheatsim_marker(), flush=True)
+    except OSError as e:
+        print("ORPHAN-BLOCKED", name, e, flush=True)
+EOF
+ask "spawn $(readlink -f "$(command -v python3)") -I $T/orphan.py $T/go $T/game/lib_ok.so $T/drop/cheat.so"
+ORPHAN_PID="$(sed -n 's/^SPAWNED \([0-9]*\) .*/\1/p' "$T/last")"
+echo "      child=$ORPHAN_PID"
+check "the child is in PROTECTED" in_protected "$ORPHAN_PID"
 exec 3>&-
 kill "$GPID"
 for _ in $(seq 50); do in_protected "$GPID" || break; sleep 0.1; done
 check_not "the game's pid is gone from PROTECTED" in_protected "$GPID"
-check "its allowlist entries are gone; the overlay's stays (1 entry)" test "$(exec_entries)" -eq 1
+check "the child is still in PROTECTED" in_protected "$ORPHAN_PID"
+sleep 1.5   # past fairplayd's once-a-second check
+check "the session's allowlist entries stay while the child runs (4 entries)" test "$(exec_entries)" -eq 4
+touch "$T/go"
+for _ in $(seq 100); do kill -0 "$ORPHAN_PID" 2>/dev/null || break; sleep 0.1; done
+grep '^ORPHAN-' "$T/game.out" | indent
+check "the child outliving the game can still map the game's library (marker=1)" \
+  grep -q "^ORPHAN-LOADED $T/game/lib_ok.so marker=1$" "$T/game.out"
+check "... and still can't map the dropped one" \
+  grep -q "^ORPHAN-BLOCKED $T/drop/cheat.so" "$T/game.out"
+check "DENIED line for it: caller=the child, hook=mmap_file file=cheat.so" \
+  grep -q "^DENIED caller=$ORPHAN_PID .*hook=mmap_file .*file=cheat.so$" "$T/daemon.out"
+for _ in $(seq 30); do [ "$(exec_entries)" -eq 1 ] && break; sleep 0.1; done
+check "once the child is gone, its allowlist entries go; the overlay's stays (1 entry)" test "$(exec_entries)" -eq 1
+check "fairplayd says the domain had no processes left" \
+  grep -q "has no processes left; its allowlist entries are released" "$T/daemon.err"
 
 step "stop fairplayd"
 sudo kill "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""
 check "socket removed" test ! -e "$SOCK"
 check_not "no mmap_file program left attached" sudo "$BPFTOOL" prog show name mmap_file
 check_not "no file_mprotect program left attached" sudo "$BPFTOOL" prog show name file_mprotect
+check_not "no bprm_check_security program left attached" sudo "$BPFTOOL" prog show name bprm_check_security
 
 echo
 echo "$pass passed, $fail failed"
