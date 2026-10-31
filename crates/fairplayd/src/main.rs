@@ -51,15 +51,16 @@ use aya::{
 use clap::Parser;
 use fairplay_api::{ProcessState, ViolationEvent, DEFAULT_LAUNCHER_GROUP, DEFAULT_SOCKET};
 use fairplay_common::{
-    ExecAllow, ExecKey, Violation, ANY_DOMAIN, FS_SYSTEM, MAP_EXEC_ALLOWED, MAP_EXEC_TRUSTED_FS,
-    MAP_INPUT_ALLOWED, MAP_INPUT_BLOCK, MAP_PROTECTED, MAP_READERS, MAP_READER_FILES,
-    MAP_SANDBOXED, MAP_UNFOLLOWED, MAP_VIOLATIONS, VIOLATION_REPORTED,
+    ExecAllow, ExecKey, Members, Violation, ANY_DOMAIN, DEFAULT_MEMBER_CAP, FS_SYSTEM,
+    MAP_EXEC_ALLOWED, MAP_EXEC_TRUSTED_FS, MAP_INPUT_ALLOWED, MAP_INPUT_BLOCK, MAP_MEMBERS,
+    MAP_MEMBER_CAP, MAP_PROTECTED, MAP_READERS, MAP_READER_FILES, MAP_SANDBOXED, MAP_UNFOLLOWED,
+    MAP_VIOLATIONS, VIOLATION_REPORTED,
 };
 use tokio::{io::unix::AsyncFd, sync::broadcast};
 
 use crate::{
     input::InputRecord,
-    state::{c_str, hook_name, unix_now, Daemon, ProtectedMap, CLI_DOMAIN},
+    state::{c_str, hook_name, unix_now, Daemon, ProtectedMap, CLI_DOMAIN, MAX_MEMBER_CAP},
 };
 
 #[derive(Parser)]
@@ -104,6 +105,13 @@ struct Args {
     /// fairplayd starts, like --overlay.
     #[arg(long)]
     input_allow: Vec<PathBuf>,
+    /// The most processes one protection domain may have forked into it at
+    /// once (issue #21). Beyond it a protected process's fork fails with
+    /// EAGAIN. The processes fairplayd launches don't count. Fewer sessions
+    /// may run at once with a larger cap, so their caps fit in PROTECTED.
+    #[arg(long, default_value_t = DEFAULT_MEMBER_CAP,
+          value_parser = clap::value_parser!(u32).range(1..=MAX_MEMBER_CAP as i64))]
+    member_cap: u32,
     /// The TPM `attest` quotes with, as a libtss2 TCTI string (e.g.
     /// `swtpm:host=127.0.0.1,port=2321` for a software TPM in tests).
     #[arg(long, default_value = "device:/dev/tpmrm0")]
@@ -117,11 +125,12 @@ struct Args {
     no_ima_log: bool,
 }
 
-/// The kernel's PROTECTED map, UNFOLLOWED beside it, EXEC_ALLOWED,
-/// INPUT_BLOCK, READERS and READER_FILES.
+/// The kernel's PROTECTED map, UNFOLLOWED and MEMBERS beside it,
+/// EXEC_ALLOWED, INPUT_BLOCK, READERS and READER_FILES.
 pub struct BpfMap {
     protected: HashMap<MapData, u32, u32>,
     unfollowed: HashMap<MapData, u32, u64>,
+    members: HashMap<MapData, u32, Members>,
     exec: HashMap<MapData, ExecKey, ExecAllow>,
     input_block: Array<MapData, u32>,
     readers: HashMap<MapData, u32, u32>,
@@ -173,8 +182,15 @@ impl ProtectedMap for BpfMap {
     fn unfollowed(&self, domain: u32) -> u64 {
         self.unfollowed.get(&domain, 0).unwrap_or(0)
     }
+    fn start_domain(&mut self, domain: u32) -> Result<()> {
+        Ok(self.members.insert(domain, Members::default(), 0)?)
+    }
+    fn members(&self, domain: u32) -> Members {
+        self.members.get(&domain, 0).unwrap_or_default()
+    }
     fn forget_domain(&mut self, domain: u32) {
         let _ = self.unfollowed.remove(&domain);
+        let _ = self.members.remove(&domain);
     }
     fn live_domains(&self) -> Result<std::collections::BTreeSet<u32>> {
         // Entries can come and go while we walk; only a member's fork adds
@@ -215,6 +231,9 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("inode_follow_link", "inode_follow_link"),
     ("socket_connect", "socket_connect"),
     ("socket_sendmsg", "socket_sendmsg"),
+    // The per-domain member cap (issue #21).
+    ("task_alloc", "task_alloc"),
+    ("task_free", "task_free"),
 ];
 
 /// LSM programs for hooks older kernels lack. fairplayd starts without them
@@ -295,9 +314,14 @@ fn main() -> Result<()> {
         .filter(|&&(_, kind)| kind == FS_SYSTEM)
         .map(|&(dev, _)| dev)
         .collect();
+    // The member cap (issue #21), before anything is protected.
+    let mut member_cap: Array<MapData, u32> =
+        Array::try_from(ebpf.take_map(MAP_MEMBER_CAP).context("MEMBER_CAP map")?)?;
+    member_cap.set(0, args.member_cap, 0)?;
     let map = BpfMap {
         protected: HashMap::try_from(ebpf.take_map(MAP_PROTECTED).context("PROTECTED map")?)?,
         unfollowed: HashMap::try_from(ebpf.take_map(MAP_UNFOLLOWED).context("UNFOLLOWED map")?)?,
+        members: HashMap::try_from(ebpf.take_map(MAP_MEMBERS).context("MEMBERS map")?)?,
         exec: HashMap::try_from(
             ebpf.take_map(MAP_EXEC_ALLOWED)
                 .context("EXEC_ALLOWED map")?,
@@ -311,6 +335,14 @@ fn main() -> Result<()> {
         )?,
     };
     let mut daemon = Daemon::new(map);
+    daemon.set_member_cap(args.member_cap);
+    // The command line's domain counts its forks like any other.
+    daemon.map_mut().start_domain(CLI_DOMAIN)?;
+    eprintln!(
+        "fairplayd: member cap {} forked processes per domain; at most {} sessions at once",
+        args.member_cap,
+        daemon.max_sessions()
+    );
     let mounts = exec_allow::Mounts::read()?;
 
     // Virtual input allowlist (milestone 7), fixed for the daemon's life.
