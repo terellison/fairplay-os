@@ -13,10 +13,13 @@ use fairplay_common::{Hook, Violation, EXE_NAME_LEN};
 
 use crate::{
     maps::{PROTECTED, VIOLATIONS},
-    vmlinux::{dentry, file, mm_struct, path, qstr, task_struct},
+    vmlinux::{
+        dentry, file, inode, kuid_t, mm_struct, path, qstr, super_block, task_struct,
+        vm_area_struct,
+    },
 };
 
-// task_mm, mm_exe_file, file_path, dentry_name: see build.rs.
+// Field accessors (task_mm, mm_exe_file, file_path, ...): see build.rs.
 include!(concat!(env!("OUT_DIR"), "/fields.rs"));
 
 pub const EPERM: i32 = 1;
@@ -66,24 +69,41 @@ pub fn task_domain(task: *const task_struct) -> Result<Option<(u32, u32)>, i64> 
 /// Writes a [`Violation`] for the current task to VIOLATIONS. Drops it if the
 /// ring buffer is full.
 pub fn record_violation(caller: u32, target: u32, hook: Hook, mode: u32) {
-    if let Some(mut entry) = VIOLATIONS.reserve::<Violation>(0) {
-        let comm = bpf_get_current_comm().unwrap_or([0; 16]);
-        let mut exe = [0u8; EXE_NAME_LEN];
-        let _ = current_exe_name(&mut exe);
+    record_violation_on_file(caller, target, hook, mode, core::ptr::null());
+}
+
+/// [`record_violation`] for a file hook: also names the file (`file` may be
+/// null).
+pub fn record_violation_on_file(
+    caller: u32,
+    target: u32,
+    hook: Hook,
+    mode: u32,
+    file: *const file,
+) {
+    let Some(mut entry) = VIOLATIONS.reserve::<Violation>(0) else {
+        return;
+    };
+    // Filled in place: a Violation plus two name buffers on the BPF stack
+    // would crowd its 512 bytes.
+    let v = entry.as_mut_ptr();
+    unsafe {
+        (*v).caller = caller;
+        (*v).target = target;
         // Lets fairplayd file an attempt on any process the game started
         // under the game's session. 0 if the target is no longer in the map.
-        let domain = unsafe { PROTECTED.get(&target) }.copied().unwrap_or(0);
-        entry.write(Violation {
-            caller,
-            target,
-            domain,
-            hook: hook as u32,
-            mode,
-            comm,
-            exe,
-        });
-        entry.submit(0);
+        (*v).domain = PROTECTED.get(&target).copied().unwrap_or(0);
+        (*v).hook = hook as u32;
+        (*v).mode = mode;
+        (*v).comm = bpf_get_current_comm().unwrap_or([0; 16]);
+        (*v).exe = [0; EXE_NAME_LEN];
+        (*v).file = [0; EXE_NAME_LEN];
+        let _ = current_exe_name(&mut (*v).exe);
+        if !file.is_null() {
+            let _ = file_name(file, &mut (*v).file);
+        }
     }
+    entry.submit(0);
 }
 
 /// The file name of the current task's executable
@@ -101,7 +121,14 @@ fn current_exe_name(out: &mut [u8; EXE_NAME_LEN]) -> Result<(), i64> {
         if exe.is_null() {
             return Ok(());
         }
-        let dentry: *const dentry = bpf_probe_read_kernel(addr_of!((*file_path(exe)).dentry))?;
+        file_name(exe, out)
+    }
+}
+
+/// `file->f_path.dentry->d_name`, NUL-terminated, cut to fit `out`.
+fn file_name(f: *const file, out: &mut [u8; EXE_NAME_LEN]) -> Result<(), i64> {
+    unsafe {
+        let dentry: *const dentry = bpf_probe_read_kernel(addr_of!((*file_path(f)).dentry))?;
         let name: *const u8 = bpf_probe_read_kernel(addr_of!((*dentry_name(dentry)).name))?;
         // Room for the NUL, so the result is always terminated.
         bpf_probe_read_kernel_str(

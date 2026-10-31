@@ -26,6 +26,7 @@
 mod vmlinux;
 
 mod domain;
+mod exec_allow;
 mod follow;
 mod hooks;
 mod maps;

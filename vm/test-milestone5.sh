@@ -212,9 +212,11 @@ kill "$PLAIN"; wait "$PLAIN" 2>/dev/null; KILL_PIDS=()
 
 step "PROTECTED full: the child runs unprotected and the session says so"
 # A protected shell that waits on a FIFO (no forks while waiting), then
-# becomes a game that forks once. Fill the map while it waits.
+# becomes a game that forks once. Fill the map while it waits. The game's
+# code is in $T/bin, not next to /bin/sh: say so, or the executable-mapping
+# allowlist (milestone 8) stops the exec.
 mkfifo "$T/go"
-as_launcher "$CTL" launch -- /bin/sh -c "read x <'$T/go'; exec '$CHEATSIM' game --depth 1" >"$T/full.out" 2>&1
+as_launcher "$CTL" launch --install-dir "$T/bin" -- /bin/sh -c "read x <'$T/go'; exec '$CHEATSIM' game --depth 1" >"$T/full.out" 2>&1
 FSESSION="$(grep '^{' "$T/full.out" | jq -r '.ok.launched.session')"
 FGAME="$(grep '^{' "$T/full.out" | jq -r '.ok.launched.pid')"
 FDOM="$(domain_of "$FGAME")"

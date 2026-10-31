@@ -30,7 +30,7 @@ the parts that need a real gaming PC come later.
 | 5 | Protection follows the game's child processes | Done | `./vm/test-milestone5.sh` |
 | 6 | fairplayd protects itself from root | Not started | |
 | 7 | Report fake input devices and who made them | Not started | |
-| 8 | Only approved code may load into the game | Not started | |
+| 8 | Only approved code may load into the game | Done | `./vm/test-milestone8.sh` |
 | 9 | Vendor anti-cheat: signed and sandboxed | Not started | |
 | 10 | Attestation | Blocked: the VM has no TPM | |
 | 11 | Player-mode system image | Needs an x86 PC | |
@@ -306,6 +306,55 @@ never reached it, that its entry is gone while it's still a zombie, that the
 same game started without `fairplayd` leaks 3/3, and that a full `PROTECTED`
 shows up as `protection_degraded`.
 
+### Only approved code loads into the game (milestone 8)
+
+Reading the game's memory is blocked, but a cheat could still get its code
+*into* the game: drop a library file somewhere and trick the game into
+loading it (a plugin folder, a config file that names a path), or, since
+milestone 5, get the game to start a dropped program, which would then be
+inside the game's domain. Clearing `LD_PRELOAD` at launch doesn't catch
+those.
+
+Every way of loading code from a file ends the same way: the kernel
+**maps** the file into memory with permission to run it (**PROT_EXEC**).
+`dlopen` does that, the loader does it for every library, `execve` does it
+for a new program, and Wine does it for DLLs. So two more checkpoints watch
+exactly that, for protected processes only: `mmap_file` (map a file as
+code) and `file_mprotect` (map it as data, then switch it to code). The
+file must be one of:
+
+- a **system file**: on the system disk, owned by root, writable by nobody
+  else. The loader, libc and graphics drivers are covered without a list;
+- one that was in the game's **install directory** at launch. `fairplayd`
+  walks that directory and lists every program and library file in it;
+- an **approved overlay** (Steam, Discord, MangoHud), named with
+  `fairplayd --overlay`.
+
+The list holds **inodes**, not file names. A file dropped after launch, or a
+library swapped for a different one at the same path, is a new inode, so it
+isn't on the list. Code a game generates in memory (a **JIT**, as Wine, .NET
+and shader compilers use) isn't a file and isn't checked: putting code there
+from outside would need a write into the game's memory, which milestone 3
+already blocks.
+
+What a blocked load looks like: `dlopen` fails ("failed to map segment"),
+`mprotect` fails with `EPERM`, and a blocked program start kills the new
+process (the kernel has already given up the old program by the time it
+maps the new one). Each shows up as a `DENIED` line and in the violation
+stream with the file's name.
+
+**Known weakness.** If the game's own files are writable by the player (they
+usually are), a cheat can rewrite an allowed file in place: same inode, new
+content. Checking content hashes (IMA or fs-verity) would close that; it's a
+design question for later.
+
+**Milestone 8's test** (`vm/test-milestone8.sh`) asks a protected `cheatsim`
+to load a dropped library (blocked), one from its install directory (loads),
+one swapped after launch (blocked) and an approved overlay (loads), to make
+a dropped file executable with `mprotect` (blocked), and to start
+`/usr/bin/true` (works) and a dropped copy of it (killed). The same dropped
+library loads fine in an unprotected game.
+
 ### Lessons learned writing BPF programs
 
 - **The verifier** checks every program before the kernel will run it. For LSM
@@ -450,6 +499,22 @@ deliberate change to both files.
   modify another.
 - **inode**: the file itself, as opposed to its name. A program that has a
   file open keeps the old inode even after the name points somewhere new.
+- **Inode-based allowlist**: a list of approved files by inode (plus the
+  disk they're on) instead of by path, so replacing a file at an approved
+  path doesn't make the replacement approved. Milestone 8's `EXEC_ALLOWED`.
+- **mmap**: asking the kernel to make a file (or plain memory) appear in a
+  process's memory. How programs and libraries get loaded.
+- **PROT_EXEC**: the permission bit on a memory mapping that lets the CPU
+  run it as code. **mprotect** changes those bits on an existing mapping.
+- **dlopen**: loading a library while a program runs (plugins, overlays).
+- **JIT** (just-in-time compiler): code a program writes into its own memory
+  and then runs, as Wine, .NET, LuaJIT and shader compilers do.
+- **memfd**: a file that lives only in memory, with no name on disk; JITs
+  use it to map the same code twice.
+- **ELF / PE**: the file formats of Linux programs and libraries, and of
+  Windows ones (`.exe`, `.dll`).
+- **Overlay**: a library that draws inside the game's window (Steam,
+  Discord, MangoHud), which means loading code into the game.
 - **Daemon**: a program that runs in the background and serves requests.
   `fairplayd` is one (the "d" is for daemon).
 - **uid / gid**: user ID and group ID, the numbers Linux uses for accounts

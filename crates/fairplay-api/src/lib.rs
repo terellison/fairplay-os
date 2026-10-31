@@ -77,6 +77,12 @@ pub enum Request {
         /// the game it watches.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         join: Option<SessionId>,
+        /// Absolute path of the directory the program's code comes from
+        /// (default: the program's own directory). Every ELF or PE file in
+        /// it when the launch happens may be mapped executable by the
+        /// session; files added or replaced later may not (milestone 8).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        install_dir: Option<String>,
     },
     /// Whether a session is protected, plus machine state a vendor cares
     /// about. Without `session`: the session the calling process belongs to.
@@ -210,10 +216,17 @@ pub struct ViolationEvent {
     pub exe_path: Option<String>,
     /// The protected process it targeted.
     pub target: u32,
-    /// LSM hook that denied it, e.g. `ptrace_access_check`.
+    /// LSM hook that denied it, e.g. `ptrace_access_check`, or `mmap_file`
+    /// / `file_mprotect` for code the game tried to map that isn't on its
+    /// allowlist (then `caller` and `target` are both the game).
     pub hook: String,
-    /// ptrace access mode bits the caller asked for.
+    /// ptrace access mode bits the caller asked for, or for `mmap_file` and
+    /// `file_mprotect` the `PROT_*` bits.
     pub mode: u32,
+    /// File name (no directory) of the file it tried to map, for
+    /// `mmap_file` and `file_mprotect`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
     /// Seconds since the Unix epoch, when fairplayd read the record.
     pub seen_at: u64,
 }
@@ -340,6 +353,7 @@ mod tests {
                 cwd: "/".into(),
                 run_as: None,
                 join: None,
+                install_dir: None,
             }
         );
     }
@@ -354,6 +368,7 @@ mod tests {
                 cwd: "/tmp".into(),
                 run_as: Some(1000),
                 join: Some(3),
+                install_dir: Some("/games/x".into()),
             },
             Request::SessionStatus { session: Some(1) },
             Request::SessionStatus { session: None },
@@ -454,6 +469,7 @@ mod tests {
             target: 9,
             hook: "ptrace_access_check".into(),
             mode: 0x11,
+            file: None,
             seen_at: 5,
         }));
         let text = String::from_utf8(encode(&ev)).unwrap();
@@ -461,7 +477,24 @@ mod tests {
             text.starts_with("{\"event\":{\"violation\":{\"session\":1,"),
             "{text}"
         );
+        assert!(!text.contains("\"file\""), "no file for process hooks");
         assert_eq!(serde_json::from_str::<Response>(&text).unwrap(), ev);
+
+        let mapping = Response::Event(Event::Violation(ViolationEvent {
+            session: Some(1),
+            caller: 9,
+            comm: "game".into(),
+            exe: "game".into(),
+            exe_path: None,
+            target: 9,
+            hook: "mmap_file".into(),
+            mode: 0x5,
+            file: Some("cheat.so".into()),
+            seen_at: 5,
+        }));
+        let text = String::from_utf8(encode(&mapping)).unwrap();
+        assert!(text.contains("\"file\":\"cheat.so\""), "{text}");
+        assert_eq!(serde_json::from_str::<Response>(&text).unwrap(), mapping);
     }
 
     #[test]

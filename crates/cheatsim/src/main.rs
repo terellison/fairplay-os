@@ -9,6 +9,10 @@
 //! fail and fairplayd must print one DENIED line per attempt. Run the attacker
 //! as root on purpose: kernel ptrace rules let root through, so a denial proves
 //! the LSM did it.
+//!
+//! Milestone 8: `cheatsim game --dlopen <lib>` (or `--dlopen-stdin`) has the
+//! game load a library after startup, as a game tricked into loading a
+//! dropped cheat would, and prints LOADED or BLOCKED.
 
 use std::{
     fs::File,
@@ -45,6 +49,20 @@ enum Cmd {
         /// is a chain of processes). Every level dies with its parent.
         #[arg(long, default_value_t = 0)]
         depth: u32,
+        /// After startup, dlopen() this library (repeatable) and print
+        /// LOADED or BLOCKED: a game being tricked into loading a cheat, or
+        /// loading an overlay (milestone 8).
+        #[arg(long)]
+        dlopen: Vec<String>,
+        /// Also read library paths from stdin, one per line, and dlopen each
+        /// as it arrives (so a test can drop or replace files first). A line
+        /// `mprotect <path>` instead maps the file read-only and then asks
+        /// for PROT_EXEC with mprotect(), printing MPROTECT-OK or
+        /// MPROTECT-BLOCKED; a line `exec <path>` forks a child that execs
+        /// the program, printing EXEC-OK if it exited 0, else EXEC-BLOCKED
+        /// and how it ended.
+        #[arg(long)]
+        dlopen_stdin: bool,
     },
     /// Try every read path against the target.
     Attack {
@@ -66,12 +84,16 @@ fn parse_hex(s: &str) -> Result<u64, String> {
 
 fn main() -> ExitCode {
     match Args::parse().cmd {
-        Cmd::Game { depth } => game(depth),
+        Cmd::Game {
+            depth,
+            dlopen,
+            dlopen_stdin,
+        } => game(depth, &dlopen, dlopen_stdin),
         Cmd::Attack { pid, addr } => attack(Pid::from_raw(pid), addr),
     }
 }
 
-fn game(depth: u32) -> ExitCode {
+fn game(depth: u32, dlopen: &[String], dlopen_stdin: bool) -> ExitCode {
     for level in 1..=depth {
         let parent = getpid();
         // SAFETY: single-threaded so far; the child just carries on here.
@@ -111,10 +133,124 @@ fn game(depth: u32) -> ExitCode {
         std::process::id(),
         &*secret as *const u64 as usize
     );
+    for path in dlopen {
+        load(path);
+    }
+    if dlopen_stdin {
+        for line in std::io::stdin().lines() {
+            let Ok(line) = line else { break };
+            if let Some(path) = line.strip_prefix("mprotect ") {
+                make_executable(path);
+            } else if let Some(path) = line.strip_prefix("exec ") {
+                run(path);
+            } else if !line.is_empty() {
+                load(&line);
+            }
+        }
+    }
     loop {
         // Keep the value live so the optimizer can't drop it.
         std::hint::black_box(&secret);
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// dlopen()s a library the way a game loads a plugin, then prints one line:
+/// `LOADED <path>` (and the result of its `cheatsim_marker()` if it has
+/// one) or `BLOCKED <path>: <loader error>`. The library is never closed.
+fn load(path: &str) {
+    let Ok(c) = std::ffi::CString::new(path) else {
+        println!("BLOCKED {path}: NUL in path");
+        return;
+    };
+    // SAFETY: dlopen runs the library's constructors, which is the point:
+    // this is the test's stand-in for injected code.
+    let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    if handle.is_null() {
+        // SAFETY: dlerror returns a thread-local string or NULL.
+        let err = unsafe { libc::dlerror() };
+        let msg = if err.is_null() {
+            "unknown error".into()
+        } else {
+            // SAFETY: non-null dlerror results are NUL-terminated.
+            unsafe { std::ffi::CStr::from_ptr(err) }.to_string_lossy()
+        };
+        println!("BLOCKED {path}: {msg}");
+        return;
+    }
+    // SAFETY: handle is live; the symbol, if present, is `int (void)`.
+    let sym = unsafe { libc::dlsym(handle, c"cheatsim_marker".as_ptr()) };
+    if sym.is_null() {
+        println!("LOADED {path}");
+    } else {
+        let f: extern "C" fn() -> libc::c_int = unsafe { std::mem::transmute(sym) };
+        println!("LOADED {path} marker={}", f());
+    }
+}
+
+/// Forks a child that execs `path` (no arguments) and reports how it
+/// ended: a game starting a helper program, or being tricked into starting
+/// a dropped one.
+fn run(path: &str) {
+    let Ok(c) = std::ffi::CString::new(path) else {
+        return println!("EXEC-BLOCKED {path}: NUL in path");
+    };
+    let argv = [c.as_ptr(), std::ptr::null()];
+    // SAFETY: single-threaded; the child only calls execv and _exit.
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => unsafe {
+            libc::execv(c.as_ptr(), argv.as_ptr());
+            // Exit code 100 + errno: execve itself returned an error.
+            libc::_exit(100 + *libc::__errno_location());
+        },
+        Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
+            Ok(WaitStatus::Exited(_, 0)) => println!("EXEC-OK {path}"),
+            Ok(WaitStatus::Exited(_, code)) if code > 100 => println!(
+                "EXEC-BLOCKED {path}: execve failed: {}",
+                std::io::Error::from_raw_os_error(code - 100)
+            ),
+            Ok(WaitStatus::Exited(_, code)) => println!("EXEC-BLOCKED {path}: exited {code}"),
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                println!("EXEC-BLOCKED {path}: killed by {sig:?}")
+            }
+            other => println!("EXEC-BLOCKED {path}: {other:?}"),
+        },
+        Err(e) => println!("EXEC-BLOCKED {path}: fork: {e}"),
+    }
+}
+
+/// Maps the first page of `path` read-only, then mprotect()s it to
+/// read+exec: the other way to get file-backed code into a process.
+fn make_executable(path: &str) {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => return println!("MPROTECT-BLOCKED {path}: open: {e}"),
+    };
+    use std::os::fd::AsRawFd;
+    // SAFETY: a fresh private read-only mapping of one page; unmapped below.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        let e = std::io::Error::last_os_error();
+        return println!("MPROTECT-BLOCKED {path}: mmap: {e}");
+    }
+    // SAFETY: addr is the page we just mapped.
+    let rc = unsafe { libc::mprotect(addr, 4096, libc::PROT_READ | libc::PROT_EXEC) };
+    let e = std::io::Error::last_os_error();
+    // SAFETY: same mapping, no longer used.
+    unsafe { libc::munmap(addr, 4096) };
+    if rc == 0 {
+        println!("MPROTECT-OK {path}");
+    } else {
+        println!("MPROTECT-BLOCKED {path}: mprotect: {e}");
     }
 }
 

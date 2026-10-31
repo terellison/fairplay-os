@@ -17,11 +17,11 @@ each piece does, how they fit, and a glossary.
 | `crates/fairplay-api` | 4 | The socket protocol (JSON types), a client, and `fairplayctl` |
 | `crates/lsm-hello-ebpf` | 1 | Smoke-test LSM program: logs every `file_open` by `cat` |
 | `crates/lsm-hello` | 1 | Loads it and prints its log |
-| `crates/fairplay-ebpf` | 3, 5 | LSM program on `ptrace_access_check`, plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
-| `crates/fairplayd` | 3-5 | Loads the programs, owns the PROTECTED map, serves the socket API, streams violations |
-| `crates/cheatsim` | 3, 5 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant |
+| `crates/fairplay-ebpf` | 3, 5, 8 | LSM programs on `ptrace_access_check`, `mmap_file` and `file_mprotect` (executable-mapping allowlist), plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
+| `crates/fairplayd` | 3-5, 8 | Loads the programs, owns the PROTECTED and EXEC_ALLOWED maps, serves the socket API, streams violations |
+| `crates/cheatsim` | 3, 5, 8 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant; `game --dlopen` loads libraries like a tricked game |
 | `crates/fairplay-attest` | 10 | API shape only |
-| `vm/` | 1-5 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4 and 5 tests |
+| `vm/` | 1-5, 8 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5 and 8 tests |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
 
@@ -175,6 +175,75 @@ still an unreaped zombie. As controls, the same game started without
 `fairplayd` leaks 3/3, and with `PROTECTED` filled up a new child is reported
 as `protection_degraded`.
 
+## Milestone 8: executable-mapping allowlist
+
+`LD_PRELOAD` and Wine's DLL variables are dropped at launch, but a game can
+still be tricked into loading a dropped library (a plugin path, a config
+file), and since milestone 5 anything a protected game starts is inside its
+domain. So a protected process may only map a *file* as code (`mmap` or
+`mprotect` with `PROT_EXEC`, which is how `ld.so`, `dlopen`, `execve` and
+Wine all load code) if the file is:
+
+- a **system file**: on the filesystem holding `/usr` and `/lib`, owned by
+  root, not writable by group or others. No allowlist entry needed: the
+  loader, libc, Mesa, GPU drivers' libraries;
+- in the game's **install directory** when it was launched: `fairplayd`
+  walks `install_dir` (a new optional `launch_protected` field, default the
+  program's directory; `fairplayctl launch --install-dir`) and puts every ELF
+  or PE file there that the system rule doesn't cover into `EXEC_ALLOWED`,
+  keyed by (session domain, device, inode);
+- an **approved overlay**: `fairplayd --overlay <path>` (repeatable), allowed
+  for every domain;
+- or **memfd / shared anonymous memory** (the kernel's internal shmem mount),
+  treated like anonymous memory.
+
+Anonymous executable memory (JITs: Wine, .NET, LuaJIT, shader compilers) is
+never checked: writing code into it from outside goes through
+`ptrace_access_check`. Files are matched by inode, not path, so a file
+created, or replaced by rename, after launch is not allowed even at an
+allowed path. The inode generation is checked too where the filesystem has
+one (ext4, btrfs), so a reused inode number isn't mistaken for the original.
+
+The hooks are `mmap_file` and `file_mprotect`
+(`crates/fairplay-ebpf/src/hooks/`, shared logic in `exec_allow.rs`); both
+return at once unless the current process is in `PROTECTED`. A denial is
+`EPERM` to the caller, a `DENIED ... hook=mmap_file ... file=<name>` line,
+and a violation event with a new `file` field, filed under the session. What
+the caller sees:
+
+- `dlopen`: fails with "failed to map segment from shared object";
+- `mprotect`: fails with `EPERM`;
+- `execve` of an unapproved binary: the kernel maps the new program after
+  the point of no return, so the process is killed with `SIGSEGV` (execve
+  never returns).
+
+Limits: at most 8192 code files per launch, 200,000 directory entries
+walked, 32 levels deep, and 32768 `EXEC_ALLOWED` entries in all. A launch
+over any limit is refused (`limit_reached`), never half-allowed. The walk
+doesn't follow symlinks or cross mount points, and refuses pseudo
+filesystems (`/proc`, `/sys`, ...). Entries go when the session's last
+launched process exits.
+
+Known weaknesses: a file that was allowed can be **rewritten in place** if
+the user can write to it (the install directory is usually the user's);
+content hashes (IMA or fs-verity) would close that. Root can make a file
+pass the system rule (`chown root`); in player mode root is fenced.
+
+The exit test, inside the VM, as your normal user:
+
+    flock /run/lock/fairplay-vm-tests ./vm/test-milestone8.sh
+
+A protected `cheatsim game --dlopen-stdin` is asked to load libraries after
+launch: one dropped in `/tmp` (blocked, with a `DENIED` line and a violation
+event), one in its install directory (loads), one in its install directory
+replaced after launch (blocked), and an approved overlay (loads). It also
+mprotects a dropped file executable (blocked) and an allowed one (works),
+forks children that exec `/usr/bin/true` (works) and a copy of it dropped in
+`/tmp` (killed), and checks that the same dropped library loads in an
+unprotected game, that JIT-style anonymous and memfd code still works in a
+protected process, and that allowlist entries are removed when the game
+exits.
+
 ## Known gaps on arm64 QEMU
 
 - **Secure Boot.** Homebrew's arm64 UEFI firmware has no Secure Boot keys
@@ -190,7 +259,7 @@ as `protection_degraded`.
 
 CI (`.github/workflows/ci.yml`) runs on every PR: fmt, clippy, unit tests,
 both eBPF builds, the full milestone 2 test, and shellcheck. It can't load BPF
-programs, so milestones 1, 3, 4 and 5 still need a run on the VM; see
+programs, so milestones 1, 3, 4, 5 and 8 still need a run on the VM; see
 [docs/GUIDE.md](docs/GUIDE.md#what-ci-checks).
 
 User-space crates build and test anywhere Linux runs: `cargo test --workspace`.

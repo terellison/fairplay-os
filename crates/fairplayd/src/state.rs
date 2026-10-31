@@ -12,9 +12,12 @@ use anyhow::Result;
 use fairplay_api::{
     ApiError, ErrorCode, ProcessInfo, ProcessState, Reply, SessionId, SessionInfo, ViolationEvent,
 };
-use fairplay_common::{Hook, Violation};
+use fairplay_common::{ExecAllow, ExecKey, Hook, Violation};
 
-/// The kernel's PROTECTED map (tgid -> protection domain), or a fake in tests.
+use crate::exec_allow::{ExecEntries, FileId};
+
+/// The kernel's PROTECTED map (tgid -> protection domain), with UNFOLLOWED
+/// and EXEC_ALLOWED (files a domain may map executable), or a fake in tests.
 /// The kernel also adds the processes a protected process starts, and
 /// removes each when it exits; fairplayd only manages the ones it launched.
 pub trait ProtectedMap {
@@ -25,6 +28,8 @@ pub trait ProtectedMap {
     fn unfollowed(&self, domain: u32) -> u64;
     /// Drops `domain`'s UNFOLLOWED count, once nothing will ask for it.
     fn forget_domain(&mut self, domain: u32);
+    fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()>;
+    fn disallow_exec(&mut self, key: ExecKey) -> Result<()>;
 }
 
 /// Who is on the other end of a connection, as the kernel reported it
@@ -213,6 +218,8 @@ pub struct Daemon<M> {
     sessions: BTreeMap<SessionId, Session>,
     next_session: SessionId,
     next_domain: u32,
+    /// What this daemon put in EXEC_ALLOWED, per domain (milestone 8).
+    exec: ExecEntries,
 }
 
 impl<M: ProtectedMap> Daemon<M> {
@@ -222,11 +229,40 @@ impl<M: ProtectedMap> Daemon<M> {
             sessions: BTreeMap::new(),
             next_session: 1,
             next_domain: CLI_DOMAIN + 1,
+            exec: ExecEntries::default(),
         }
     }
 
     pub fn map_mut(&mut self) -> &mut M {
         &mut self.map
+    }
+
+    /// Lets every protected process map these files executable (approved
+    /// overlays). For startup: an error means fairplayd shouldn't start.
+    pub fn allow_overlays(&mut self, files: &[FileId]) -> Result<(), ApiError> {
+        self.exec
+            .allow(&mut self.map, fairplay_common::ANY_DOMAIN, files)
+            .map(|_| ())
+    }
+
+    /// Adds a launch's files to its domain's allowlist before the program
+    /// runs. Returns how many were new. Refuses (and adds nothing) if the
+    /// map can't take them all.
+    pub fn allow_exec(&mut self, t: &Ticket, files: &[FileId]) -> Result<usize, ApiError> {
+        self.exec.allow(&mut self.map, t.domain, files)
+    }
+
+    /// Undoes [`Daemon::allow_exec`] for a launch that started a session but
+    /// failed before registering it.
+    pub fn abandon_launch(&mut self, t: &Ticket) {
+        if !t.join {
+            self.exec.release(&mut self.map, t.domain);
+        }
+    }
+
+    /// Entries in EXEC_ALLOWED that this daemon made (for tests and logs).
+    pub fn exec_entries(&self) -> usize {
+        self.exec.used()
     }
 
     /// Checks limits and reserves a session and protection domain: a new
@@ -345,6 +381,12 @@ impl<M: ProtectedMap> Daemon<M> {
             eprintln!("fairplayd: removing pid {pid} from PROTECTED: {e:#}");
         }
         p.state = state;
+        // The domain's last process is gone: its files are no longer
+        // allowed (domains aren't reused while the daemon runs, but the map
+        // is finite).
+        if !s.procs().any(Proc::running) {
+            self.exec.release(&mut self.map, s.domain);
+        }
         self.prune_ended();
         Some(id)
     }
@@ -401,6 +443,7 @@ impl<M: ProtectedMap> Daemon<M> {
             target: v.target,
             hook: hook_name(v.hook).into(),
             mode: v.mode,
+            file: Some(c_str(&v.file)).filter(|f| !f.is_empty()),
             seen_at: now(),
         }
     }
@@ -472,6 +515,8 @@ pub fn hook_name(hook: u32) -> &'static str {
     match hook {
         x if x == Hook::PtraceAccess as u32 => "ptrace_access_check",
         x if x == Hook::UinputOpen as u32 => "file_open(/dev/uinput)",
+        x if x == Hook::MmapFile as u32 => "mmap_file",
+        x if x == Hook::FileMprotect as u32 => "file_mprotect",
         _ => "unknown",
     }
 }
@@ -493,7 +538,7 @@ fn now() -> u64 {
 mod tests {
     use std::collections::HashMap;
 
-    use fairplay_common::EXE_NAME_LEN;
+    use fairplay_common::{EXEC_CHECK_GENERATION, EXE_NAME_LEN};
 
     use super::*;
 
@@ -502,6 +547,9 @@ mod tests {
         entries: HashMap<u32, u32>,
         fail_insert: bool,
         unfollowed: HashMap<u32, u64>,
+        exec: HashMap<ExecKey, ExecAllow>,
+        /// Fail exec inserts once this many entries exist.
+        exec_fail_at: Option<usize>,
     }
 
     impl ProtectedMap for FakeMap {
@@ -520,6 +568,108 @@ mod tests {
         fn forget_domain(&mut self, domain: u32) {
             self.unfollowed.remove(&domain);
         }
+        fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
+            anyhow::ensure!(
+                self.exec_fail_at.is_none_or(|n| self.exec.len() < n),
+                "map full"
+            );
+            self.exec.insert(key, value);
+            Ok(())
+        }
+        fn disallow_exec(&mut self, key: ExecKey) -> Result<()> {
+            self.exec.remove(&key);
+            Ok(())
+        }
+    }
+
+    fn file(ino: u64) -> FileId {
+        FileId {
+            dev: 7,
+            ino,
+            generation: ino.is_multiple_of(2).then_some(ino as u32 + 100),
+        }
+    }
+
+    #[test]
+    fn exec_allowlist_follows_the_session() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        let t = d.begin_launch(&alice, None).unwrap();
+        assert_eq!(d.allow_exec(&t, &[file(1), file(2), file(2)]).unwrap(), 2);
+        d.register(t, 4242, &alice, 1000, vec!["game".into()])
+            .unwrap();
+        let k = |ino| ExecKey {
+            domain: t.domain,
+            dev: 7,
+            ino,
+        };
+        assert_eq!(
+            d.map.exec[&k(1)],
+            ExecAllow {
+                generation: 0,
+                flags: 0
+            }
+        );
+        assert_eq!(
+            d.map.exec[&k(2)],
+            ExecAllow {
+                generation: 102,
+                flags: EXEC_CHECK_GENERATION
+            }
+        );
+        // The anti-cheat joins with its own files; repeats aren't counted.
+        let j = d.begin_launch(&alice, Some(t.session)).unwrap();
+        assert_eq!(d.allow_exec(&j, &[file(2), file(3)]).unwrap(), 1);
+        d.register(j, 4243, &alice, 1000, vec!["ac".into()])
+            .unwrap();
+        assert_eq!(d.exec_entries(), 3);
+        // Entries stay while any process of the session runs.
+        d.child_exited(4242, EXITED_0);
+        assert_eq!(d.map.exec.len(), 3);
+        d.child_exited(4243, EXITED_0);
+        assert!(d.map.exec.is_empty());
+        assert_eq!(d.exec_entries(), 0);
+    }
+
+    #[test]
+    fn overlays_are_for_every_domain_and_stay() {
+        let mut d = Daemon::new(FakeMap::default());
+        d.allow_overlays(&[file(9)]).unwrap();
+        assert!(d.map.exec.contains_key(&ExecKey {
+            domain: fairplay_common::ANY_DOMAIN,
+            dev: 7,
+            ino: 9
+        }));
+        let alice = launcher(1000);
+        let t = launch(&mut d, &alice, 4242);
+        d.allow_exec(&t, &[file(1)]).unwrap();
+        d.child_exited(4242, EXITED_0);
+        assert_eq!(d.map.exec.len(), 1, "the overlay outlives sessions");
+    }
+
+    #[test]
+    fn a_full_allowlist_refuses_the_launch_and_adds_nothing() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        // The kernel map fails part-way: everything from this call is undone.
+        d.map.exec_fail_at = Some(2);
+        let t = d.begin_launch(&alice, None).unwrap();
+        let e = d.allow_exec(&t, &[file(1), file(2), file(3)]).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert!(d.map.exec.is_empty());
+        assert_eq!(d.exec_entries(), 0);
+        // Over capacity: refused up front.
+        d.map.exec_fail_at = None;
+        let many: Vec<FileId> = (0..fairplay_common::EXEC_ALLOWED_CAPACITY as u64 + 1)
+            .map(file)
+            .collect();
+        let e = d.allow_exec(&t, &many).unwrap_err();
+        assert_eq!(e.code, ErrorCode::LimitReached);
+        assert!(d.map.exec.is_empty());
+        // A launch that fails before registering gives its entries back.
+        d.allow_exec(&t, &[file(1)]).unwrap();
+        d.abandon_launch(&t);
+        assert!(d.map.exec.is_empty());
     }
 
     const LAUNCHERS: u32 = 900;
@@ -559,6 +709,7 @@ mod tests {
             mode: 0x11,
             comm,
             exe,
+            file: [0; EXE_NAME_LEN],
         }
     }
 
@@ -934,5 +1085,24 @@ mod tests {
         assert_eq!(c_str(b"0123456789abcdef"), "0123456789abcdef");
         assert_eq!(hook_name(Hook::UinputOpen as u32), "file_open(/dev/uinput)");
         assert_eq!(hook_name(77), "unknown");
+    }
+
+    #[test]
+    fn mapping_violations_name_the_file() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        let t = launch(&mut d, &alice, 4242);
+        // The game itself tried: caller and target are both the game.
+        let mut v = denied(4242, 4242);
+        v.hook = Hook::MmapFile as u32;
+        v.mode = 0x5;
+        v.file[..8].copy_from_slice(b"cheat.so");
+        let ev = d.record_violation(&v, None);
+        assert_eq!(ev.session, Some(t.session));
+        assert_eq!(ev.hook, "mmap_file");
+        assert_eq!(ev.file.as_deref(), Some("cheat.so"));
+        assert_eq!(hook_name(Hook::FileMprotect as u32), "file_mprotect");
+        // Process hooks have no file.
+        assert_eq!(d.record_violation(&denied(1, 4242), None).file, None);
     }
 }
