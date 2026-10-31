@@ -70,18 +70,24 @@ acts as the owner:
 
 - **Workers** act as `fairplay-os-agents`. A worker takes one task from the lead, works on
   its own branch and worktree, and opens a PR. Workers never approve anything.
-- **The lead** acts as `fairplay-os-lead`, which can review, approve and comment but can't
-  push code. It splits milestones into tasks, assigns them, reviews each PR against the
+- **The lead** acts as `fairplay-os-lead`. The App has write access, because GitHub only
+  counts approvals from accounts that can push, but the lead never pushes. It splits milestones into tasks, assigns them, reviews each PR against the
   design doc, runs the VM tests itself for PRs that touch BPF or `fairplayd`, approves, and
-  drafts design changes for the owner. The lead never approves a PR it wrote. Its token:
-  `FAIRPLAY_AGENT_ENV=~/.config/fairplay-lead/app.env tools/gh-app-token.sh`.
+  drafts design changes for the owner. It approves only through
+  `tools/lead-approve.sh <pr> <reviewed-head-sha> <review-file>`, which refuses PRs not
+  opened by a worker, PRs labelled `lead-authored`, and PRs whose head moved after review.
+  PRs the lead writes itself (opened with the worker App) get the `lead-authored` label and
+  the owner's review; the lead never approves its own work. Its token, for comments and
+  labels: `FAIRPLAY_AGENT_ENV=~/.config/fairplay-lead/app.env tools/gh-app-token.sh`.
 - **The owner** approves design and workflow changes (code owners) and can stop everything
   by turning off auto-merge or uninstalling the lead App.
 
 `master` is protected by two rulesets: all four CI checks must pass on a branch that is up
 to date with `master`, and a PR needs one approval: the lead's, plus the owner's when it
-touches a code-owned file. New commits on the branch dismiss an earlier approval; merging
-`master` in (the Update branch button) does not.
+touches a code-owned file. Whoever pushed last can't approve, and new commits on the
+branch dismiss an earlier approval; merging `master` in does not. If the owner needs to
+approve a PR, a worker should update its branch rather than the owner's Update branch
+button, which would make the owner the last pusher.
 
 Steps for a worker:
 
