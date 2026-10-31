@@ -39,6 +39,11 @@ pub static VIOLATIONS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 #[map]
 pub static UNFOLLOWED: HashMap<u32, u64> = HashMap::with_max_entries(1024, 0);
 
+/// Index 0: nonzero while any process is protected (set by fairplayd).
+/// `perf_event_open` denies CPU-wide events then (issue #27).
+#[map]
+pub static PERF_GUARD: Array<u32> = Array::with_max_entries(1, 0);
+
 /// Protection domain -> its forked-member count (issue #21, see `members`).
 /// fairplayd creates each domain's entry before the domain has a process
 /// and drops it when it forgets the session; a fork in a domain without

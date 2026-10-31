@@ -99,6 +99,15 @@ pub const MAP_INPUT_ALLOWED: &str = "INPUT_ALLOWED";
 /// Name of the one-entry array (index 0, a `u32`) that is nonzero while
 /// some running session asked for `block_virtual_input`, milestone 7.
 pub const MAP_INPUT_BLOCK: &str = "INPUT_BLOCK";
+/// Name of the one-entry array (index 0, a `u32`) that is nonzero while
+/// any process is protected (a session runs, a finished session's
+/// processes are still around, or `--protect`): CPU-wide
+/// `perf_event_open` is denied then (issue #27).
+pub const MAP_PERF_GUARD: &str = "PERF_GUARD";
+/// `PERF_SECURITY_CPU` (`<linux/perf_event.h>`): the `perf_event_open`
+/// LSM hook's `type` for an event on a whole CPU (no task: `pid == -1`,
+/// or a cgroup), checked by the kernel's `perf_allow_cpu`.
+pub const PERF_SECURITY_CPU: u32 = 1;
 
 /// Which LSM hook denied (or, for the input hooks, saw) the attempt.
 #[repr(u32)]
@@ -179,6 +188,24 @@ pub enum Hook {
     /// files (`oom_score_adj`, `oom_adj`, `autogroup`) for writing. `mode`
     /// is the file's `FMODE_*` bits, `file` its name.
     ProcTuneWrite = 34,
+    // Issue #27 (milestone 6 follow-ups), part 2: 35 to 39.
+    /// `perf_event_open`: a CPU-wide perf event (`pid == -1`, or a cgroup
+    /// event) while a process is protected. One sampling every process on
+    /// a CPU reads the game's registers and user stack without the ptrace
+    /// check a per-process event gets. Machine-wide, like the input hooks:
+    /// target 0, filed under every running session. `mode` is the event's
+    /// PMU type (see [`Hook::PerfTarget`]).
+    PerfCpu = 35,
+    /// `perf_event_alloc`: a perf event on one protected process (or on
+    /// fairplayd while it protects itself) by a process its ptrace rule
+    /// would refuse. Root's `CAP_PERFMON` skips the kernel's ptrace check
+    /// for perf, so `PtraceAccess` never sees these. Also a protected
+    /// process's event on one outside its domain. Target is that pid.
+    /// `mode` is the event's PMU type as the kernel resolved it
+    /// (`event->attr.type`): the `PERF_TYPE_*` asked for, except that a
+    /// software cpu-clock or task-clock event shows the boot-assigned type
+    /// of the kernel's `cpu_clock` / `task_clock` PMU (6 and 7 on 6.8).
+    PerfTarget = 36,
     // Milestone 8 follow-ups (#23), numbered 40 and up.
     /// `bprm_check_security`: a protected process exec'ing an ELF file
     /// that is not on its executable-mapping allowlist. `execve` fails with

@@ -8,7 +8,10 @@
 //! `violations` turns the connection into a one-way stream of events.
 //!
 //! The daemon learns who is calling from the kernel (`SO_PEERCRED`), never
-//! from the request, so nothing in a request claims an identity.
+//! from the request, so nothing in a request claims an identity. The
+//! client checks the other way too: the socket must be served by root and,
+//! inside a protected session, by the fairplayd that launched it
+//! ([`PID_ENV`]).
 //!
 //! `launch_protected` starts only what a signed game manifest names
 //! (milestone 9, see [`manifest`]): a launch executable for a new session,
@@ -46,6 +49,10 @@ pub use attest::WireEvidence;
 pub const DEFAULT_SOCKET: &str = "/run/fairplayd.sock";
 /// Environment variable clients read to find a non-default socket.
 pub const SOCKET_ENV: &str = "FAIRPLAYD_SOCKET";
+/// Environment variable fairplayd sets, to its own pid, for every process
+/// it launches (and so everything they start). A client that finds it
+/// refuses a socket served by any other process (see [`client`]).
+pub const PID_ENV: &str = "FAIRPLAYD_PID";
 /// Group whose members may call `launch_protected` (root always may).
 pub const DEFAULT_LAUNCHER_GROUP: &str = "fairplay-launcher";
 /// Longest request line the daemon accepts, newline included.

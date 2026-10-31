@@ -19,6 +19,10 @@
 //! its memory or steal its file descriptors, load a BPF program of its own,
 //! and detach programs. Each attempt prints BLOCKED (EPERM or EACCES) or
 //! WORKED.
+//! Issue #27: `cheatsim perf` opens a CPU-wide perf event sampling user
+//! registers and stack (`pid == -1`, CPU 0), the kind that would see the
+//! game's; `cheatsim perf --pid <pid>` opens one on a single process.
+//! Prints OPENED or BLOCKED.
 //! Milestone 7: `cheatsim clicker` makes a virtual mouse through
 //! `/dev/uinput` and clicks, `cheatsim uhid` makes one through `/dev/uhid`,
 //! and `cheatsim inject --device /dev/input/eventN` writes an event into an
@@ -115,6 +119,12 @@ enum Cmd {
         #[arg(long)]
         prog_id: Option<u32>,
     },
+    /// Open a perf event sampling user registers and stack: on every
+    /// process on CPU 0, or with --pid on one process.
+    Perf {
+        #[arg(long)]
+        pid: Option<i32>,
+    },
     /// Make a virtual mouse through /dev/uinput and click with it (an
     /// autoclicker or triggerbot). Needs write access to /dev/uinput.
     Clicker {
@@ -186,6 +196,7 @@ fn main() -> ExitCode {
         } => game(depth, &dlopen, dlopen_stdin),
         Cmd::Attack { pid, addr } => attack(Pid::from_raw(pid), addr),
         Cmd::SelfAttack { pid, prog_id } => self_attack(Pid::from_raw(pid), prog_id),
+        Cmd::Perf { pid } => perf(pid),
         Cmd::Clicker {
             name,
             clicks,
@@ -899,6 +910,61 @@ fn self_attack(pid: Pid, prog_id: Option<u32>) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// `perf_event_open` for a software clock event that samples user
+/// registers and the user stack: on `pid`, or with `None` on everything
+/// CPU 0 runs. Exit status 0 if it opened.
+fn perf(pid: Option<i32>) -> ExitCode {
+    // struct perf_event_attr, PERF_ATTR_SIZE_VER5 (112 bytes), zeroed.
+    let mut attr = [0u8; 112];
+    let put32 = |a: &mut [u8], at: usize, v: u32| a[at..at + 4].copy_from_slice(&v.to_ne_bytes());
+    let put64 = |a: &mut [u8], at: usize, v: u64| a[at..at + 8].copy_from_slice(&v.to_ne_bytes());
+    put32(&mut attr, 0, 1); // type: PERF_TYPE_SOFTWARE
+    put32(&mut attr, 4, 112); // size
+    put64(&mut attr, 8, 0); // config: PERF_COUNT_SW_CPU_CLOCK
+    put64(&mut attr, 16, 10_000); // sample_period
+                                  // sample_type: PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER
+    put64(&mut attr, 24, (1 << 12) | (1 << 13));
+    // flags: disabled, exclude_kernel, exclude_hv
+    put64(&mut attr, 40, 1 | (1 << 5) | (1 << 6));
+    put64(&mut attr, 80, 0xff); // sample_regs_user: a few registers
+    put32(&mut attr, 88, 4096); // sample_stack_user
+    let (target, cpu) = match pid {
+        Some(p) => (p, -1),
+        None => (-1, 0),
+    };
+    let what = match pid {
+        Some(p) => format!("perf_event_open on pid {p}"),
+        None => "CPU-wide perf_event_open (pid -1, CPU 0)".into(),
+    };
+    // SAFETY: attr is a fully initialised buffer of the size it declares.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_perf_event_open,
+            attr.as_ptr(),
+            target,
+            cpu,
+            -1,
+            8u64, // PERF_FLAG_FD_CLOEXEC
+        )
+    };
+    match Errno::result(rc) {
+        Ok(fd) => {
+            // SAFETY: a fresh fd we own.
+            unsafe { libc::close(fd as i32) };
+            println!("OPENED  {what}");
+            ExitCode::SUCCESS
+        }
+        Err(e @ (Errno::EPERM | Errno::EACCES)) => {
+            println!("BLOCKED {what}: {e}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            println!("FAILED  {what}: {e} (not a permission error)");
+            ExitCode::from(2)
+        }
     }
 }
 
