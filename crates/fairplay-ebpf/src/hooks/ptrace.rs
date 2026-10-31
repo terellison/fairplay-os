@@ -1,14 +1,20 @@
 //! `ptrace_access_check` guards every way one process reads or writes
 //! another's memory: ptrace attach, process_vm_readv/writev, and
-//! /proc/<pid>/mem. If the target is protected (see `task_domain`) and the
-//! caller is not in the same protection domain, the access is denied and
-//! logged.
+//! /proc/<pid>/mem (and `pidfd_getfd`). If the target is protected (see
+//! `task_domain`) and the caller is not in the same protection domain, the
+//! access is denied and logged.
+//!
+//! While fairplayd protects itself (milestone 6, see `self_protect`), it is
+//! protected too, from every other process: nothing may trace it or read
+//! its memory or file descriptors.
 
-use aya_ebpf::{macros::lsm, programs::LsmContext};
-use fairplay_common::Hook;
+use aya_ebpf::{helpers::bpf_probe_read_kernel, macros::lsm, programs::LsmContext};
+use core::ptr::addr_of;
+use fairplay_common::{Hook, PTRACE_MODE_NOAUDIT};
 
 use crate::{
     domain::{denied_caller_in, record_violation, task_domain, EPERM},
+    self_protect::outsider,
     vmlinux::task_struct,
 };
 
@@ -33,6 +39,19 @@ pub fn ptrace_access_check(ctx: LsmContext) -> i32 {
 fn should_deny(ctx: &LsmContext) -> Result<bool, i64> {
     let child: *const task_struct = unsafe { ctx.arg(0) };
     let mode: u32 = unsafe { ctx.arg(1) };
+
+    if let Some((caller, fairplayd)) = outsider() {
+        let tgid = unsafe { bpf_probe_read_kernel(addr_of!((*child).tgid))? } as u32;
+        if tgid == fairplayd {
+            // NOAUDIT is the kernel asking on its own account (`ps` reading
+            // /proc/<pid>/stat), not a request to access fairplayd: deny
+            // quietly, or every `ps` would print a DENIED line.
+            if mode & PTRACE_MODE_NOAUDIT == 0 {
+                record_violation(caller, fairplayd, Hook::PtraceAccess, mode);
+            }
+            return Ok(true);
+        }
+    }
 
     let Some((target, domain)) = task_domain(child)? else {
         return Ok(false);

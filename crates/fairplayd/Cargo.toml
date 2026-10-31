@@ -14,4 +14,4 @@ fairplay-attest = { path = "../fairplay-attest" }
 fairplay-common = { workspace = true, features = ["user"] }
 libc = "0.2"
 nix = { workspace = true, features = ["socket", "uio", "user", "process"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "macros", "time"] }
