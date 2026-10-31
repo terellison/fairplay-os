@@ -70,6 +70,14 @@ pub static MEMBER_CAP: Array<u32> = Array::with_max_entries(1, 0);
 #[map]
 pub static SELF_PROTECT: Array<u32> = Array::with_max_entries(1, 0);
 
+/// fairplayd's threads other than its main one (tid -> 1) while it
+/// protects itself: `follow` adds each new one and removes it at exit,
+/// fairplayd adds the ones it already had. `/proc/<tid>/` works for any
+/// thread, so the `file_open` guard on fairplayd's `/proc` files needs to
+/// know them (issue #27).
+#[map]
+pub static SELF_THREADS: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+
 /// fairplayd's own maps, programs and links
 /// (`fairplay_common::self_object_key` -> 1), which no other process may
 /// open while self-protection is on.

@@ -6,7 +6,11 @@
 //! holds a file descriptor for), then fairplayd's own tgid (SELF_PROTECT),
 //! which arms the hooks in `crates/fairplay-ebpf/src/self_protect.rs`. From
 //! then on no other process may signal it, trace it, open its maps or
-//! programs, load a BPF program or detach one.
+//! programs, load a BPF program or detach one, change its limits, nice
+//! value, scheduling or I/O priority, or write its `/proc` OOM and
+//! autogroup files. It also lists its threads (SELF_THREADS; new ones are
+//! added by the kernel side) and sets its own `oom_score_adj` to -1000, so
+//! the OOM killer never picks it.
 //!
 //! There is deliberately no socket call to turn it off. The only ways out
 //! are a timer fairplayd sets for itself (`--self-protect-for`, for tests)
@@ -20,7 +24,8 @@ use aya::{
     Ebpf,
 };
 use fairplay_common::{
-    self_object_key, MAP_SELF_OBJECTS, MAP_SELF_PROTECT, SELF_LINK, SELF_MAP, SELF_PROG,
+    self_object_key, MAP_SELF_OBJECTS, MAP_SELF_PROTECT, MAP_SELF_THREADS, SELF_LINK, SELF_MAP,
+    SELF_PROG,
 };
 
 /// A BPF object fairplayd holds: (`SELF_*` kind, kernel id).
@@ -46,7 +51,11 @@ impl SelfProtect {
             ebpf.take_map(MAP_SELF_OBJECTS)
                 .context("SELF_OBJECTS map")?,
         )?;
-        // After taking both maps: their fds count too.
+        let mut threads: HashMap<MapData, u32, u32> = HashMap::try_from(
+            ebpf.take_map(MAP_SELF_THREADS)
+                .context("SELF_THREADS map")?,
+        )?;
+        // After taking the maps: their fds count too.
         let held = own_objects()?;
         for &(kind, id) in &held {
             objects
@@ -55,12 +64,26 @@ impl SelfProtect {
         }
         let pid = std::process::id();
         guardian.set(0, pid, 0)?;
+        // Threads started from here on are added by the kernel side
+        // (`follow`); list the ones already running, after arming so none
+        // falls in between.
+        for tid in own_threads()? {
+            if tid != pid {
+                threads
+                    .insert(tid, 1, 0)
+                    .with_context(|| format!("listing thread {tid}"))?;
+            }
+        }
+        // Nobody else may raise it now; keep the OOM killer off fairplayd.
+        if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "-1000") {
+            eprintln!("fairplayd: warning: could not set oom_score_adj: {e}");
+        }
         eprintln!(
             "fairplayd: self-protection on for pid {pid}: {}",
             describe(&held)
         );
-        // `objects` is dropped here; the kernel keeps the map, since
-        // the programs that read it hold a reference.
+        // `objects` and `threads` are dropped here; the kernel keeps the
+        // maps, since the programs that use them hold a reference.
         Ok(Self { guardian })
     }
 
@@ -70,6 +93,17 @@ impl SelfProtect {
         eprintln!("fairplayd: self-protection off");
         Ok(())
     }
+}
+
+/// This process's thread ids, from /proc/self/task.
+fn own_threads() -> Result<Vec<u32>> {
+    let mut tids = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/task").context("reading /proc/self/task")? {
+        if let Some(tid) = entry?.file_name().to_str().and_then(|n| n.parse().ok()) {
+            tids.push(tid);
+        }
+    }
+    Ok(tids)
 }
 
 /// Every BPF map, program and link this process has a file descriptor

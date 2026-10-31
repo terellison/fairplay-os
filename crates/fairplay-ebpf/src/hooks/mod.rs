@@ -17,3 +17,4 @@ mod socket;
 mod task_alloc;
 mod task_free;
 mod task_kill;
+mod task_set;

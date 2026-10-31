@@ -3,8 +3,10 @@
 # (SC2024: output from sudo commands is meant to land in files we own.)
 # Milestone 6 exit test: fairplayd protects itself from root. With
 # --self-protect, root cannot kill or stop fairplayd, trace it or read its
-# memory, read or write its BPF maps, detach its programs, or load a BPF
-# program of its own, and every attempt prints a DENIED line. Without it
+# memory, read or write its BPF maps, detach its programs, load a BPF
+# program of its own, or change its limits, nice value, scheduling, CPU
+# affinity, I/O priority or OOM score, and every attempt prints a DENIED
+# line. Without it
 # (developer mode) root kills it as before. Run inside the VM, as your normal
 # user (not root), from the repo root, under the shared VM lock:
 #   flock /run/lock/fairplay-vm-tests ./vm/test-milestone6.sh
@@ -38,8 +40,9 @@ not() { ! "$@"; }
 
 T="$(mktemp -d /tmp/fairplay-m6.XXXXXX)"
 chmod 755 "$T"
-DAEMON_PID=""; FPD=""
+DAEMON_PID=""; FPD=""; OTHER=""
 cleanup() {
+  [ -n "$OTHER" ] && kill "$OTHER" 2>/dev/null
   if [ -n "$DAEMON_PID" ]; then
     # Works on an unprotected fairplayd. A self-protected one refuses (and
     # says so with a DENIED line), so wait for its own deadline.
@@ -104,6 +107,8 @@ start_daemon() {
 step "developer mode: no --self-protect, root can kill fairplayd"
 start_daemon
 check_not "no self-protection" grep -q 'self-protection on' "$T/daemon.err"
+check "root renices it and changes its limits" sh -c \
+  "sudo renice -n 1 -p $FPD >/dev/null && sudo prlimit --pid $FPD --nofile=4096:4096"
 sudo kill -9 "$FPD"
 wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""
 check "kill -9 as root ends it" not alive "$FPD"
@@ -166,6 +171,47 @@ check "3 DENIED lines from bpf (PROG_LOAD 0x5, LINK_DETACH 0x22, PROG_DETACH 0x9
          grep -q 'target=$FPD hook=bpf mode=0x9\$' '$T/daemon.out'"
 check "1 DENIED line from bpf_prog (PROG_GET_FD_BY_ID)" test "$(denied bpf_prog)" -eq $((before_prog + 1))
 grep "^DENIED .*comm=cheatsim .*target=$FPD " "$T/daemon.out" | indent
+
+step "limits, priorities and the OOM score, as root"
+# Starving or limiting it instead of killing it (issue #27).
+tunables() {
+  echo "nice=$(awk '{print $19}' "/proc/$FPD/stat")" \
+       "sched=$(sudo chrt -p "$FPD" | head -n1 | sed 's/.*: //')" \
+       "cpus=$(sudo taskset -cp "$FPD" | sed 's/.*: //')" \
+       "io=$(sudo ionice -p "$FPD")" \
+       "cpu_limit=$(awk '/^Max cpu time/ {print $4"/"$5}' "/proc/$FPD/limits")" \
+       "oom=$(cat "/proc/$FPD/oom_score_adj")"
+}
+BEFORE="$(tunables)"
+echo "      $BEFORE"
+check "fairplayd set its own oom_score_adj to -1000" grep -q 'oom=-1000$' <<<"$BEFORE"
+expect_denied "prlimit --cpu=1 (SIGXCPU, then SIGKILL)" task_setrlimit 0x0 \
+  prlimit --pid "$FPD" --cpu=1:1
+expect_denied "prlimit --nofile=4" task_setrlimit 0x7 prlimit --pid "$FPD" --nofile=4:4
+expect_denied "renice -n 19" task_setnice 0x13 renice -n 19 -p "$FPD"
+expect_denied "chrt --idle (SCHED_IDLE)" task_setscheduler 0x0 chrt -i -p 0 "$FPD"
+expect_denied "taskset to one CPU" task_setscheduler 0x0 taskset -p 1 "$FPD"
+expect_denied "ionice -c 3 (idle I/O class)" task_setioprio 0x6007 ionice -c 3 -p "$FPD"
+TID=""
+for d in "/proc/$FPD/task/"*; do [ "${d##*/}" != "$FPD" ] && { TID="${d##*/}"; break; }; done
+[ -n "$TID" ] || bad "fairplayd has a second thread"
+for f in "/proc/$FPD/oom_score_adj" "/proc/$FPD/oom_adj" "/proc/$FPD/autogroup" \
+         "/proc/$FPD/task/$TID/oom_score_adj" "/proc/$TID/oom_score_adj"; do
+  expect_denied "write $f" proc_tune_write "" sh -c "echo 15 > $f"
+done
+check "the DENIED lines name the files" sh -c "
+  grep -q 'hook=proc_tune_write .* file=oom_score_adj\$' '$T/daemon.out' &&
+  grep -q 'hook=proc_tune_write .* file=oom_adj\$' '$T/daemon.out' &&
+  grep -q 'hook=proc_tune_write .* file=autogroup\$' '$T/daemon.out'"
+AFTER="$(tunables)"
+check "nothing changed ($AFTER)" test "$AFTER" = "$BEFORE"
+# Only fairplayd is fenced: root still tunes any other process.
+sleep 60 & OTHER=$!
+check "root still renices, limits, reschedules and re-scores other processes" sh -c "
+  sudo renice -n 5 -p $OTHER >/dev/null && sudo prlimit --pid $OTHER --cpu=100:100 &&
+  sudo chrt -b -p 0 $OTHER && sudo taskset -p 1 $OTHER >/dev/null && sudo ionice -c 3 -p $OTHER &&
+  echo 500 | sudo tee /proc/$OTHER/oom_score_adj >/dev/null"
+kill "$OTHER"; wait "$OTHER" 2>/dev/null; OTHER=""
 
 step "fairplayd still works while it protects itself"
 check "the socket API answers root" sh -c "sudo '$CTL' --socket '$SOCK' list | grep -q '\"ok\"'"

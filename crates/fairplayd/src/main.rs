@@ -223,6 +223,10 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("bpf", "bpf"),
     ("bpf_map", "bpf_map"),
     ("bpf_prog", "bpf_prog"),
+    ("task_setrlimit", "task_setrlimit"),
+    ("task_setnice", "task_setnice"),
+    ("task_setscheduler", "task_setscheduler"),
+    ("task_setioprio", "task_setioprio"),
     ("file_ioctl", "file_ioctl"),
     ("file_permission", "file_permission"),
     // The anti-cheat's sandbox (milestone 9, part B); inert for processes

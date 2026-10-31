@@ -331,7 +331,7 @@ nothing behind.
 Everything above is enforced by `fairplayd`'s programs and maps. If root
 could kill `fairplayd`, delete the game from `PROTECTED`, or unhook the
 checkpoints, the protection would be one command away. In player mode root
-might be the cheater, so `fairplayd --self-protect` turns on four more
+might be the cheater, so `fairplayd --self-protect` turns on more
 checkpoints that guard `fairplayd` itself, from every other process, root
 included:
 
@@ -341,6 +341,9 @@ included:
 | `ptrace_access_check` | tracing it, reading its memory, or copying its open files (`pidfd_getfd`) |
 | `bpf_map`, `bpf_prog` | opening its maps or programs, which is the first step of reading or changing them (`bpftool map dump`) |
 | `bpf` | loading any new BPF program, and detaching attached ones |
+| `task_setrlimit` | changing its **resource limits**: a CPU-time limit (`prlimit --cpu=1`) makes the kernel itself kill it |
+| `task_setnice`, `task_setscheduler`, `task_setioprio` | **starving** it instead: lowering its CPU priority (`renice`, `chrt`), pinning it to one busy CPU (`taskset`), or its disk priority (`ionice`) |
+| `file_open` | writing its out-of-memory score (`/proc/<pid>/oom_score_adj`, `oom_adj`) or `autogroup` nice value |
 
 Why refuse *every* new BPF program? Because a BPF program loaded by root can
 read the memory of whatever process it happens to run in, and the
@@ -354,18 +357,24 @@ the shared test VM. Nothing over the socket turns it off. For tests,
 
 What it doesn't stop, on purpose (other layers cover these): root changing
 the kernel itself (lockdown's job), rebooting into something else
-(attestation's job), reading the swap disk (encrypted swap), and a handful
-of ways root can make the *kernel* stop `fairplayd` for it, such as killing
-its whole **cgroup** or provoking the out-of-memory killer. Those don't pass
-through `task_kill`; the README lists them with their fixes.
+(attestation's job), reading the swap disk (encrypted swap), and a few
+ways root can make the *kernel* stop `fairplayd` for it through its
+**cgroup** (killing or freezing it, or moving `fairplayd` into one that is
+frozen or starved). Those don't pass through any of these checkpoints;
+running `fairplayd` as a system service in player mode (milestone 11) is
+the fix, and the README lists them. The out-of-memory killer is covered:
+`fairplayd` sets its own score so it is never picked, and nobody else may
+change it.
 
 **Milestone 6's test** (`vm/test-milestone6.sh`) shows root killing an
 unprotected `fairplayd`, then, against one started with
 `--self-protect-for 60`, tries as root: `kill -9`, `kill -STOP`,
 `kill -TERM`, `bpftool` dumping and changing its maps (including the switch
-that turns self-protection off) and detaching a program, and `cheatsim
+that turns self-protection off) and detaching a program, `cheatsim
 self-attack` (ptrace, memory reads, stealing a file descriptor, loading a
-BPF program, detaching). Every attempt fails with one `DENIED` line; then
+BPF program, detaching), and `prlimit`, `renice`, `chrt`, `taskset`,
+`ionice` and writing its `oom_score_adj`. Every attempt fails with one
+`DENIED` line, and nothing about `fairplayd` changed; then
 `fairplayd` switches itself off on time and leaves nothing loaded.
 
 ### Only approved code loads into the game (milestone 8)
