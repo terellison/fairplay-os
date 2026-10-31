@@ -20,6 +20,10 @@
 //!   (PROTECTED, and READERS and SANDBOXED if it was in them). That
 //!   is before the process is reaped, so before its PID can be reused: an
 //!   unrelated process that gets the PID later never inherits the domain.
+//!
+//! Both also keep the per-domain member count (issue #21, see `members`):
+//! a fork `task_alloc` let through is counted at fork, and given back at
+//! exit.
 
 use aya_ebpf::{
     helpers::bpf_probe_read_kernel, macros::btf_tracepoint, programs::BtfTracePointContext,
@@ -27,7 +31,8 @@ use aya_ebpf::{
 use core::ptr::addr_of;
 
 use crate::{
-    maps::{PROTECTED, READERS, SANDBOXED, UNFOLLOWED},
+    maps::{COUNTED, PROTECTED, READERS, SANDBOXED, UNFOLLOWED},
+    members,
     vmlinux::{signal_struct, task_struct},
 };
 
@@ -53,11 +58,15 @@ fn try_follow_fork(parent: *const task_struct, child: *const task_struct) -> Res
         return Ok(());
     }
     let parent_tgid = unsafe { bpf_probe_read_kernel(addr_of!((*parent).tgid))? } as u32;
-    let Some(&domain) = (unsafe { PROTECTED.get(&parent_tgid) }) else {
+    // The domain `task_alloc` reserved a place in (issue #21), or, for a
+    // fork that started before the parent was protected, the parent's.
+    let reserved = members::settle(child as u64, tgid as u32);
+    let Some(domain) = reserved.or_else(|| unsafe { PROTECTED.get(&parent_tgid) }.copied()) else {
         return Ok(());
     };
     if PROTECTED.insert(&(tgid as u32), &domain, 0).is_err() {
         note_unfollowed(domain);
+        members::uncount(tgid as u32);
     }
     // A sandboxed process's children stay sandboxed (milestone 9, part B),
     // like its mount namespace and seccomp filter do.
@@ -94,8 +103,12 @@ pub fn unfollow_exit(ctx: BtfTracePointContext) -> i32 {
 fn try_unfollow_exit(task: *const task_struct) -> Result<(), i64> {
     let tgid = unsafe { bpf_probe_read_kernel(addr_of!((*task).tgid))? } as u32;
     // Most exits on the machine are not protected processes. (Readers are
-    // always in PROTECTED too.)
-    if unsafe { PROTECTED.get(&tgid) }.is_none() && unsafe { READERS.get(&tgid) }.is_none() {
+    // always in PROTECTED too, and so are counted members, unless fairplayd
+    // removed one.)
+    if unsafe { PROTECTED.get(&tgid) }.is_none()
+        && unsafe { READERS.get(&tgid) }.is_none()
+        && unsafe { COUNTED.get(&tgid) }.is_none()
+    {
         return Ok(());
     }
     // do_exit decrements signal->live before this tracepoint, so it reads 0
@@ -109,6 +122,8 @@ fn try_unfollow_exit(task: *const task_struct) -> Result<(), i64> {
         let _ = PROTECTED.remove(&tgid);
         let _ = READERS.remove(&tgid);
         let _ = SANDBOXED.remove(&tgid);
+        // Its place under the member cap (issue #21), given back once.
+        members::uncount(tgid);
     }
     Ok(())
 }
