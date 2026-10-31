@@ -15,4 +15,6 @@ mod mmap_file;
 mod perf_event_open;
 mod ptrace;
 mod socket;
+mod task_alloc;
+mod task_free;
 mod task_kill;

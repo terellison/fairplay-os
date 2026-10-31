@@ -15,7 +15,9 @@ use fairplay_api::{
     ApiError, ErrorCode, Outcome, ProcessInfo, ProcessState, Reply, SandboxInfo, SessionId,
     SessionInfo, ViolationEvent,
 };
-use fairplay_common::{ExecAllow, ExecKey, Hook, Violation};
+use fairplay_common::{
+    ExecAllow, ExecKey, Hook, Members, Violation, DEFAULT_MEMBER_CAP, MEMBER_BUDGET,
+};
 
 use crate::{
     exec_allow::{ExecEntries, FileId, Table},
@@ -47,7 +49,16 @@ pub trait ProtectedMap {
     /// How many processes started in `domain` the kernel could not add
     /// (the UNFOLLOWED map). Nonzero means protection is degraded.
     fn unfollowed(&self, domain: u32) -> u64;
-    /// Drops `domain`'s UNFOLLOWED count, once nothing will ask for it.
+    /// Creates `domain`'s MEMBERS entry, zeroed (issue #21). Only before
+    /// the domain has a process: after that the kernel counts in it, and a
+    /// write from here would race its atomic adds. Without one, the
+    /// kernel refuses every fork in the domain.
+    fn start_domain(&mut self, domain: u32) -> Result<()>;
+    /// `domain`'s MEMBERS entry: its forked members, and forks refused at
+    /// the cap. Zero if there is none.
+    fn members(&self, domain: u32) -> Members;
+    /// Drops `domain`'s UNFOLLOWED and MEMBERS entries, once nothing will
+    /// ask for them.
     fn forget_domain(&mut self, domain: u32);
     /// The domains that have a process in PROTECTED right now, launched by
     /// us or started by one of those.
@@ -87,12 +98,16 @@ pub struct Identity {
 
 /// Domain for processes given on fairplayd's command line (milestone 3).
 pub const CLI_DOMAIN: u32 = 1;
-/// Running protected processes one launcher may have. Keeps one user from
-/// filling the PROTECTED map (1024 entries) and locking everyone else out.
+/// Running protected processes one launcher may have launched. Keeps one
+/// user from using up the sessions and locking everyone else out.
 pub const MAX_RUNNING_PER_LAUNCHER: usize = 16;
-/// Running protected processes in total; leaves room in the map for
-/// command-line PIDs.
+/// Running protected processes in total that fairplayd launched; the
+/// PROTECTED map has room for these beside the forked members
+/// (`fairplay_common::PROTECTED_CAPACITY`).
 pub const MAX_RUNNING: usize = 512;
+/// The largest `--member-cap`: room for one session beside the command
+/// line's domain.
+pub const MAX_MEMBER_CAP: u32 = MEMBER_BUDGET / 2;
 /// Ended sessions kept for status queries; the oldest are forgotten first.
 pub const MAX_ENDED_KEPT: usize = 256;
 
@@ -213,8 +228,15 @@ impl Session {
         self.procs().any(Proc::running)
     }
 
-    /// `unfollowed`: the domain's count from [`ProtectedMap::unfollowed`].
-    fn info(&self, id: SessionId, unfollowed: u64) -> SessionInfo {
+    /// `unfollowed` and `members`: the domain's counts from the map;
+    /// `member_cap`: the daemon's.
+    fn info(
+        &self,
+        id: SessionId,
+        unfollowed: u64,
+        members: Members,
+        member_cap: u32,
+    ) -> SessionInfo {
         SessionInfo {
             session: id,
             launcher_uid: self.launcher_uid,
@@ -225,6 +247,9 @@ impl Session {
             violations: self.violations,
             protection_degraded: unfollowed > 0,
             unprotected_children: unfollowed,
+            member_cap,
+            forked_members: members.live,
+            forks_denied: members.denied,
             manifest: self.manifest.as_ref().map(|m| Box::new(m.info())),
         }
     }
@@ -275,15 +300,18 @@ pub struct Daemon<M> {
     input_block: bool,
     /// What PERF_GUARD is set to: on while anything is protected.
     perf_guard: bool,
-    /// Processes were protected from the command line (`--protect`),
-    /// which fairplayd doesn't track: PERF_GUARD stays on.
-    cli_protected: bool,
+    /// Something fairplayd doesn't track as a session is protected for the
+    /// daemon's whole life (`--protect`, or fairplayd itself with
+    /// `--self-protect`): PERF_GUARD stays on.
+    always_guarded: bool,
     /// Domains whose launched processes have all exited, but which may
     /// still have members: processes they started, which the kernel keeps
     /// in the domain (milestone 5) and which may outlive them. Their
     /// EXEC_ALLOWED and READER_FILES entries stay until
     /// [`Daemon::release_drained`] finds the domain empty.
     draining: BTreeSet<u32>,
+    /// Forked members a domain may have (MEMBER_CAP, issue #21).
+    member_cap: u32,
 }
 
 impl<M: ProtectedMap> Daemon<M> {
@@ -298,13 +326,30 @@ impl<M: ProtectedMap> Daemon<M> {
             input: InputLog::default(),
             input_block: false,
             perf_guard: false,
-            cli_protected: false,
+            always_guarded: false,
             draining: BTreeSet::new(),
+            member_cap: DEFAULT_MEMBER_CAP,
         }
     }
 
     pub fn map_mut(&mut self) -> &mut M {
         &mut self.map
+    }
+
+    /// Says what the kernel's MEMBER_CAP is ([`MAX_MEMBER_CAP`] at most),
+    /// for `session_status` and for how many sessions may run at once.
+    pub fn set_member_cap(&mut self, cap: u32) {
+        self.member_cap = cap.clamp(1, MAX_MEMBER_CAP);
+    }
+
+    pub fn member_cap(&self) -> u32 {
+        self.member_cap
+    }
+
+    /// Sessions that may run at once, so that their caps, and the command
+    /// line's domain's, together fit in PROTECTED.
+    pub fn max_sessions(&self) -> usize {
+        (MEMBER_BUDGET / self.member_cap) as usize - 1
     }
 
     /// Lets every protected process map these files executable (approved
@@ -452,6 +497,24 @@ impl<M: ProtectedMap> Daemon<M> {
                 ),
             ));
         }
+        // Each running session may fork up to the cap into PROTECTED (issue
+        // #21); only so many caps fit. A session whose launched processes
+        // ended still takes its place while forked members of it live on.
+        let sessions = self
+            .sessions
+            .values()
+            .filter(|s| s.running() || self.map.members(s.domain).live > 0)
+            .count();
+        if join.is_none() && sessions >= self.max_sessions() {
+            return Err(ApiError::new(
+                ErrorCode::LimitReached,
+                format!(
+                    "at most {} protected sessions at once (member cap {})",
+                    self.max_sessions(),
+                    self.member_cap
+                ),
+            ));
+        }
         if let Some(id) = join {
             // A joined program is a reader: it can read the game.
             let s = self.joinable(peer, id)?;
@@ -510,7 +573,18 @@ impl<M: ProtectedMap> Daemon<M> {
             }
             self.perf_guard = true;
         }
-        if let Err(e) = self.map.insert(pid, t.domain) {
+        // A new domain's member count starts before its first process.
+        let started = if t.join {
+            Ok(())
+        } else {
+            self.map
+                .start_domain(t.domain)
+                .map_err(|e| e.context("starting the domain's member count"))
+        };
+        if let Err(e) = started.and_then(|()| self.map.insert(pid, t.domain)) {
+            if !t.join {
+                self.map.forget_domain(t.domain);
+            }
             self.sync_input_block();
             self.sync_perf_guard();
             return Err(e);
@@ -599,9 +673,10 @@ impl<M: ProtectedMap> Daemon<M> {
         self.sync_perf_guard();
     }
 
-    /// `--protect` put processes in PROTECTED: keep PERF_GUARD on for good.
-    pub fn protected_from_cli(&mut self) -> Result<()> {
-        self.cli_protected = true;
+    /// `--protect` put processes in PROTECTED, or fairplayd is about to
+    /// protect itself: keep PERF_GUARD on for good.
+    pub fn guard_perf_for_good(&mut self) -> Result<()> {
+        self.always_guarded = true;
         self.map.set_perf_guard(true)?;
         self.perf_guard = true;
         Ok(())
@@ -609,9 +684,9 @@ impl<M: ProtectedMap> Daemon<M> {
 
     /// Sets PERF_GUARD to whether anything may be protected: a session
     /// running, a domain still draining (its launched processes are gone,
-    /// what they started may not be), or `--protect`.
+    /// what they started may not be), `--protect` or `--self-protect`.
     fn sync_perf_guard(&mut self) {
-        let want = self.cli_protected
+        let want = self.always_guarded
             || !self.draining.is_empty()
             || self.sessions.values().any(Session::running);
         if want == self.perf_guard {
@@ -730,6 +805,15 @@ impl<M: ProtectedMap> Daemon<M> {
         }
     }
 
+    fn info(&self, id: SessionId, s: &Session) -> SessionInfo {
+        s.info(
+            id,
+            self.map.unfollowed(s.domain),
+            self.map.members(s.domain),
+            self.member_cap,
+        )
+    }
+
     /// Is `pid` protected right now, whoever started it?
     pub fn is_protected(&self, pid: u32) -> bool {
         self.map.contains(pid)
@@ -805,10 +889,7 @@ impl<M: ProtectedMap> Daemon<M> {
             return Ok((false, None));
         };
         let s = self.visible(peer, id)?;
-        Ok((
-            s.game.running(),
-            Some(s.info(id, self.map.unfollowed(s.domain))),
-        ))
+        Ok((s.game.running(), Some(self.info(id, s))))
     }
 
     pub fn subscribe(&self, peer: &Peer, id: Option<SessionId>) -> Result<Subscription, ApiError> {
@@ -828,7 +909,7 @@ impl<M: ProtectedMap> Daemon<M> {
                 .keys()
                 .filter_map(|&id| {
                     let s = self.visible(peer, id).ok()?;
-                    Some(s.info(id, self.map.unfollowed(s.domain)))
+                    Some(self.info(id, s))
                 })
                 .collect(),
         )
@@ -861,6 +942,7 @@ pub fn hook_name(hook: u32) -> &'static str {
         x if x == Hook::UnixAbstract as u32 => "unix_abstract",
         x if x == Hook::PerfCpu as u32 => "perf_event_open",
         x if x == Hook::PerfTarget as u32 => "perf_event_alloc",
+        x if x == Hook::TaskAlloc as u32 => "task_alloc",
         x => match crate::input::Mechanism::of_hook(x) {
             Some(m) => input_hook_name(m),
             None => "unknown",
@@ -911,6 +993,7 @@ mod tests {
         entries: HashMap<u32, u32>,
         fail_insert: bool,
         unfollowed: HashMap<u32, u64>,
+        members: HashMap<u32, Members>,
         exec: HashMap<ExecKey, ExecAllow>,
         /// Fail exec inserts once this many entries exist.
         exec_fail_at: Option<usize>,
@@ -939,8 +1022,16 @@ mod tests {
         fn unfollowed(&self, domain: u32) -> u64 {
             self.unfollowed.get(&domain).copied().unwrap_or(0)
         }
+        fn start_domain(&mut self, domain: u32) -> Result<()> {
+            self.members.insert(domain, Members::default());
+            Ok(())
+        }
+        fn members(&self, domain: u32) -> Members {
+            self.members.get(&domain).copied().unwrap_or_default()
+        }
         fn forget_domain(&mut self, domain: u32) {
             self.unfollowed.remove(&domain);
+            self.members.remove(&domain);
         }
         fn live_domains(&self) -> Result<BTreeSet<u32>> {
             Ok(self.entries.values().copied().collect())
@@ -1488,6 +1579,66 @@ mod tests {
     }
 
     #[test]
+    fn each_session_gets_a_member_count_reported_in_status() {
+        let mut d = Daemon::new(FakeMap::default());
+        d.set_member_cap(64);
+        let alice = launcher(1000);
+        let a = launch(&mut d, &alice, 70);
+        assert_eq!(d.map.members.get(&a.domain), Some(&Members::default()));
+        // The kernel forked 10 into it and refused 3 at the cap.
+        d.map.members.insert(
+            a.domain,
+            Members {
+                live: 10,
+                denied: 3,
+                ..Default::default()
+            },
+        );
+        let i = d.status(&alice, Some(a.session)).unwrap().1.unwrap();
+        assert_eq!(
+            (i.member_cap, i.forked_members, i.forks_denied),
+            (64, 10, 3)
+        );
+        // A join doesn't reset the count.
+        let j = d.begin_launch(&alice, Some(a.session)).unwrap();
+        d.register(j, 71, &alice, 1000, vec![], None).unwrap();
+        assert_eq!(d.map.members[&a.domain].live, 10);
+    }
+
+    #[test]
+    fn failed_insert_drops_the_member_count() {
+        let mut d = Daemon::new(FakeMap {
+            fail_insert: true,
+            ..Default::default()
+        });
+        let alice = launcher(1000);
+        let t = d.begin_launch(&alice, None).unwrap();
+        assert!(d.register(t, 9, &alice, 1000, vec![], None).is_err());
+        assert!(d.map.members.is_empty());
+    }
+
+    #[test]
+    fn sessions_are_limited_so_their_caps_fit() {
+        let mut d = Daemon::new(FakeMap::default());
+        let root = user(0);
+        // The default: 32 caps fit, one is the command line's.
+        assert_eq!(d.max_sessions(), 31);
+        d.set_member_cap(MAX_MEMBER_CAP);
+        assert_eq!(d.max_sessions(), 1);
+        let a = launch(&mut d, &root, 70);
+        let e = d.begin_launch(&root, None).unwrap_err();
+        assert_eq!(e.code, ErrorCode::LimitReached);
+        // Joining the running session is still fine.
+        assert!(d.begin_launch(&root, Some(a.session)).is_ok());
+        // The game exited, but processes it forked live on: still taken.
+        d.map.members.get_mut(&a.domain).unwrap().live = 4;
+        d.child_exited(70, EXITED_0);
+        assert!(d.begin_launch(&root, None).is_err());
+        d.map.members.get_mut(&a.domain).unwrap().live = 0;
+        assert!(d.begin_launch(&root, None).is_ok());
+    }
+
+    #[test]
     fn per_launcher_limit() {
         let mut d = Daemon::new(FakeMap::default());
         let alice = launcher(1000);
@@ -1662,8 +1813,8 @@ mod tests {
         d.map.entries.remove(&5000);
         d.release_drained();
         assert!(!d.map.perf_guard && !d.perf_guarded());
-        // --protect keeps it on for good.
-        d.protected_from_cli().unwrap();
+        // --protect and --self-protect keep it on for good.
+        d.guard_perf_for_good().unwrap();
         launch(&mut d, &alice, 4244);
         d.child_exited(4244, EXITED_0);
         d.release_drained();

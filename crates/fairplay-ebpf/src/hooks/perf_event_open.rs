@@ -16,8 +16,17 @@
 //!   before the hook runs). Same rule as `ptrace_access_check`: on a
 //!   protected process only the process itself and its domain's readers
 //!   may, and while fairplayd protects itself nobody else may watch it.
-//!   Recorded as [`Hook::PerfTarget`]. Counters copied to a child at fork
-//!   (`event->parent` set) were already allowed on the parent and pass.
+//!   The rule points outward too: a protected process may not watch one
+//!   outside its domain. Recorded as [`Hook::PerfTarget`]. Counters copied
+//!   to a child at fork (`event->parent` set) were already allowed on the
+//!   parent and pass: refusing them would fail the fork.
+//!
+//! `mode` in the record is `event->attr.type`, which by now is the PMU
+//! the kernel picked, not always what the caller asked for: a
+//! `PERF_TYPE_SOFTWARE` cpu-clock or task-clock event is moved to the
+//! kernel's own `cpu_clock` / `task_clock` PMU, whose type is assigned at
+//! boot (6 and 7 on 6.8; `perf_swevent_init`). The `perf_event_open`
+//! hook's `attr` for a CPU-wide event is that same `event->attr`.
 //!
 //! Both leave alone the kernel's own counters (the hard-lockup watchdog),
 //! made from kernel threads, and per-process events on unprotected
@@ -33,7 +42,7 @@ use fairplay_common::{Hook, PERF_SECURITY_CPU};
 
 use crate::{
     domain::{denied_caller_in, record_in, record_violation, task_domain, Name, EPERM},
-    maps::PERF_GUARD,
+    maps::{PERF_GUARD, PROTECTED},
     self_protect::outsider,
     vmlinux::{perf_event, perf_event_attr, task_struct},
 };
@@ -105,11 +114,35 @@ fn should_deny_alloc(event: *const perf_event) -> Result<bool, i64> {
         }
     }
     let Some((tgid, domain)) = task_domain(target)? else {
-        return Ok(false);
+        return outbound(target, event_type);
     };
     let Some(caller) = denied_caller_in(tgid, domain) else {
         return Ok(false);
     };
     record_violation(caller, tgid, Hook::PerfTarget, event_type);
+    Ok(true)
+}
+
+/// The target is not protected: deny (and record) only if the caller is,
+/// as `ptrace_access_check` does. A protected process (the game, its
+/// anti-cheat) may watch only processes of its own domain.
+fn outbound(target: *const task_struct, event_type: u32) -> Result<bool, i64> {
+    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let Some(&domain) = (unsafe { PROTECTED.get(&caller) }) else {
+        return Ok(false);
+    };
+    let tgid = unsafe { bpf_probe_read_kernel(addr_of!((*target).tgid))? } as u32;
+    if tgid == caller {
+        return Ok(false);
+    }
+    record_in(
+        caller,
+        tgid,
+        domain,
+        Hook::PerfTarget,
+        event_type,
+        0,
+        Name::None,
+    );
     Ok(true)
 }

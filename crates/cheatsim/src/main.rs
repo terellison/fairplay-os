@@ -27,7 +27,10 @@
 //! `/dev/uinput` and clicks, `cheatsim uhid` makes one through `/dev/uhid`,
 //! and `cheatsim inject --device /dev/input/eventN` writes an event into an
 //! existing device (see `input`).
+//! Issue #21: `cheatsim forkbomb` forks until a fork fails, and says how
+//! many it got and why (see `forkbomb`).
 
+mod forkbomb;
 mod input;
 
 use std::{
@@ -90,7 +93,12 @@ enum Cmd {
         /// (`process_vm_writev`, then writing `/proc/<pid>/mem`); `signal
         /// <pid> <signum>`; `hold <path>` opens a file and keeps it open;
         /// `connect <name>` and `dgram <name>` reach an abstract Unix
-        /// socket (`@name`). Each prints an EXEC- line when done.
+        /// socket (`@name`); `syscalls` tries the namespace, mount, keyring
+        /// and bpf system calls the sandbox's seccomp filter refuses, each
+        /// with arguments that make it fail harmlessly if it does run, and
+        /// prints `EXEC-SYSCALLS name=<errno> ...`. Each prints an EXEC-
+        /// line when done. `byhandle <path>` opens a file by its file handle
+        /// (`open_by_handle_at`, which needs CAP_DAC_READ_SEARCH).
         #[arg(long)]
         dlopen_stdin: bool,
     },
@@ -155,6 +163,20 @@ enum Cmd {
         #[arg(long)]
         device: String,
     },
+    /// Fork until a fork fails (issue #21: a game filling PROTECTED), from
+    /// several processes at once, and keep every process alive until
+    /// killed.
+    Forkbomb {
+        /// Processes forking at once.
+        #[arg(long, default_value_t = 4)]
+        workers: u32,
+        /// Stop each worker after this many forks.
+        #[arg(long, default_value_t = 100_000)]
+        max: u32,
+        /// After the first refusal, keep trying for this many seconds.
+        #[arg(long, default_value_t = 0)]
+        keep_trying: u64,
+    },
 }
 
 const SECRET: u64 = 0x5EC2_E713_37C0_DE11;
@@ -189,6 +211,11 @@ fn main() -> ExitCode {
             wait_stdin,
         } => input::uhid(&name, moves, hold, bogus_first, wait_stdin),
         Cmd::Inject { device } => input::inject(&device),
+        Cmd::Forkbomb {
+            workers,
+            max,
+            keep_trying,
+        } => forkbomb::forkbomb(workers, max, keep_trying),
     }
 }
 
@@ -267,6 +294,13 @@ fn game(depth: u32, dlopen: &[String], dlopen_stdin: bool) -> ExitCode {
                     }
                     Err(e) => println!("EXEC-ERR ls {dir}: {e}"),
                 }
+            } else if let Some(path) = line.strip_prefix("byhandle ") {
+                match by_handle(path) {
+                    Ok(()) => println!("EXEC-BYHANDLE {path}: opened"),
+                    Err(e) => println!("EXEC-ERR byhandle {path}: {e}"),
+                }
+            } else if line == "syscalls" {
+                println!("EXEC-SYSCALLS {}", try_syscalls());
             } else if let Some(rest) = line.strip_prefix("poke ") {
                 poke(rest);
             } else if let Some(rest) = line.strip_prefix("signal ") {
@@ -427,6 +461,216 @@ fn poke(args: &str) {
         Err(e) => e.to_string(),
     };
     println!("EXEC-POKE process_vm_writev: {pvw}; /proc/{pid}/mem: {mem}");
+}
+
+/// Gets `path`'s file handle (`name_to_handle_at`) and opens the file by
+/// it (`open_by_handle_at`): the inode-number route around a mount
+/// namespace ("shocker"), which needs CAP_DAC_READ_SEARCH.
+fn by_handle(path: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let c = std::ffi::CString::new(path)?;
+    // struct file_handle: handle_bytes, handle_type, then up to
+    // MAX_HANDLE_SZ (128) bytes.
+    let mut buf = [0u32; 2 + 32];
+    buf[0] = 128;
+    let mut mount_id = 0;
+    // SAFETY: buf is a file_handle with room for 128 bytes.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_name_to_handle_at,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            buf.as_mut_ptr(),
+            &mut mount_id,
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mount = File::open(path)?;
+    // SAFETY: buf holds the handle the kernel just filled in.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_by_handle_at,
+            mount.as_raw_fd(),
+            buf.as_ptr(),
+            libc::O_RDONLY,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the fd the call just returned.
+    unsafe { libc::close(fd as libc::c_int) };
+    Ok(())
+}
+
+/// Tries each system call the anti-cheat sandbox's seccomp filter refuses
+/// beyond the memory ones (#30), with arguments that make the call itself
+/// fail (a missing path, a bad fd, an unknown command) if it runs, so a
+/// control run outside the sandbox changes nothing, even as root. Returns
+/// `name=<errno>` for each (`ok` if one somehow succeeds): EPERM means
+/// refused before it ran (or, for an ordinary user, for lack of privilege:
+/// the test runs it as root). clone3 should be ENOSYS in the sandbox.
+fn try_syscalls() -> String {
+    const NOPE: &std::ffi::CStr = c"/nonexistent-fairplay-m9b";
+    let n = NOPE.as_ptr();
+    let null = std::ptr::null::<libc::c_char>();
+    // (name, returns an fd to close, call)
+    let probes: [(&str, bool, &dyn Fn() -> libc::c_long); 27] = [
+        ("setns", false, &|| unsafe {
+            libc::syscall(libc::SYS_setns, -1, 0)
+        }),
+        // Bit 0 is no unshare flag: EINVAL before anything is done.
+        ("unshare", false, &|| unsafe {
+            libc::syscall(libc::SYS_unshare, 1)
+        }),
+        ("mount", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_mount,
+                c"none".as_ptr(),
+                n,
+                c"tmpfs".as_ptr(),
+                0,
+                null,
+            )
+        }),
+        ("umount2", false, &|| unsafe {
+            libc::syscall(libc::SYS_umount2, n, 0)
+        }),
+        ("open_tree", true, &|| unsafe {
+            libc::syscall(libc::SYS_open_tree, -1, n, 0)
+        }),
+        ("move_mount", false, &|| unsafe {
+            libc::syscall(libc::SYS_move_mount, -1, n, -1, n, 0)
+        }),
+        ("fsopen", true, &|| unsafe {
+            libc::syscall(libc::SYS_fsopen, c"fairplay-no-such-fs".as_ptr(), 0)
+        }),
+        ("fsconfig", false, &|| unsafe {
+            libc::syscall(libc::SYS_fsconfig, -1, 0, null, null, 0)
+        }),
+        ("fsmount", true, &|| unsafe {
+            libc::syscall(libc::SYS_fsmount, -1, 0, 0)
+        }),
+        ("fspick", true, &|| unsafe {
+            libc::syscall(libc::SYS_fspick, -1, n, 0)
+        }),
+        ("mount_setattr", false, &|| unsafe {
+            libc::syscall(libc::SYS_mount_setattr, -1, n, 0, null, 0)
+        }),
+        ("pivot_root", false, &|| unsafe {
+            libc::syscall(libc::SYS_pivot_root, n, n)
+        }),
+        ("chroot", false, &|| unsafe {
+            libc::syscall(libc::SYS_chroot, n)
+        }),
+        ("keyctl", false, &|| unsafe {
+            libc::syscall(libc::SYS_keyctl, 9999, 0, 0, 0, 0)
+        }),
+        ("add_key", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_add_key,
+                c"fairplay-no-such-type".as_ptr(),
+                c"x".as_ptr(),
+                null,
+                0,
+                0,
+            )
+        }),
+        ("request_key", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_request_key,
+                c"fairplay-no-such-type".as_ptr(),
+                c"x".as_ptr(),
+                null,
+                0,
+            )
+        }),
+        ("bpf", false, &|| unsafe {
+            libc::syscall(libc::SYS_bpf, 9999, null, 0)
+        }),
+        // 0 entries: EINVAL.
+        ("io_uring_setup", false, &|| unsafe {
+            libc::syscall(libc::SYS_io_uring_setup, 0, null)
+        }),
+        ("io_uring_enter", false, &|| unsafe {
+            libc::syscall(libc::SYS_io_uring_enter, -1, 0, 0, 0, null, 0)
+        }),
+        // A NULL attribute block: EFAULT.
+        ("perf_event_open", true, &|| unsafe {
+            libc::syscall(libc::SYS_perf_event_open, null, 0, -1, -1, 0)
+        }),
+        // Flags it doesn't know: EINVAL.
+        ("userfaultfd", true, &|| unsafe {
+            libc::syscall(libc::SYS_userfaultfd, 0x7fff_0000)
+        }),
+        // CLONE_NEWUSER with CLONE_FS is invalid: EINVAL, no child.
+        ("clone_newuser", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                libc::CLONE_NEWUSER | libc::CLONE_FS | libc::SIGCHLD,
+                0,
+                0,
+                0,
+                0,
+            )
+        }),
+        ("clone_newns", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                libc::CLONE_NEWNS | libc::CLONE_FS | libc::SIGCHLD,
+                0,
+                0,
+                0,
+                0,
+            )
+        }),
+        ("clone_newnet", false, &|| unsafe {
+            // CLONE_SIGHAND without CLONE_VM is invalid too.
+            libc::syscall(
+                libc::SYS_clone,
+                libc::CLONE_NEWNET | libc::CLONE_SIGHAND | libc::SIGCHLD,
+                0,
+                0,
+                0,
+                0,
+            )
+        }),
+        ("clone_newpid", false, &|| unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                libc::CLONE_NEWPID | libc::CLONE_SIGHAND | libc::SIGCHLD,
+                0,
+                0,
+                0,
+                0,
+            )
+        }),
+        // A NULL argument block smaller than any version: EINVAL.
+        ("clone3", false, &|| unsafe {
+            libc::syscall(libc::SYS_clone3, null, 0)
+        }),
+        ("unshare_none", false, &|| unsafe {
+            libc::syscall(libc::SYS_unshare, 0)
+        }),
+    ];
+    let mut out = Vec::new();
+    for (name, fd, call) in probes {
+        let r = call();
+        let what = if r >= 0 {
+            if fd {
+                // SAFETY: an fd the call just returned.
+                unsafe { libc::close(r as libc::c_int) };
+            }
+            "ok".to_string()
+        } else {
+            format!("{:?}", Errno::last())
+        };
+        out.push(format!("{name}={what}"));
+    }
+    out.join(" ")
 }
 
 /// Execs `cmd` (split on whitespace) in place of this process: the same
@@ -685,8 +929,8 @@ fn perf(pid: Option<i32>) -> ExitCode {
     put64(&mut attr, 24, (1 << 12) | (1 << 13));
     // flags: disabled, exclude_kernel, exclude_hv
     put64(&mut attr, 40, 1 | (1 << 5) | (1 << 6));
-    put64(&mut attr, 72, 0xff); // sample_regs_user: a few registers
-    put32(&mut attr, 80, 4096); // sample_stack_user
+    put64(&mut attr, 80, 0xff); // sample_regs_user: a few registers
+    put32(&mut attr, 88, 4096); // sample_stack_user
     let (target, cpu) = match pid {
         Some(p) => (p, -1),
         None => (-1, 0),
