@@ -90,7 +90,8 @@ enum Cmd {
         /// and bpf system calls the sandbox's seccomp filter refuses, each
         /// with arguments that make it fail harmlessly if it does run, and
         /// prints `EXEC-SYSCALLS name=<errno> ...`. Each prints an EXEC-
-        /// line when done.
+        /// line when done. `byhandle <path>` opens a file by its file handle
+        /// (`open_by_handle_at`, which needs CAP_DAC_READ_SEARCH).
         #[arg(long)]
         dlopen_stdin: bool,
     },
@@ -260,6 +261,11 @@ fn game(depth: u32, dlopen: &[String], dlopen_stdin: bool) -> ExitCode {
                     }
                     Err(e) => println!("EXEC-ERR ls {dir}: {e}"),
                 }
+            } else if let Some(path) = line.strip_prefix("byhandle ") {
+                match by_handle(path) {
+                    Ok(()) => println!("EXEC-BYHANDLE {path}: opened"),
+                    Err(e) => println!("EXEC-ERR byhandle {path}: {e}"),
+                }
             } else if line == "syscalls" {
                 println!("EXEC-SYSCALLS {}", try_syscalls());
             } else if let Some(rest) = line.strip_prefix("poke ") {
@@ -424,6 +430,49 @@ fn poke(args: &str) {
     println!("EXEC-POKE process_vm_writev: {pvw}; /proc/{pid}/mem: {mem}");
 }
 
+/// Gets `path`'s file handle (`name_to_handle_at`) and opens the file by
+/// it (`open_by_handle_at`): the inode-number route around a mount
+/// namespace ("shocker"), which needs CAP_DAC_READ_SEARCH.
+fn by_handle(path: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let c = std::ffi::CString::new(path)?;
+    // struct file_handle: handle_bytes, handle_type, then up to
+    // MAX_HANDLE_SZ (128) bytes.
+    let mut buf = [0u32; 2 + 32];
+    buf[0] = 128;
+    let mut mount_id = 0;
+    // SAFETY: buf is a file_handle with room for 128 bytes.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_name_to_handle_at,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            buf.as_mut_ptr(),
+            &mut mount_id,
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mount = File::open(path)?;
+    // SAFETY: buf holds the handle the kernel just filled in.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_by_handle_at,
+            mount.as_raw_fd(),
+            buf.as_ptr(),
+            libc::O_RDONLY,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the fd the call just returned.
+    unsafe { libc::close(fd as libc::c_int) };
+    Ok(())
+}
+
 /// Tries each system call the anti-cheat sandbox's seccomp filter refuses
 /// beyond the memory ones (#30), with arguments that make the call itself
 /// fail (a missing path, a bad fd, an unknown command) if it runs, so a
@@ -436,7 +485,7 @@ fn try_syscalls() -> String {
     let n = NOPE.as_ptr();
     let null = std::ptr::null::<libc::c_char>();
     // (name, returns an fd to close, call)
-    let probes: [(&str, bool, &dyn Fn() -> libc::c_long); 23] = [
+    let probes: [(&str, bool, &dyn Fn() -> libc::c_long); 27] = [
         ("setns", false, &|| unsafe {
             libc::syscall(libc::SYS_setns, -1, 0)
         }),
@@ -508,6 +557,21 @@ fn try_syscalls() -> String {
         }),
         ("bpf", false, &|| unsafe {
             libc::syscall(libc::SYS_bpf, 9999, null, 0)
+        }),
+        // 0 entries: EINVAL.
+        ("io_uring_setup", false, &|| unsafe {
+            libc::syscall(libc::SYS_io_uring_setup, 0, null)
+        }),
+        ("io_uring_enter", false, &|| unsafe {
+            libc::syscall(libc::SYS_io_uring_enter, -1, 0, 0, 0, null, 0)
+        }),
+        // A NULL attribute block: EFAULT.
+        ("perf_event_open", true, &|| unsafe {
+            libc::syscall(libc::SYS_perf_event_open, null, 0, -1, -1, 0)
+        }),
+        // Flags it doesn't know: EINVAL.
+        ("userfaultfd", true, &|| unsafe {
+            libc::syscall(libc::SYS_userfaultfd, 0x7fff_0000)
         }),
         // CLONE_NEWUSER with CLONE_FS is invalid: EINVAL, no child.
         ("clone_newuser", false, &|| unsafe {

@@ -712,12 +712,67 @@ pub fn prepare(r: Request) -> Result<Prepared, ApiError> {
 /// account uses (the kernel only refuses -1).
 pub const PROC_OPTIONS: &std::ffi::CStr = c"hidepid=invisible,gid=2147483646";
 
+/// Machine-wide files in the sandbox's `/proc`, bound read-only over
+/// themselves after `pivot_root` (skipped if missing). File permissions
+/// alone guard many of them: uid 0 may write most of `/proc/sys` (sysctls,
+/// e.g. Yama's `ptrace_scope` with only CAP_SYS_PTRACE) and
+/// `/proc/sysrq-trigger` (crash or reboot the machine) without any other
+/// capability, so dropping capabilities isn't enough for a root
+/// anti-cheat. The same list container runtimes use.
+pub const PROC_READ_ONLY: &[&std::ffi::CStr] = &[
+    c"/proc/sys",
+    c"/proc/sysrq-trigger",
+    c"/proc/bus",
+    c"/proc/fs",
+    c"/proc/irq",
+];
+
+/// `CAP_SYS_PTRACE` (`<linux/capability.h>`; not in the libc crate).
+pub const CAP_SYS_PTRACE: u32 = 19;
+
+/// The only capability a sandboxed process may keep (as a bit mask):
+/// `CAP_SYS_PTRACE`, and only if it already has it (root). Without it a
+/// root anti-cheat can't read a root game at all (checked on the VM: 0/3,
+/// and the game drops out of its `hidepid` `/proc`). Two kernel rules
+/// apply to every ptrace-style access: a caller must hold every
+/// capability the target holds (a root game holds them all), unless it
+/// has CAP_SYS_PTRACE; and Yama (`ptrace_scope` 1, Ubuntu's default)
+/// allows `process_vm_readv` and `/proc/<game>/mem` ("attach" mode) only to
+/// the target's ancestors or holders of CAP_SYS_PTRACE, while the
+/// anti-cheat is the game's sibling. What the
+/// capability could add beyond reading the game is closed off elsewhere:
+/// every use goes through `ptrace_access_check`, whose outward rule keeps
+/// it to its own domain, and seccomp refuses `ptrace` itself,
+/// `process_vm_writev`, `pidfd_getfd` and `process_madvise`.
+pub const KEPT_CAPS: u64 = 1 << CAP_SYS_PTRACE;
+
+/// `<linux/capability.h>`: `_LINUX_CAPABILITY_VERSION_3` (two 32-bit
+/// words per set).
+const CAP_VERSION_3: u32 = 0x2008_0522;
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
 /// Stage numbers [`Prepared::enter`] reports, after `launch`'s own.
 pub const STAGE_UNSHARE: u32 = 1000;
 pub const STAGE_PRIVATE: u32 = 1001;
 pub const STAGE_PIVOT: u32 = 1002;
 pub const STAGE_ROOT_RO: u32 = 1003;
 pub const STAGE_SECCOMP: u32 = 1004;
+pub const STAGE_PROC_RO: u32 = 1005;
+pub const STAGE_CAPBSET: u32 = 1006;
+pub const STAGE_CAPSET: u32 = 1007;
 /// Step `i` fails as stage `STAGE_STEP + i`.
 pub const STAGE_STEP: u32 = 2000;
 
@@ -730,6 +785,9 @@ impl Prepared {
             STAGE_PIVOT => "pivot_root".into(),
             STAGE_ROOT_RO => "remounting / read-only".into(),
             STAGE_SECCOMP => "seccomp filter".into(),
+            STAGE_PROC_RO => "making /proc's system files read-only".into(),
+            STAGE_CAPBSET => "dropping the capability bounding set".into(),
+            STAGE_CAPSET => "dropping capabilities".into(),
             s if s >= STAGE_STEP => self.names.get((s - STAGE_STEP) as usize)?.clone(),
             _ => return None,
         })
@@ -832,6 +890,24 @@ impl Prepared {
             {
                 return Err(STAGE_PIVOT);
             }
+            // /proc's machine-wide files: read-only over themselves.
+            let proc_ro = libc::MS_BIND
+                | libc::MS_REMOUNT
+                | libc::MS_RDONLY
+                | libc::MS_NOSUID
+                | libc::MS_NODEV
+                | libc::MS_NOEXEC;
+            for p in PROC_READ_ONLY {
+                if libc::mount(p.as_ptr(), p.as_ptr(), null, libc::MS_BIND, null.cast()) != 0 {
+                    if *libc::__errno_location() == libc::ENOENT {
+                        continue;
+                    }
+                    return Err(STAGE_PROC_RO);
+                }
+                if libc::mount(null, p.as_ptr(), null, proc_ro, null.cast()) != 0 {
+                    return Err(STAGE_PROC_RO);
+                }
+            }
             let ro = libc::MS_BIND
                 | libc::MS_REMOUNT
                 | libc::MS_RDONLY
@@ -867,6 +943,72 @@ impl Prepared {
         }
         Ok(())
     }
+
+    /// Drops every capability but [`KEPT_CAPS`] from the bounding set (what
+    /// any later exec, root's included, can ever hold) and clears the
+    /// ambient set. Needs CAP_SETPCAP, so `launch` calls it before
+    /// `setuid`. Async-signal-safe.
+    ///
+    /// # Safety
+    /// Only in the forked child.
+    pub unsafe fn drop_bounding(&self) -> Result<(), u32> {
+        unsafe {
+            for cap in 0..64u32 {
+                if KEPT_CAPS & (1 << cap) != 0 {
+                    continue;
+                }
+                if libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) != 0 {
+                    // Past the kernel's last capability.
+                    if *libc::__errno_location() == libc::EINVAL {
+                        break;
+                    }
+                    return Err(STAGE_CAPBSET);
+                }
+            }
+            if libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) != 0
+            {
+                return Err(STAGE_CAPBSET);
+            }
+        }
+        Ok(())
+    }
+
+    /// Cuts the effective and permitted sets down to [`KEPT_CAPS`] (of what
+    /// the process still has: nothing, after `setuid` to anyone but root)
+    /// and empties the inheritable set. `launch` calls it after `setuid`,
+    /// so the exec starts from these. Async-signal-safe.
+    ///
+    /// # Safety
+    /// Only in the forked child.
+    pub unsafe fn drop_caps(&self) -> Result<(), u32> {
+        let mut hdr = CapHeader {
+            version: CAP_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapData::default(); 2];
+        // SAFETY: hdr and data are the layout capget/capset expect (v3).
+        unsafe {
+            if libc::syscall(libc::SYS_capget, &mut hdr, data.as_mut_ptr()) != 0 {
+                return Err(STAGE_CAPSET);
+            }
+            for (i, d) in data.iter_mut().enumerate() {
+                let keep = (KEPT_CAPS >> (32 * i)) as u32;
+                d.permitted &= keep;
+                d.effective = d.permitted;
+                d.inheritable = 0;
+            }
+            if libc::syscall(libc::SYS_capset, &hdr, data.as_ptr()) != 0 {
+                return Err(STAGE_CAPSET);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// System calls the sandbox refuses with EPERM (milestone 9, part B). The
@@ -880,9 +1022,10 @@ impl Prepared {
 ///
 /// The rest is defence in depth (#30): nothing that reads a game's memory
 /// and module list needs them, and each is a way to change what the
-/// sandbox sees or to reach a large kernel surface. Most already fail for
-/// an ordinary user, but the anti-cheat may run as root (the milestone 9
-/// test does, on purpose), and root keeps its capabilities in here:
+/// sandbox sees or to reach a large kernel surface. Most already fail
+/// without capabilities, which the sandbox drops ([`KEPT_CAPS`]), but a new
+/// user namespace doesn't need any, and the filter doesn't depend on the
+/// capability drop being complete:
 ///
 /// - namespaces: `setns`, `unshare` (and `clone` with a `CLONE_NEW*` flag,
 ///   see [`seccomp_filter`]): a new user namespace makes even an ordinary
@@ -895,6 +1038,10 @@ impl Prepared {
 ///   shared with the user's other programs, outside any mount namespace;
 /// - `bpf`: loading programs or touching maps (fairplayd's too, as root)
 ///   is the operating system's job, never the anti-cheat's.
+/// - large kernel surfaces with a long record of bugs, which nothing that
+///   reads a game needs: `io_uring_setup` (and `io_uring_enter`,
+///   `io_uring_register`), `perf_event_open`, `userfaultfd` (a way to
+///   stall the kernel mid-copy, a staple of exploits).
 ///
 /// fairplayd's own mounts and `pivot_root` for the sandbox happen before
 /// the filter is installed (`launch`: [`Prepared::enter`], then
@@ -921,6 +1068,11 @@ pub const DENIED_SYSCALLS: &[(&str, libc::c_long)] = &[
     ("add_key", libc::SYS_add_key),
     ("request_key", libc::SYS_request_key),
     ("bpf", libc::SYS_bpf),
+    ("io_uring_setup", libc::SYS_io_uring_setup),
+    ("io_uring_enter", libc::SYS_io_uring_enter),
+    ("io_uring_register", libc::SYS_io_uring_register),
+    ("perf_event_open", libc::SYS_perf_event_open),
+    ("userfaultfd", libc::SYS_userfaultfd),
 ];
 
 /// `clone` flags that make a new namespace (`<linux/sched.h>`; libc has
@@ -1332,6 +1484,14 @@ mod tests {
             .iter()
             .any(|s| matches!(s, CStep::Mount { fstype, data, .. }
             if fstype.to_str().unwrap() == "proc" && data.as_c_str() == PROC_OPTIONS)));
+    }
+
+    #[test]
+    fn kept_caps_and_read_only_proc() {
+        assert_eq!(KEPT_CAPS, 0x80000, "CAP_SYS_PTRACE only");
+        for p in ["/proc/sys", "/proc/sysrq-trigger"] {
+            assert!(PROC_READ_ONLY.iter().any(|c| c.to_str() == Ok(p)), "{p}");
+        }
     }
 
     #[test]

@@ -233,7 +233,8 @@ step "(5) seccomp: no namespaces, mounts, keyrings or bpf, even as root"
 # cheatsim's `syscalls` makes each call with arguments that fail harmlessly
 # if it runs (a missing path, a bad fd); EPERM means seccomp refused it.
 SECCOMP_DENIED="setns unshare unshare_none mount umount2 open_tree move_mount fsopen fsconfig fsmount fspick
-  mount_setattr pivot_root chroot keyctl add_key request_key bpf clone_newuser clone_newns clone_newnet clone_newpid"
+  mount_setattr pivot_root chroot keyctl add_key request_key bpf io_uring_setup io_uring_enter perf_event_open
+  userfaultfd clone_newuser clone_newns clone_newnet clone_newpid"
 all_eperm() {
   local n
   for n in $SECCOMP_DENIED; do grep -qE "^EXEC-SYSCALLS .*\b$n=EPERM\b" "$1" || { echo "      $n: not EPERM"; return 1; }; done
@@ -246,6 +247,36 @@ ask 4 "$T/AC1.out" "syscalls"
 check "the anti-cheat (root, sandboxed): EPERM for each, clone3 ENOSYS" all_eperm "$T/last"
 # (Plain fork and exec still work in the sandbox: forkattack in (f), and
 # (e) execs fairplayctl, whose spawn falls back from clone3 to clone.)
+
+step "(6) a root anti-cheat keeps no root powers but CAP_SYS_PTRACE (it read the game in (a))"
+# Capability sets in /proc/<pid>/status are hex masks; CAP_SYS_PTRACE is bit 19.
+PTRACE_ONLY=0000000000080000
+caps_are() {  # caps_are FILE EFF/PRM BND
+  grep -qE "^CapEff:\s+$2$" "$1" && grep -qE "^CapPrm:\s+$2$" "$1" && grep -qE "^CapBnd:\s+$3$" "$1" &&
+    grep -qE '^CapInh:\s+0{16}$' "$1" && grep -qE '^CapAmb:\s+0{16}$' "$1"
+}
+ask 3 "$T/G1.out" "read /proc/self/status" >/dev/null
+grep -E '^Cap' "$T/last" | sed 's/^/control (game): /' | indent
+check_not "control: the game (root, not sandboxed) has the full set" caps_are "$T/last" "$PTRACE_ONLY" "$PTRACE_ONLY"
+ask 4 "$T/AC1.out" "read /proc/self/status" >/dev/null
+grep -E '^Cap' "$T/last" | indent
+check "the anti-cheat: effective, permitted and bounding sets are CAP_SYS_PTRACE only, none inheritable or ambient" \
+  caps_are "$T/last" "$PTRACE_ONLY" "$PTRACE_ONLY"
+ask 3 "$T/G1.out" "byhandle /usr"
+check "control: the game opens /usr by its file handle (open_by_handle_at)" grep -q '^EXEC-BYHANDLE /usr: opened' "$T/last"
+ask 4 "$T/AC1.out" "byhandle /usr"
+check "the anti-cheat can't (no CAP_DAC_READ_SEARCH)" grep -q '^EXEC-ERR byhandle /usr: Operation not permitted' "$T/last"
+RATELIMIT="$(cat /proc/sys/kernel/printk_ratelimit)"
+ask 4 "$T/AC1.out" "read /proc/sys/kernel/ostype"
+check "it still reads /proc/sys" grep -q '^EXEC-READ /proc/sys/kernel/ostype: Linux' "$T/last"
+# Writing back the value it already has: harmless if the guard failed.
+ask 4 "$T/AC1.out" "write /proc/sys/kernel/printk_ratelimit $RATELIMIT"
+check "but can't write a sysctl, though uid 0 owns it (read-only)" \
+  grep -q '^EXEC-ERR write /proc/sys/kernel/printk_ratelimit: Read-only file system' "$T/last"
+# Zero bytes: does nothing even if the open got through.
+ask 4 "$T/AC1.out" "write /proc/sysrq-trigger"
+check "nor open /proc/sysrq-trigger for writing (read-only)" \
+  grep -q '^EXEC-ERR write /proc/sysrq-trigger: Read-only file system' "$T/last"
 
 step "(c) it can't read an ordinary program of the same user (the browser)"
 sudo "$CHEATSIM" game >"$T/browser.out" 2>&1 &
@@ -406,6 +437,8 @@ check "session_status from inside the sandbox answers for its session" \
 
 ask 6 "$T/AC2.out" "syscalls"
 check "as you, too: EPERM for each, clone3 ENOSYS" all_eperm "$T/last"
+ask 6 "$T/AC2.out" "read /proc/self/status" >/dev/null
+check "and no capabilities at all (bounding set: CAP_SYS_PTRACE only)" caps_are "$T/last" 0000000000000000 "$PTRACE_ONLY"
 
 step "(g) the game itself is not sandboxed"
 ask 5 "$T/G2.out" "read $MARKER"
