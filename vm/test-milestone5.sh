@@ -91,7 +91,7 @@ denied_at_least() { [ "$(denied "$1")" -ge "$2" ]; }
 # Run a command as you plus the launcher group.
 as_launcher() {
   sudo setpriv --reuid="$ME_UID" --regid="$ME_GID" --groups="$ME_GROUPS,$LAUNCHER_GID" -- \
-    env HOME="$HOME" PATH="$PATH" FAIRPLAYD_SOCKET="$SOCK" "$@"
+    env HOME="$HOME" PATH="$PATH" FAIRPLAYD_SOCKET="$SOCK" XDG_DATA_HOME="$T/xdg" "$@"
 }
 
 # Wait up to ~10s for a file to match a pattern, or a command to succeed.

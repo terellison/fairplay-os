@@ -19,6 +19,10 @@ pub const MAP_READERS: &str = "READERS";
 /// Name of the map of files that make a protected process a reader when it
 /// execs them ([`ExecKey`] -> [`ExecAllow`]), milestone 9.
 pub const MAP_READER_FILES: &str = "READER_FILES";
+/// Name of the map from a sandboxed process's tgid (the vendor's
+/// anti-cheat and everything it starts) to its protection domain
+/// (milestone 9, part B). Sandboxed processes are in [`MAP_PROTECTED`] too.
+pub const MAP_SANDBOXED: &str = "SANDBOXED";
 /// Entries [`MAP_READER_FILES`] holds: a few per session (the anti-cheat,
 /// `wineserver`).
 pub const READER_FILES_CAPACITY: u32 = 1024;
@@ -52,6 +56,10 @@ pub const BPF_PROG_DETACH: u32 = 9;
 pub const BPF_LINK_GET_FD_BY_ID: u32 = 30;
 pub const BPF_LINK_DETACH: u32 = 34;
 
+/// `PTRACE_MODE_ATTACH` (`<linux/ptrace.h>`): the caller wants to act on
+/// the process (ptrace attach, `process_vm_*`, `/proc/<pid>/mem`), not just
+/// look (`PTRACE_MODE_READ`: `/proc/<pid>/environ`, `maps`, hidepid).
+pub const PTRACE_MODE_ATTACH: u32 = 0x02;
 /// `PTRACE_MODE_NOAUDIT` (`<linux/ptrace.h>`, kernel-internal): the kernel
 /// is only checking, e.g. to decide which `/proc/<pid>/stat` fields `ps`
 /// may see, not acting on a request to access the process.
@@ -109,6 +117,24 @@ pub enum Hook {
     /// uinput device) while a session blocks virtual input. Recorded only
     /// when denied, once per fd.
     UinputWrite = 23,
+    // Milestone 9, part B: what a sandboxed process (the vendor's
+    // anti-cheat, see `MAP_SANDBOXED`) may not do. Filed under its own
+    // domain. Its signals to processes outside its sandbox are `TaskKill`.
+    /// `file_open`: opening a `/proc/<pid>/mem` file for writing. Target 0;
+    /// `mode` is the file's `FMODE_*` bits.
+    ProcMemWrite = 24,
+    /// `inode_follow_link`: following a `/proc/<pid>/` magic link (`root`,
+    /// `cwd`, `exe`, `fd/N`, `map_files/*`) of a process outside its
+    /// sandbox. Target is that pid; `file` the link's name.
+    ProcLink = 25,
+    /// `socket_connect` / `socket_sendmsg`: an abstract Unix socket
+    /// address (X11's `@/tmp/.X11-unix/X0`). Target 0; `file` the name.
+    UnixAbstract = 26,
+    // Milestone 8 follow-ups (#23), numbered 40 and up.
+    /// `bprm_check_security`: a protected process exec'ing an ELF file
+    /// that is not on its executable-mapping allowlist. `execve` fails with
+    /// EACCES; `mode` is 0.
+    BprmCheck = 40,
 }
 
 /// [`Violation::flags`]: the kernel let it happen and only reports it
@@ -125,9 +151,12 @@ pub const VIOLATION_ALLOWLISTED: u32 = 2;
 pub struct Violation {
     /// tgid of the process that tried.
     pub caller: u32,
-    /// tgid of the protected process it targeted (0 for non-process targets).
+    /// tgid of the protected process it targeted (0 for non-process
+    /// targets). For a protected caller reaching outside its domain
+    /// (milestone 9), the unprotected process it tried to reach.
     pub target: u32,
     /// The target's protection domain, or 0 if it was no longer in the map.
+    /// For a protected caller reaching outside its domain, the caller's.
     pub domain: u32,
     /// A [`Hook`] value.
     pub hook: u32,
@@ -147,8 +176,9 @@ pub struct Violation {
     /// captured in the kernel; user space adds the full path if the caller
     /// is still alive.
     pub exe: [u8; EXE_NAME_LEN],
-    /// For file hooks ([`Hook::MmapFile`], [`Hook::FileMprotect`]): file
-    /// name (no directory) of the file it tried to map, same format as
+    /// For file hooks ([`Hook::MmapFile`], [`Hook::FileMprotect`],
+    /// [`Hook::BprmCheck`]): file name (no directory) of the file it tried
+    /// to map or exec, same format as
     /// `exe`. For [`Hook::UinputCreate`]: the name the caller gave the new
     /// device (sysfs `name`). For [`Hook::UhidCreate`],
     /// [`Hook::EvdevWrite`] and [`Hook::UinputWrite`]: the device node's

@@ -262,6 +262,24 @@ pub struct ProcessInfo {
     /// `"state":"exited","code":0,"signal":null`.
     #[serde(flatten)]
     pub state: ProcessState,
+    /// Set for the vendor's anti-cheat (a `join`), which runs in a sandbox
+    /// (milestone 9, part B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Box<SandboxInfo>>,
+}
+
+/// What a sandboxed process can see of the file system. Everything else
+/// (the home directory, other users' files, display and D-Bus sockets) is
+/// not in its mount namespace at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxInfo {
+    /// Its own read-write data directory,
+    /// `$XDG_DATA_HOME/fairplay/<signer fingerprint>/`. The only place it
+    /// can keep anything across runs.
+    pub data_dir: String,
+    /// Directories it sees read-only besides the system ones: its own
+    /// install directory and the game's.
+    pub read_only: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,7 +325,9 @@ pub struct ViolationEvent {
     pub target: u32,
     /// LSM hook that denied it, e.g. `ptrace_access_check`, or `mmap_file`
     /// / `file_mprotect` for code the game tried to map that isn't on its
-    /// allowlist (then `caller` and `target` are both the game). For
+    /// allowlist (then `caller` and `target` are both the game), or
+    /// `bprm_check_security` for a program not on it that the game (or a
+    /// process it started) tried to exec; `execve` failed. For
     /// virtual input: `uinput_create`, `uhid_create`, `evdev_write`, or
     /// `uinput_write` (input through a uinput device, refused while a
     /// session blocks virtual input).
@@ -322,7 +342,8 @@ pub struct ViolationEvent {
     /// node's kernel `dev_t` (`major << 20 | minor`).
     pub mode: u32,
     /// File name (no directory) of the file it tried to map, for
-    /// `mmap_file` and `file_mprotect`. For `uinput_create`, the name the
+    /// `mmap_file` and `file_mprotect`, or exec, for
+    /// `bprm_check_security`. For `uinput_create`, the name the
     /// caller gave the device; for the others, the device node (`uhid`,
     /// `event3`, `uinput`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -553,6 +574,7 @@ mod tests {
                 code: Some(0),
                 signal: None,
             },
+            sandbox: None,
         };
         let text = String::from_utf8(encode(&game)).unwrap();
         assert!(

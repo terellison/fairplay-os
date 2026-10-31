@@ -4,10 +4,14 @@
 mod bpf;
 mod bpf_map;
 mod bpf_prog;
+mod bprm_check_security;
 mod file_ioctl;
 mod file_ioctl_compat;
 mod file_mprotect;
+mod file_open;
 mod file_permission;
+mod inode_follow_link;
 mod mmap_file;
 mod ptrace;
+mod socket;
 mod task_kill;

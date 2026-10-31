@@ -73,7 +73,7 @@ cleanup() {
   fi
   [ -n "$CREATED_GROUP" ] && sudo groupdel "$GROUP"
   sudo rm -f "$SOCK"
-  rm -rf "$T"
+  sudo rm -rf "$T"
 }
 trap cleanup EXIT
 
@@ -224,10 +224,11 @@ check "3 DENIED lines for each (parent $(denied "$GPID"), sibling $(denied "$SIB
   test "$(denied "$GPID")" -eq 3 -a "$(denied "$SIB")" -eq 3
 
 step "(c) the vendor's anti-cheat joins as a reader and reads the game"
-ctl launch --run-as 0 --join "$SESSION" -- "$T/vendor/anticheat" attack --pid "$GPID" --addr "$ADDR" >"$T/ac.out" 2>&1
+sudo XDG_DATA_HOME="$T/xdg" "$CTL" --socket "$SOCK" launch --run-as 0 --join "$SESSION" -- "$T/vendor/anticheat" attack --pid "$GPID" --addr "$ADDR" >"$T/ac.out" 2>&1
 wait_for "$T/ac.out" 'paths leaked'
 indent <"$T/ac.out"
-check "3/3 paths leaked: the reader can read the game" grep -q '^3/3 paths leaked' "$T/ac.out"
+check "the reader reads the game (process_vm_readv, /proc/<pid>/mem; ptrace is off in its sandbox)" \
+  sh -c "grep -q '^LEAKED  process_vm_readv' '$T/ac.out' && grep -q '^LEAKED  /proc/<pid>/mem' '$T/ac.out'"
 check "no new DENIED lines for the game" test "$(denied "$GPID")" -eq 3
 check "READER_FILES gained the anti-cheat's file (2 entries)" test "$(reader_files)" -eq 2
 

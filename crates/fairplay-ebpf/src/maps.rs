@@ -20,6 +20,14 @@ pub static PROTECTED: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 #[map]
 pub static READERS: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 
+/// tgid of a sandboxed process -> its protection domain (milestone 9,
+/// part B): the vendor's anti-cheat, put here by fairplayd before it runs,
+/// and every process it starts (`follow`). Every one is in PROTECTED too.
+/// The sandbox hooks (ptrace, `file_open`, `inode_follow_link`,
+/// `socket_connect`/`socket_sendmsg`, `task_kill`) key on it.
+#[map]
+pub static SANDBOXED: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+
 /// Denied attempts, read by fairplayd and streamed to vendors.
 #[map]
 pub static VIOLATIONS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);

@@ -29,6 +29,7 @@ mod exec_allow;
 mod host;
 mod input;
 mod launch;
+mod sandbox;
 mod self_protect;
 mod server;
 mod state;
@@ -50,7 +51,7 @@ use fairplay_api::{ProcessState, ViolationEvent, DEFAULT_LAUNCHER_GROUP, DEFAULT
 use fairplay_common::{
     ExecAllow, ExecKey, Violation, ANY_DOMAIN, FS_SYSTEM, MAP_EXEC_ALLOWED, MAP_EXEC_TRUSTED_FS,
     MAP_INPUT_ALLOWED, MAP_INPUT_BLOCK, MAP_PROTECTED, MAP_READERS, MAP_READER_FILES,
-    MAP_UNFOLLOWED, MAP_VIOLATIONS, VIOLATION_REPORTED,
+    MAP_SANDBOXED, MAP_UNFOLLOWED, MAP_VIOLATIONS, VIOLATION_REPORTED,
 };
 use tokio::{io::unix::AsyncFd, sync::broadcast};
 
@@ -112,6 +113,7 @@ pub struct BpfMap {
     input_block: Array<MapData, u32>,
     readers: HashMap<MapData, u32, u32>,
     reader_files: HashMap<MapData, ExecKey, ExecAllow>,
+    sandboxed: HashMap<MapData, u32, u32>,
 }
 
 fn ignore_missing(r: Result<(), MapError>) -> Result<()> {
@@ -137,6 +139,12 @@ impl ProtectedMap for BpfMap {
     fn remove_reader(&mut self, pid: u32) -> Result<()> {
         ignore_missing(self.readers.remove(&pid))
     }
+    fn add_sandboxed(&mut self, pid: u32, domain: u32) -> Result<()> {
+        Ok(self.sandboxed.insert(pid, domain, 0)?)
+    }
+    fn remove_sandboxed(&mut self, pid: u32) -> Result<()> {
+        ignore_missing(self.sandboxed.remove(&pid))
+    }
     fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
         Ok(self.exec.insert(key, value, 0)?)
     }
@@ -155,6 +163,16 @@ impl ProtectedMap for BpfMap {
     fn forget_domain(&mut self, domain: u32) {
         let _ = self.unfollowed.remove(&domain);
     }
+    fn live_domains(&self) -> Result<std::collections::BTreeSet<u32>> {
+        // Entries can come and go while we walk; only a member's fork adds
+        // one, so a draining domain's member can be missed only if it
+        // forked and exited mid-walk, and the cost is a child losing the
+        // game's files (it fails closed).
+        self.protected
+            .iter()
+            .map(|r| Ok(r?.1))
+            .collect::<Result<_>>()
+    }
     fn set_input_block(&mut self, on: bool) -> Result<()> {
         Ok(self.input_block.set(0, u32::from(on), 0)?)
     }
@@ -170,6 +188,7 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("ptrace_access_check", "ptrace_access_check"),
     ("mmap_file", "mmap_file"),
     ("file_mprotect", "file_mprotect"),
+    ("bprm_check_security", "bprm_check_security"),
     // Self-protection (milestone 6); inert unless --self-protect.
     ("task_kill", "task_kill"),
     ("bpf", "bpf"),
@@ -177,6 +196,12 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("bpf_prog", "bpf_prog"),
     ("file_ioctl", "file_ioctl"),
     ("file_permission", "file_permission"),
+    // The anti-cheat's sandbox (milestone 9, part B); inert for processes
+    // not in SANDBOXED.
+    ("file_open", "file_open"),
+    ("inode_follow_link", "inode_follow_link"),
+    ("socket_connect", "socket_connect"),
+    ("socket_sendmsg", "socket_sendmsg"),
 ];
 
 /// LSM programs for hooks older kernels lack. fairplayd starts without them
@@ -266,6 +291,7 @@ fn main() -> Result<()> {
         )?,
         input_block: Array::try_from(ebpf.take_map(MAP_INPUT_BLOCK).context("INPUT_BLOCK map")?)?,
         readers: HashMap::try_from(ebpf.take_map(MAP_READERS).context("READERS map")?)?,
+        sandboxed: HashMap::try_from(ebpf.take_map(MAP_SANDBOXED).context("SANDBOXED map")?)?,
         reader_files: HashMap::try_from(
             ebpf.take_map(MAP_READER_FILES)
                 .context("READER_FILES map")?,
@@ -369,7 +395,9 @@ fn main() -> Result<()> {
             events: events.clone(),
             launcher_gid,
             system_devs,
+            socket: args.socket.clone(),
         };
+        tokio::spawn(release_drained(daemon.clone()));
         tokio::spawn(read_violations(ring, daemon, events));
         let deadline = async {
             match protect_for {
@@ -389,6 +417,17 @@ fn main() -> Result<()> {
         eprintln!("fairplayd: stopping; protected processes still running are no longer protected");
         Ok(())
     })
+}
+
+/// Once a second, releases the allowlists of sessions whose launched
+/// processes have exited, as soon as the last process they started is gone
+/// too (see `Daemon::release_drained`).
+async fn release_drained(daemon: Shared) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        daemon.lock().unwrap().release_drained();
+    }
 }
 
 async fn shutdown_signal() {
