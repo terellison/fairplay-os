@@ -1,5 +1,6 @@
 //! The executable-mapping allowlist (milestone 8), shared by the
-//! `mmap_file` and `file_mprotect` hooks.
+//! `mmap_file` and `file_mprotect` hooks, and by `bprm_check_security`,
+//! which applies it to `execve` before the point of no return.
 //!
 //! A protected process may map a file executable only if the file is
 //! - on a system filesystem (EXEC_TRUSTED_FS = FS_SYSTEM), owned by root and
@@ -26,11 +27,11 @@ use fairplay_common::{
 
 use crate::{
     domain::{
-        file_inode, inode_generation, inode_ino, inode_mode, inode_sb, inode_uid,
-        record_violation_on_file, sb_dev, EPERM,
+        bprm_buf, bprm_file, file_inode, inode_generation, inode_ino, inode_mode, inode_sb,
+        inode_uid, record_violation_on_file, sb_dev, EACCES, EPERM,
     },
     maps::PROTECTED,
-    vmlinux::{file, inode, super_block},
+    vmlinux::{file, inode, linux_binprm, super_block},
 };
 
 /// Files a domain may map executable. Written only by fairplayd.
@@ -65,6 +66,37 @@ pub fn exec_mapping_verdict(file: *const file, hook: Hook, prot: u32) -> i32 {
     record_violation_on_file(tgid, tgid, hook, prot, file);
     -EPERM
 }
+
+/// The verdict for the current task exec'ing the file in `bprm`: 0 or
+/// -EACCES. Only ELF files are checked: those are what the ELF loader maps
+/// executable. A `#!` script (or a `binfmt_misc` format) isn't mapped; the
+/// kernel comes back here with its interpreter, which is. Anything this
+/// misses is still caught by `mmap_file`, just less cleanly.
+#[inline(always)]
+pub fn exec_verdict(bprm: *const linux_binprm) -> i32 {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let Some(&domain) = (unsafe { PROTECTED.get(&tgid) }) else {
+        return 0;
+    };
+    // `bprm` comes from the kernel; if a read fails anyway, fail closed
+    // like `exec_mapping_verdict`.
+    let read = unsafe {
+        bpf_probe_read_kernel(bprm_file(bprm)).and_then(|f| {
+            bpf_probe_read_kernel(bprm_buf(bprm) as *const [u8; 4]).map(|magic| (f, magic))
+        })
+    };
+    let f: *const file = match read {
+        Ok((_, magic)) if magic != ELF_MAGIC => return 0,
+        Ok((f, _)) if !f.is_null() && allowed(f, domain).unwrap_or(false) => return 0,
+        Ok((f, _)) => f,
+        Err(_) => core::ptr::null(),
+    };
+    record_violation_on_file(tgid, tgid, Hook::BprmCheck, 0, f);
+    -EACCES
+}
+
+/// The first four bytes of every ELF file.
+const ELF_MAGIC: [u8; 4] = *b"\x7fELF";
 
 fn allowed(file: *const file, domain: u32) -> Result<bool, i64> {
     unsafe {
