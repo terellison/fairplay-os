@@ -103,3 +103,5 @@ Update branch button) does not.
    any other new commit dismisses it, and the owner has to approve again.
 7. **The App can't edit `.github/workflows/`.** If CI needs changing, describe the change
    in the PR or an issue and the owner will make it.
+
+<!-- lead approval smoke test, do not merge -->
