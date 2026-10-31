@@ -23,14 +23,13 @@ You have root via sudo. The Mac side (`vm/macos/*.sh`) is not run from here.
 Known VM limits:
 - **TPM**: `tpm-tis-device` currently crashes QEMU under HVF (`HV_BAD_ARGUMENT`), so the VM
   boots with `TPM=off`. TPM checks in `vm/check-milestone1.sh` are expected to fail for now.
-  Attestation (milestone 6) is blocked on this.
-- **Secure Boot**: not available with Homebrew's arm64 firmware. Milestone 6 tests
+  Attestation (milestone 10) is blocked on this.
+- **Secure Boot**: not available with Homebrew's arm64 firmware. Milestone 10 tests
   "reject a different kernel" instead of "reject Secure Boot off".
 
 ## Milestones (each ends with a test a skeptic can run)
 
-Numbers are names; the design doc lists them in planned order (8, 9, 5, 7, 10, 6, 11, 12).
-6, 11 and 12 need an x86 PC with a TPM; this VM can't run Proton or NVIDIA drivers either.
+10, 11 and 12 need an x86 PC with a TPM; this VM can't run Proton or NVIDIA drivers either.
 
 1. VM baseline: BPF LSM active, BTF, btrfs `/work/ws` subvolume, nightly + bpf-linker + aya-tool.
    Exit: `vm/check-milestone1.sh` passes (minus TPM), and a hello-world LSM program loads.
@@ -39,13 +38,13 @@ Numbers are names; the design doc lists them in planned order (8, 9, 5, 7, 10, 6
 3. Protected process. Exit: `cheatsim attack` leaks 3/3 unprotected, 0/3 with `fairplayd`,
    and fairplayd prints one DENIED line per attempt. Run the attacker as root on purpose.
 4. fairplayd socket API: launch_protected, session_status, attest, violations.
-5. Input: report virtual input devices and who created them (don't block: Steam Input and
+5. The protection domain follows the game's child processes; drop Wine's DLL env variables.
+6. fairplayd protects itself from root: no kill, trace, map access or program detach.
+7. Input: report virtual input devices and who created them (don't block: Steam Input and
    accessibility tools use uinput).
-6. Attestation, including the mode (blocked on TPM, see above).
-7. Executable-mapping allowlist (also covers overlays and Wine DLL injection).
-8. The protection domain follows the game's child processes; drop Wine's DLL env variables.
-9. fairplayd protects itself from root: no kill, trace, map access or program detach.
-10. Vendor anti-cheat: only a vendor-signed binary may join; it runs sandboxed to the game.
+8. Executable-mapping allowlist (also covers overlays and Wine DLL injection).
+9. Vendor anti-cheat: only a vendor-signed binary may join; it runs sandboxed to the game.
+10. Attestation, including the mode (blocked on TPM, see above).
 11. Player-mode image: signed, read-only, lockdown, Wayland only, atomic rollback.
 12. Proton end to end on x86 hardware.
 

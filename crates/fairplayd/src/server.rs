@@ -186,7 +186,7 @@ fn session_status(ctx: &Ctx, peer: &Peer, session: Option<u64>) -> Result<Reply,
     }))
 }
 
-/// Milestone 6. There is no TPM in the VM, so say so; never fake a quote.
+/// Milestone 10. There is no TPM in the VM, so say so; never fake a quote.
 fn attest(nonce: String) -> ApiError {
     let mut e = if !valid_nonce(&nonce) {
         ApiError::new(ErrorCode::BadRequest, "nonce must be 1-64 bytes of hex")
@@ -199,15 +199,15 @@ fn attest(nonce: String) -> ApiError {
             Err(fairplay_attest::Error::NoTpm) => ApiError::new(
                 ErrorCode::Unavailable,
                 if Path::new("/dev/tpmrm0").exists() {
-                    "attestation is not implemented yet (milestone 6)"
+                    "attestation is not implemented yet (milestone 10)"
                 } else {
-                    "no TPM on this machine; attestation needs one (milestone 6)"
+                    "no TPM on this machine; attestation needs one (milestone 10)"
                 },
             ),
             Err(fairplay_attest::Error::Other(m)) => ApiError::new(ErrorCode::Unavailable, m),
             Ok(_) => ApiError::new(
                 ErrorCode::Unavailable,
-                "evidence encoding is not defined yet (milestone 6)",
+                "evidence encoding is not defined yet (milestone 10)",
             ),
         }
     };

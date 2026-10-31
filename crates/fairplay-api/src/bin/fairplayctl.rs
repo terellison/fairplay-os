@@ -65,7 +65,7 @@ enum Cmd {
     },
     /// List your sessions (all sessions, as root).
     List,
-    /// Ask for attestation evidence (milestone 6; unavailable for now).
+    /// Ask for attestation evidence (milestone 10; unavailable for now).
     Attest {
         /// Server-chosen nonce, hex. Random if omitted.
         #[arg(long)]

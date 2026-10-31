@@ -15,7 +15,7 @@ pub enum Hook {
     /// `ptrace_access_check`: covers ptrace attach, `process_vm_readv`/`writev`,
     /// and `/proc/<pid>/mem`.
     PtraceAccess = 1,
-    /// `file_open` on `/dev/uinput` during a protected session (milestone 5).
+    /// `file_open` on `/dev/uinput` during a protected session (milestone 7).
     UinputOpen = 2,
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "fairplay-attest"
-description = "TPM quote + IMA log collection, and the server-side verifier (milestone 6)"
+description = "TPM quote + IMA log collection, and the server-side verifier (milestone 10)"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
