@@ -327,6 +327,13 @@ unsafe fn child_main(a: &ChildArgs) -> ! {
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             fail(a, 5);
         }
+        // The anti-cheat's seccomp filter (it reads the game, never writes
+        // or controls it). Inherited by everything it starts.
+        if let Some(sb) = a.sandbox {
+            if let Err(stage) = sb.seccomp() {
+                fail(a, stage);
+            }
+        }
         // After setuid, so the kernel checks the directory as the user.
         if libc::chdir(a.cwd.as_ptr()) != 0 {
             fail(a, 6);

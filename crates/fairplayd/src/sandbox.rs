@@ -385,6 +385,8 @@ pub struct Prepared {
     names: Vec<String>,
     new_root: CString,
     _dirs: Vec<OwnedFd>,
+    /// Installed by [`Prepared::seccomp`].
+    filter: Vec<libc::sock_filter>,
     pub info: SandboxInfo,
     pub data_dir: PathBuf,
     /// Where the program starts: the requested directory if the sandbox
@@ -459,7 +461,6 @@ fn clone_tree(dir: &OwnedFd) -> std::io::Result<OwnedFd> {
 }
 
 fn steps_to_c(steps: &[Step]) -> (Vec<CStep>, Vec<String>) {
-    let empty = CString::default();
     let mut out = vec![];
     let mut names = vec![];
     for s in steps {
@@ -494,7 +495,13 @@ fn steps_to_c(steps: &[Step]) -> (Vec<CStep>, Vec<String>) {
                     target: under_root(p),
                     fstype: c"proc".into(),
                     flags: libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-                    data: empty.clone(),
+                    // Only processes it may look at (its own, and the game
+                    // for a reader) show up at all: the kernel asks
+                    // ptrace_access_check about each one. hidepid exempts
+                    // members of the mount's `gid`, 0 by default, which
+                    // would exempt a root anti-cheat: name a group nobody
+                    // is in.
+                    data: PROC_OPTIONS.into(),
                 },
                 format!("mount proc on {}", p.display()),
             ),
@@ -691,6 +698,7 @@ pub fn prepare(r: Request) -> Result<Prepared, ApiError> {
         names,
         new_root: cpath(Path::new(NEW_ROOT)),
         _dirs: vec![game_fd, own_fd, data_fd],
+        filter: seccomp_filter(),
         info: SandboxInfo {
             data_dir: data.display().to_string(),
             read_only,
@@ -700,11 +708,16 @@ pub fn prepare(r: Request) -> Result<Prepared, ApiError> {
     })
 }
 
+/// Mount options for the sandbox's `/proc`. 2147483646 is a group id no
+/// account uses (the kernel only refuses -1).
+pub const PROC_OPTIONS: &std::ffi::CStr = c"hidepid=invisible,gid=2147483646";
+
 /// Stage numbers [`Prepared::enter`] reports, after `launch`'s own.
 pub const STAGE_UNSHARE: u32 = 1000;
 pub const STAGE_PRIVATE: u32 = 1001;
 pub const STAGE_PIVOT: u32 = 1002;
 pub const STAGE_ROOT_RO: u32 = 1003;
+pub const STAGE_SECCOMP: u32 = 1004;
 /// Step `i` fails as stage `STAGE_STEP + i`.
 pub const STAGE_STEP: u32 = 2000;
 
@@ -716,6 +729,7 @@ impl Prepared {
             STAGE_PRIVATE => "making mounts private".into(),
             STAGE_PIVOT => "pivot_root".into(),
             STAGE_ROOT_RO => "remounting / read-only".into(),
+            STAGE_SECCOMP => "seccomp filter".into(),
             s if s >= STAGE_STEP => self.names.get((s - STAGE_STEP) as usize)?.clone(),
             _ => return None,
         })
@@ -829,6 +843,101 @@ impl Prepared {
         }
         Ok(())
     }
+
+    /// Installs [`seccomp_filter`]. Async-signal-safe. Needs `no_new_privs`
+    /// (or CAP_SYS_ADMIN); `launch` calls it right after setting that.
+    ///
+    /// # Safety
+    /// Only in the forked child.
+    pub unsafe fn seccomp(&self) -> Result<(), u32> {
+        let prog = libc::sock_fprog {
+            len: self.filter.len() as u16,
+            filter: self.filter.as_ptr() as *mut libc::sock_filter,
+        };
+        // SAFETY: prog points at a live filter for the duration of the call.
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &prog as *const libc::sock_fprog,
+            )
+        };
+        if rc != 0 {
+            return Err(STAGE_SECCOMP);
+        }
+        Ok(())
+    }
+}
+
+/// System calls the sandbox refuses with EPERM (milestone 9, part B). The
+/// anti-cheat reads the game; it never writes to or controls it, nor
+/// borrows its files: `ptrace` (attach, poke, and making the game run
+/// code), `process_vm_writev`, `pidfd_getfd` (copying the game's open
+/// files, e.g. Wine's handle on `/`), `process_madvise`. `process_vm_readv`
+/// and reading `/proc/<pid>/mem` stay. Writes to `/proc/<pid>/mem` and
+/// signals outside the sandbox are refused by the BPF LSM instead (seccomp
+/// sees neither paths nor targets).
+pub const DENIED_SYSCALLS: &[(&str, libc::c_long)] = &[
+    ("ptrace", libc::SYS_ptrace),
+    ("process_vm_writev", libc::SYS_process_vm_writev),
+    ("pidfd_getfd", libc::SYS_pidfd_getfd),
+    ("process_madvise", libc::SYS_process_madvise),
+];
+
+/// `<linux/audit.h>`: the architecture a filter was written for. A system
+/// call made through another ABI (32-bit compat) kills the process.
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 0xC000_00B7;
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 0xC000_003E;
+/// x86-64's x32 ABI: the same numbers with this bit set.
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+// Classic BPF opcodes (`<linux/filter.h>`).
+/// `BPF_LD | BPF_W | BPF_ABS`.
+const LD_W_ABS: u16 = 0x20;
+/// `BPF_JMP | BPF_JEQ | BPF_K`.
+const JMP_JEQ_K: u16 = 0x15;
+#[cfg(target_arch = "x86_64")]
+/// `BPF_JMP | BPF_JGE | BPF_K`.
+const JMP_JGE_K: u16 = 0x35;
+const RET_K: u16 = 0x06;
+/// `struct seccomp_data` offsets: `nr`, then `arch`.
+const OFFSET_NR: u32 = 0;
+const OFFSET_ARCH: u32 = 4;
+
+fn stmt(code: u16, k: u32) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter { code, jt, jf, k }
+}
+
+/// The sandbox's seccomp filter: wrong architecture -> kill; a call in
+/// [`DENIED_SYSCALLS`] -> EPERM; anything else allowed.
+pub fn seccomp_filter() -> Vec<libc::sock_filter> {
+    let eperm = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32 & libc::SECCOMP_RET_DATA);
+    let mut f = vec![
+        stmt(LD_W_ABS, OFFSET_ARCH),
+        jump(JMP_JEQ_K, AUDIT_ARCH, 1, 0),
+        stmt(RET_K, libc::SECCOMP_RET_KILL_PROCESS),
+        stmt(LD_W_ABS, OFFSET_NR),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    f.extend([jump(JMP_JGE_K, X32_SYSCALL_BIT, 0, 1), stmt(RET_K, eperm)]);
+    for &(_, nr) in DENIED_SYSCALLS {
+        f.push(jump(JMP_JEQ_K, nr as u32, 0, 1));
+        f.push(stmt(RET_K, eperm));
+    }
+    f.push(stmt(RET_K, libc::SECCOMP_RET_ALLOW));
+    f
 }
 
 #[cfg(test)]
@@ -1145,5 +1254,90 @@ mod tests {
         assert!(
             matches!(&c[0], CStep::Mount { target, .. } if target.to_str().unwrap() == NEW_ROOT)
         );
+        // /proc shows only what the sandbox may look at.
+        assert!(c
+            .iter()
+            .any(|s| matches!(s, CStep::Mount { fstype, data, .. }
+            if fstype.to_str().unwrap() == "proc" && data.as_c_str() == PROC_OPTIONS)));
+    }
+
+    #[test]
+    fn seccomp_filter_shape() {
+        let f = seccomp_filter();
+        // Architecture check first, allow last, one EPERM per denied call.
+        assert_eq!((f[0].code, f[0].k), (LD_W_ABS, OFFSET_ARCH));
+        assert_eq!((f[1].code, f[1].k), (JMP_JEQ_K, AUDIT_ARCH));
+        assert_eq!(f[2].k, libc::SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(f.last().unwrap().k, libc::SECCOMP_RET_ALLOW);
+        let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        for &(name, nr) in DENIED_SYSCALLS {
+            let i = f
+                .iter()
+                .position(|x| x.code == JMP_JEQ_K && x.k == nr as u32)
+                .unwrap_or_else(|| panic!("{name} not in the filter"));
+            assert_eq!((f[i].jt, f[i].jf), (0, 1));
+            assert_eq!((f[i + 1].code, f[i + 1].k), (RET_K, eperm), "{name}");
+        }
+        assert!(!f.iter().any(|x| x.code == JMP_JEQ_K
+            && (x.k == libc::SYS_process_vm_readv as u32 || x.k == libc::SYS_openat as u32)));
+    }
+
+    /// Installs the filter in a forked child (no root needed): ptrace and
+    /// process_vm_writev fail with EPERM, process_vm_readv still works.
+    #[test]
+    fn seccomp_filter_works() {
+        let sb = Prepared {
+            steps: vec![],
+            names: vec![],
+            new_root: CString::default(),
+            _dirs: vec![],
+            filter: seccomp_filter(),
+            info: SandboxInfo {
+                data_dir: String::new(),
+                read_only: vec![],
+            },
+            data_dir: PathBuf::new(),
+            cwd: PathBuf::new(),
+        };
+        // SAFETY: the child only makes system calls and exits.
+        match unsafe { libc::fork() } {
+            0 => unsafe {
+                let mut code = 0;
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || sb.seccomp().is_err()
+                {
+                    libc::_exit(10);
+                }
+                let eperm = || *libc::__errno_location() == libc::EPERM;
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != -1 || !eperm() {
+                    code |= 1;
+                }
+                let mut buf = [0u8; 8];
+                let src = [7u8; 8];
+                let local = libc::iovec {
+                    iov_base: buf.as_mut_ptr().cast(),
+                    iov_len: 8,
+                };
+                let remote = libc::iovec {
+                    iov_base: src.as_ptr() as *mut _,
+                    iov_len: 8,
+                };
+                let me = libc::getpid();
+                if libc::process_vm_writev(me, &local, 1, &remote, 1, 0) != -1 || !eperm() {
+                    code |= 2;
+                }
+                if libc::process_vm_readv(me, &local, 1, &remote, 1, 0) != 8 || buf != src {
+                    code |= 4;
+                }
+                libc::_exit(code);
+            },
+            -1 => panic!("fork failed"),
+            pid => {
+                let mut status = 0;
+                // SAFETY: waiting for our own child.
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+                assert!(libc::WIFEXITED(status), "status {status:#x}");
+                assert_eq!(libc::WEXITSTATUS(status), 0, "1 ptrace, 2 writev, 4 readv");
+            }
+        }
     }
 }

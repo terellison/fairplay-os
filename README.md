@@ -561,12 +561,7 @@ account (`PTRACE_MODE_NOAUDIT`, e.g. which `/proc/<pid>/stat` fields `ps`
 may show) are denied quietly. Covered: ptrace attach, `process_vm_readv` /
 `writev`, `/proc/<pid>/mem`, `environ`, `maps`, `smaps`, `pagemap`,
 `auxv`, `stack`, `syscall`, the `fd/`, `cwd`, `root` and `exe` links, and
-`pidfd_getfd`. **Still visible** (not behind this check): the list of pids
-in `/proc`, and each one's `cmdline`, `comm`, `stat` (minus the address
-fields) and `status`. `hidepid=invisible` on the sandbox's `/proc` would
-hide them, but the kernel checks each `/proc` entry it lists through the
-same hook without `NOAUDIT`, so every directory scan would log one
-violation per process; left for later.
+`pidfd_getfd`.
 
 **2. Files, with a mount namespace** (`crates/fairplayd/src/sandbox.rs`),
 for `anti_cheat` joins only. Before the privilege drop and exec, the
@@ -610,10 +605,7 @@ the `launch_failed` error.
 `"sandbox": {"data_dir": ..., "read_only": [game dir, anti-cheat dir]}`;
 the game has none. The game is not sandboxed.
 
-**Known gaps.** Abstract Unix sockets (names starting with `@`) belong to
-the network namespace, not the file system, so they stay reachable (an X
-server's `@/tmp/.X11-unix/X0`, on this VM `multipathd`'s and `iscsiadm`'s);
-Landlock's scoping for them needs kernel 6.12. The sandbox assumes the
+**Known gaps.** The sandbox assumes the
 anti-cheat runs as the user: run as root (as the memory tests do, to get
 past Yama) it could mount its way out. If fairplayd restarts, a running
 anti-cheat keeps a bind of the old socket file.
@@ -622,10 +614,9 @@ The exit test, inside the VM, as your normal user:
 
     flock /run/lock/fairplay-vm-tests ./vm/test-milestone9b.sh
 
-As root (so every memory block is the LSM's): (a) the sandboxed mock vendor
-reads the game 3/3; (c) it reads an unprotected `cheatsim game` (the
-"browser") 0/3, with 3 `DENIED` lines filed under its session, and can't
-read its `environ` or `maps`; (f) a reader's fork-only child, and the reader
+The script's comments and step names list each check. As root: (a) the
+sandboxed mock vendor reads the game; (c) it reads an unprotected `cheatsim
+game` (the "browser") 0/3; (f) a reader's fork-only child, and the reader
 itself after it execs `/bin/sh`, read the game 0/3. As you: (b) the vendor
 can't read a marker file in `$HOME`, and `ls $HOME` finds no such directory;
 (d) it writes and reads back a file in its data directory, which appears in

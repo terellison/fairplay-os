@@ -264,7 +264,17 @@ fn launch_protected(
         }
         let pid = paused.pid();
         match &sandbox {
-            Some(sb) => d.set_sandbox(ticket.session, pid, sb.info.clone()),
+            Some(sb) => {
+                // In SANDBOXED before it runs, or it doesn't run: `paused`
+                // drops on the error path and the child is killed.
+                if let Err(e) = d.mark_sandboxed(&ticket, pid) {
+                    return Err(ApiError::new(
+                        ErrorCode::Internal,
+                        format!("marking pid {pid} sandboxed: {e:#}"),
+                    ));
+                }
+                d.set_sandbox(ticket.session, pid, sb.info.clone());
+            }
             None => d.set_game_dir(ticket.session, &dir),
         }
         let info = plan.manifest.info();

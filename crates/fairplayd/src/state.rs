@@ -38,6 +38,10 @@ pub trait ProtectedMap {
     /// exec'ing a file in READER_FILES.
     fn add_reader(&mut self, pid: u32, domain: u32) -> Result<()>;
     fn remove_reader(&mut self, pid: u32) -> Result<()>;
+    /// Marks `pid` as sandboxed in `domain` (milestone 9, part B): the
+    /// kernel's sandbox hooks apply to it and everything it starts.
+    fn add_sandboxed(&mut self, pid: u32, domain: u32) -> Result<()>;
+    fn remove_sandboxed(&mut self, pid: u32) -> Result<()>;
     fn allow_reader_file(&mut self, key: ExecKey, value: ExecAllow) -> Result<()>;
     fn disallow_reader_file(&mut self, key: ExecKey) -> Result<()>;
     /// How many processes started in `domain` the kernel could not add
@@ -355,6 +359,14 @@ impl<M: ProtectedMap> Daemon<M> {
         }
     }
 
+    /// Puts a registered (not yet released) child into SANDBOXED, so the
+    /// kernel treats it as the sandboxed anti-cheat from its first
+    /// instruction. The caller must not release the child unless this
+    /// succeeds.
+    pub fn mark_sandboxed(&mut self, t: &Ticket, pid: u32) -> Result<()> {
+        self.map.add_sandboxed(pid, t.domain)
+    }
+
     /// Records that a process launched into `id` runs sandboxed (after
     /// [`Daemon::register`]).
     pub fn set_sandbox(&mut self, id: SessionId, pid: u32, info: SandboxInfo) {
@@ -514,6 +526,9 @@ impl<M: ProtectedMap> Daemon<M> {
         // The kernel already dropped it at exit; this is belt and braces.
         if let Err(e) = self.map.remove_reader(pid) {
             eprintln!("fairplayd: removing pid {pid} from READERS: {e:#}");
+        }
+        if let Err(e) = self.map.remove_sandboxed(pid) {
+            eprintln!("fairplayd: removing pid {pid} from SANDBOXED: {e:#}");
         }
         p.state = state;
         // The domain's last process is gone: its files are no longer
@@ -725,6 +740,9 @@ pub fn hook_name(hook: u32) -> &'static str {
         x if x == Hook::BpfMap as u32 => "bpf_map",
         x if x == Hook::BpfProg as u32 => "bpf_prog",
         x if x == Hook::Bpf as u32 => "bpf",
+        x if x == Hook::ProcMemWrite as u32 => "proc_mem_write",
+        x if x == Hook::ProcLink as u32 => "proc_link",
+        x if x == Hook::UnixAbstract as u32 => "unix_abstract",
         x => match crate::input::Mechanism::of_hook(x) {
             Some(m) => input_hook_name(m),
             None => "unknown",
@@ -780,6 +798,7 @@ mod tests {
         exec_fail_at: Option<usize>,
         readers: HashMap<u32, u32>,
         reader_files: HashMap<ExecKey, ExecAllow>,
+        sandboxed: HashMap<u32, u32>,
         input_block: bool,
         fail_input_block: bool,
     }
@@ -821,6 +840,14 @@ mod tests {
         }
         fn remove_reader(&mut self, pid: u32) -> Result<()> {
             self.readers.remove(&pid);
+            Ok(())
+        }
+        fn add_sandboxed(&mut self, pid: u32, domain: u32) -> Result<()> {
+            self.sandboxed.insert(pid, domain);
+            Ok(())
+        }
+        fn remove_sandboxed(&mut self, pid: u32) -> Result<()> {
+            self.sandboxed.remove(&pid);
             Ok(())
         }
         fn allow_reader_file(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
@@ -1081,6 +1108,10 @@ mod tests {
         d.register(j, 51, &alice, 1000, vec!["ac".into()], None)
             .unwrap();
         assert_eq!(d.map.entries.get(&51), Some(&t.domain));
+        // Sandboxed (milestone 9, part B) before it runs; the game isn't.
+        d.mark_sandboxed(&j, 51).unwrap();
+        assert_eq!(d.map.sandboxed.get(&51), Some(&t.domain));
+        assert!(!d.map.sandboxed.contains_key(&50));
 
         // The anti-cheat, asking about "my session", finds the game's.
         let ac = Peer {
@@ -1099,6 +1130,7 @@ mod tests {
         // Its exit unprotects it and leaves the game alone.
         assert_eq!(d.child_exited(51, EXITED_0), Some(t.session));
         assert_eq!(d.map.entries.len(), 1);
+        assert!(d.map.sandboxed.is_empty());
         assert!(d.status(&alice, Some(t.session)).unwrap().0);
 
         // Once the game is gone nobody joins.

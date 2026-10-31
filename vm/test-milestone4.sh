@@ -207,7 +207,8 @@ sudo FAIRPLAYD_SOCKET="$SOCK" XDG_DATA_HOME="$T/xdg-root" "$CTL" launch --run-as
   "$T/vendor/cheatsim" attack --pid "$GPID" --addr "$ADDR" >"$T/member.out" 2>&1
 wait_for "$T/member.out" 'paths leaked'
 grep -E 'LEAKED|BLOCKED|paths' "$T/member.out" | indent
-check "3/3 read by the manifest's anti_cheat reader" grep -q '^3/3 paths leaked' "$T/member.out"
+check "the manifest's anti_cheat reader reads the game (process_vm_readv, /proc/<pid>/mem; ptrace is off in its sandbox)" \
+  sh -c "grep -q '^LEAKED  process_vm_readv' '$T/member.out' && grep -q '^LEAKED  /proc/<pid>/mem' '$T/member.out'"
 sudo FAIRPLAYD_SOCKET="$SOCK" XDG_DATA_HOME="$T/xdg-root" "$CTL" launch --no-stdio --run-as 0 --join "$SESSION" -- \
   "$CHEATSIM" attack --pid "$GPID" --addr "$ADDR" >"$T/unnamed.out" 2>/dev/null
 check "a program the manifest doesn't name can't join (forbidden)" \

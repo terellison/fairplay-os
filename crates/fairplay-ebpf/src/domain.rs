@@ -12,7 +12,7 @@ use core::ptr::addr_of;
 use fairplay_common::{Hook, Violation, EXE_NAME_LEN};
 
 use crate::{
-    maps::{PROTECTED, READERS, VIOLATIONS},
+    maps::{PROTECTED, READERS, SANDBOXED, VIOLATIONS},
     vmlinux::{
         bpf_map, bpf_prog, bpf_prog_aux, dentry, file, inode, kuid_t, linux_binprm, mm_struct,
         path, qstr, super_block, task_struct, vm_area_struct,
@@ -32,6 +32,21 @@ pub const EPERM: i32 = 1;
 pub fn denied_caller(target: u32) -> Option<u32> {
     let domain = *unsafe { PROTECTED.get(&target) }?;
     denied_caller_in(target, domain)
+}
+
+/// `(caller, domain)` if the current task is sandboxed (milestone 9, part
+/// B: the vendor's anti-cheat or something it started).
+#[inline(always)]
+pub fn sandboxed() -> Option<(u32, u32)> {
+    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let domain = *unsafe { SANDBOXED.get(&caller) }?;
+    Some((caller, domain))
+}
+
+/// Is `tgid` a sandboxed process of `domain`?
+#[inline(always)]
+pub fn sandboxed_in(tgid: u32, domain: u32) -> bool {
+    unsafe { SANDBOXED.get(&tgid) }.is_some_and(|&d| d == domain)
 }
 
 /// [`denied_caller`] for a target already known to be in `domain` (see
@@ -192,4 +207,34 @@ fn kernel_str(s: *const u8, out: &mut [u8; EXE_NAME_LEN]) {
             s as *const c_void,
         );
     }
+}
+
+/// The first 15 bytes of a dentry's name, NUL-padded (enough to compare
+/// against `/proc` entry names and to parse a pid).
+#[inline(always)]
+pub fn short_name(d: *const dentry) -> Result<[u8; 16], i64> {
+    let mut out = [0u8; 16];
+    unsafe {
+        let name: *const u8 = bpf_probe_read_kernel(addr_of!((*dentry_name(d)).name))?;
+        bpf_probe_read_kernel_str(out.as_mut_ptr() as *mut c_void, 15, name as *const c_void);
+    }
+    Ok(out)
+}
+
+/// Is `d` on a procfs (`PROC_SUPER_MAGIC`)?
+#[inline(always)]
+pub fn on_procfs(d: *const dentry) -> Result<bool, i64> {
+    const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+    unsafe {
+        let sb: *const super_block = bpf_probe_read_kernel(dentry_sb(d))?;
+        let magic = bpf_probe_read_kernel(sb_magic(sb))? as u64;
+        Ok(magic == PROC_SUPER_MAGIC)
+    }
+}
+
+/// `name` (NUL-padded) equals `want` exactly.
+#[inline(always)]
+pub fn name_is(name: &[u8; 16], want: &[u8]) -> bool {
+    let n = want.len();
+    n < 16 && name[n] == 0 && name[..n] == *want
 }

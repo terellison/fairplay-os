@@ -12,7 +12,12 @@
 //! filed under the caller's own session. That keeps the anti-cheat to the
 //! game it was started for. Kernel checks made on their own account
 //! (`PTRACE_MODE_NOAUDIT`, e.g. which `/proc/<pid>/stat` fields `ps` may
-//! see) are denied quietly.
+//! see) are denied quietly. So are a *sandboxed* caller's look-only checks
+//! (no `PTRACE_MODE_ATTACH`): its `/proc` is mounted `hidepid=invisible`,
+//! which asks this hook about every process a directory scan lists, and
+//! one violation per process per scan would flood the stream. Attempts to
+//! act on a process (ptrace attach, `process_vm_*`, `/proc/<pid>/mem`) are
+//! always recorded.
 //!
 //! While fairplayd protects itself (milestone 6, see `self_protect`), it is
 //! protected too, from every other process: nothing may trace it or read
@@ -24,10 +29,10 @@ use aya_ebpf::{
     programs::LsmContext,
 };
 use core::ptr::addr_of;
-use fairplay_common::{Hook, PTRACE_MODE_NOAUDIT};
+use fairplay_common::{Hook, PTRACE_MODE_ATTACH, PTRACE_MODE_NOAUDIT};
 
 use crate::{
-    domain::{denied_caller_in, record_in, record_violation, task_domain, Name, EPERM},
+    domain::{denied_caller_in, record_in, record_violation, sandboxed, task_domain, Name, EPERM},
     maps::PROTECTED,
     self_protect::outsider,
     vmlinux::task_struct,
@@ -74,8 +79,17 @@ fn should_deny(ctx: &LsmContext) -> Result<bool, i64> {
     let Some(caller) = denied_caller_in(target, domain) else {
         return Ok(false);
     };
-    record_violation(caller, target, Hook::PtraceAccess, mode);
+    if !quiet(mode) {
+        record_violation(caller, target, Hook::PtraceAccess, mode);
+    }
     Ok(true)
+}
+
+/// Deny without recording: the kernel checking on its own account, or a
+/// sandboxed caller only looking (see the module docs).
+#[inline(always)]
+fn quiet(mode: u32) -> bool {
+    mode & PTRACE_MODE_NOAUDIT != 0 || (mode & PTRACE_MODE_ATTACH == 0 && sandboxed().is_some())
 }
 
 /// The target is not protected: deny (and record) only if the caller is,
@@ -89,7 +103,7 @@ fn outbound(child: *const task_struct, mode: u32) -> Result<bool, i64> {
     if target == caller {
         return Ok(false);
     }
-    if mode & PTRACE_MODE_NOAUDIT == 0 {
+    if !quiet(mode) {
         record_in(
             caller,
             target,

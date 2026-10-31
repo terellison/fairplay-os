@@ -17,6 +17,16 @@ const FIELDS: &[(&str, &str, &str, &str)] = &[
     ("mm_exe_file", "mm_struct", "exe_file", "*mut file"),
     ("file_path", "file", "f_path", "path"),
     ("dentry_name", "dentry", "d_name", "qstr"),
+    // The anti-cheat's sandbox (hooks/file_open.rs, hooks/inode_follow_link.rs).
+    ("file_mode", "file", "f_mode", "u32"),
+    ("dentry_parent", "dentry", "d_parent", "*mut dentry"),
+    ("dentry_sb", "dentry", "d_sb", "*mut super_block"),
+    (
+        "sb_magic",
+        "super_block",
+        "s_magic",
+        "::aya_ebpf::cty::c_ulong",
+    ),
     // Executable-mapping allowlist (hooks/mmap_file.rs, hooks/file_mprotect.rs).
     ("file_inode", "file", "f_inode", "*mut inode"),
     ("vma_file", "vm_area_struct", "vm_file", "*mut file"),
