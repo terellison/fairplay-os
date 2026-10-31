@@ -34,6 +34,11 @@ pub fn lookup_user(uid: u32) -> Option<(u32, Vec<u32>)> {
     ))
 }
 
+/// `uid`'s home directory, from the user database.
+pub fn home_dir(uid: u32) -> Option<std::path::PathBuf> {
+    Some(User::from_uid(Uid::from_raw(uid)).ok()??.dir)
+}
+
 pub fn group_gid(name: &str) -> Option<u32> {
     Group::from_name(name).ok()?.map(|g| g.gid.as_raw())
 }

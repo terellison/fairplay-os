@@ -99,6 +99,25 @@ pub enum Name {
 /// and any [`Name`].
 #[inline(always)]
 pub fn record(caller: u32, target: u32, hook: Hook, mode: u32, flags: u32, name: Name) {
+    // Lets fairplayd file an attempt on any process the game started
+    // under the game's session. 0 if the target is no longer in the map.
+    let domain = unsafe { PROTECTED.get(&target) }.copied().unwrap_or(0);
+    record_in(caller, target, domain, hook, mode, flags, name);
+}
+
+/// [`record`] filed under `domain`, which need not be the target's: a
+/// protected caller reaching outside its domain (milestone 9) is filed
+/// under its own.
+#[inline(always)]
+pub fn record_in(
+    caller: u32,
+    target: u32,
+    domain: u32,
+    hook: Hook,
+    mode: u32,
+    flags: u32,
+    name: Name,
+) {
     let Some(mut entry) = VIOLATIONS.reserve::<Violation>(0) else {
         return;
     };
@@ -108,9 +127,7 @@ pub fn record(caller: u32, target: u32, hook: Hook, mode: u32, flags: u32, name:
     unsafe {
         (*v).caller = caller;
         (*v).target = target;
-        // Lets fairplayd file an attempt on any process the game started
-        // under the game's session. 0 if the target is no longer in the map.
-        (*v).domain = PROTECTED.get(&target).copied().unwrap_or(0);
+        (*v).domain = domain;
         (*v).hook = hook as u32;
         (*v).mode = mode;
         (*v).flags = flags;

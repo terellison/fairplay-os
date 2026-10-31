@@ -5,14 +5,15 @@
 
 use std::{
     collections::BTreeMap,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
 use fairplay_api::{
-    ApiError, ErrorCode, Outcome, ProcessInfo, ProcessState, Reply, SessionId, SessionInfo,
-    ViolationEvent,
+    ApiError, ErrorCode, Outcome, ProcessInfo, ProcessState, Reply, SandboxInfo, SessionId,
+    SessionInfo, ViolationEvent,
 };
 use fairplay_common::{ExecAllow, ExecKey, Hook, Violation};
 
@@ -153,6 +154,8 @@ struct Proc {
     pid: u32,
     argv: Vec<String>,
     state: ProcessState,
+    /// The anti-cheat's sandbox (milestone 9, part B).
+    sandbox: Option<Box<SandboxInfo>>,
 }
 
 impl Proc {
@@ -165,6 +168,7 @@ impl Proc {
             pid: self.pid,
             argv: self.argv.clone(),
             state: self.state,
+            sandbox: self.sandbox.clone(),
         }
     }
 }
@@ -181,6 +185,8 @@ struct Session {
     violations: u64,
     /// The manifest the game was launched from (milestone 9).
     manifest: Option<Arc<SessionManifest>>,
+    /// The game's install directory, which its anti-cheat may see.
+    game_dir: Option<PathBuf>,
     /// Asked for `block_virtual_input` (milestone 7).
     block_input: bool,
 }
@@ -330,6 +336,37 @@ impl<M: ProtectedMap> Daemon<M> {
         })
     }
 
+    /// The game's install directory, for its anti-cheat's sandbox. The same
+    /// checks as [`Daemon::join_manifest`].
+    pub fn game_dir(&self, peer: &Peer, id: SessionId) -> Result<PathBuf, ApiError> {
+        self.joinable(peer, id)?.game_dir.clone().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("session {id} has no install directory"),
+            )
+        })
+    }
+
+    /// Records a new session's install directory (after
+    /// [`Daemon::register`]).
+    pub fn set_game_dir(&mut self, id: SessionId, dir: &Path) {
+        if let Some(s) = self.sessions.get_mut(&id) {
+            s.game_dir = Some(dir.to_owned());
+        }
+    }
+
+    /// Records that a process launched into `id` runs sandboxed (after
+    /// [`Daemon::register`]).
+    pub fn set_sandbox(&mut self, id: SessionId, pid: u32, info: SandboxInfo) {
+        if let Some(p) = self
+            .sessions
+            .get_mut(&id)
+            .and_then(|s| s.procs_mut().find(|p| p.pid == pid && p.running()))
+        {
+            p.sandbox = Some(Box::new(info));
+        }
+    }
+
     /// Only the session's launcher (or root) may add to its domain, and
     /// only while its game runs.
     fn joinable(&self, peer: &Peer, id: SessionId) -> Result<&Session, ApiError> {
@@ -421,6 +458,7 @@ impl<M: ProtectedMap> Daemon<M> {
             pid,
             argv,
             state: ProcessState::Running,
+            sandbox: None,
         };
         if t.join && !self.sessions.contains_key(&t.session) {
             anyhow::bail!("session {} vanished", t.session);
@@ -453,6 +491,7 @@ impl<M: ProtectedMap> Daemon<M> {
                     started_at: now(),
                     violations: 0,
                     manifest,
+                    game_dir: None,
                     block_input: t.block_input,
                 },
             );

@@ -262,6 +262,24 @@ pub struct ProcessInfo {
     /// `"state":"exited","code":0,"signal":null`.
     #[serde(flatten)]
     pub state: ProcessState,
+    /// Set for the vendor's anti-cheat (a `join`), which runs in a sandbox
+    /// (milestone 9, part B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Box<SandboxInfo>>,
+}
+
+/// What a sandboxed process can see of the file system. Everything else
+/// (the home directory, other users' files, display and D-Bus sockets) is
+/// not in its mount namespace at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxInfo {
+    /// Its own read-write data directory,
+    /// `$XDG_DATA_HOME/fairplay/<signer fingerprint>/`. The only place it
+    /// can keep anything across runs.
+    pub data_dir: String,
+    /// Directories it sees read-only besides the system ones: its own
+    /// install directory and the game's.
+    pub read_only: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -553,6 +571,7 @@ mod tests {
                 code: Some(0),
                 signal: None,
             },
+            sandbox: None,
         };
         let text = String::from_utf8(encode(&game)).unwrap();
         assert!(

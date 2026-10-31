@@ -29,6 +29,7 @@ mod exec_allow;
 mod host;
 mod input;
 mod launch;
+mod sandbox;
 mod self_protect;
 mod server;
 mod state;
@@ -369,6 +370,7 @@ fn main() -> Result<()> {
             events: events.clone(),
             launcher_gid,
             system_devs,
+            socket: args.socket.clone(),
         };
         tokio::spawn(read_violations(ring, daemon, events));
         let deadline = async {

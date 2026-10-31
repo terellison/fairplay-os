@@ -6,7 +6,9 @@
 //!    make async-signal-safe system calls (no allocation, no locks).
 //! 2. [`fork_paused`] forks. The child blocks reading a pipe.
 //! 3. The caller puts the child's PID into PROTECTED ([`Paused::pid`]).
-//! 4. [`Paused::release`] writes one byte; the child drops to the caller's
+//! 4. [`Paused::release`] writes one byte; for the vendor's anti-cheat the
+//!    child first builds its sandbox (a mount namespace, see `sandbox`),
+//!    then it drops to the caller's
 //!    identity (groups, then gid, then uid), enters the working directory,
 //!    and execs the program through the file descriptor fairplayd hashed it
 //!    from (`fexecve`, milestone 9), never by path. If the caller drops a `Paused` without releasing it,
@@ -23,7 +25,7 @@ use std::{
 
 use fairplay_api::{ApiError, ErrorCode};
 
-use crate::state::Identity;
+use crate::{sandbox, state::Identity};
 
 /// Upper bound on argv and env entries each.
 const MAX_ARGS: usize = 4096;
@@ -112,12 +114,14 @@ const STAGES: &[&str] = &[
 
 /// Forks a child that will exec `program` (an open file, checked against
 /// the manifest) with `prep`'s argv and environment, running as `id`, with
-/// `stdio` (or /dev/null) as fds 0-2. The child does nothing until released.
+/// `stdio` (or /dev/null) as fds 0-2, inside `sandbox` if given. The child
+/// does nothing until released.
 pub fn fork_paused(
     prep: &Prepared,
     program: &File,
     id: &Identity,
     stdio: Option<[OwnedFd; 3]>,
+    sandbox: Option<&sandbox::Prepared>,
 ) -> Result<Paused, ApiError> {
     let internal =
         |what: &str, e: std::io::Error| ApiError::new(ErrorCode::Internal, format!("{what}: {e}"));
@@ -153,6 +157,7 @@ pub fn fork_paused(
         program: program.as_raw_fd(),
         argv: &argv,
         envp: &envp,
+        sandbox,
     };
     // SAFETY: the child runs only child_main, which makes async-signal-safe
     // system calls on data prepared above and never returns.
@@ -206,7 +211,8 @@ impl Drop for Paused {
 
 impl Released {
     /// Waits until the child has exec'd (`Ok(pid)`) or failed trying.
-    pub fn wait_exec(mut self) -> Result<u32, ApiError> {
+    /// `sandbox` is the one it was forked with, to name a failing step.
+    pub fn wait_exec(mut self, sandbox: Option<&sandbox::Prepared>) -> Result<u32, ApiError> {
         let mut buf = [0u8; 8];
         let mut got = 0;
         while got < buf.len() {
@@ -225,15 +231,16 @@ impl Released {
         if got == 0 {
             return Ok(self.pid);
         }
-        let stage = u32::from_ne_bytes(buf[..4].try_into().unwrap()) as usize;
+        let stage = u32::from_ne_bytes(buf[..4].try_into().unwrap());
         let errno = i32::from_ne_bytes(buf[4..].try_into().unwrap());
+        let name = STAGES
+            .get(stage as usize)
+            .map(|s| s.to_string())
+            .or_else(|| sandbox.and_then(|s| s.stage_name(stage)))
+            .unwrap_or_else(|| "?".into());
         Err(ApiError::new(
             ErrorCode::LaunchFailed,
-            format!(
-                "{}: {}",
-                STAGES.get(stage).unwrap_or(&"?"),
-                std::io::Error::from_raw_os_error(errno)
-            ),
+            format!("{name}: {}", std::io::Error::from_raw_os_error(errno)),
         ))
     }
 }
@@ -261,6 +268,8 @@ struct ChildArgs<'a> {
     program: RawFd,
     argv: &'a [*const libc::c_char],
     envp: &'a [*const libc::c_char],
+    /// Built (as root) after the release and before anything else.
+    sandbox: Option<&'a sandbox::Prepared>,
 }
 
 /// Runs in the forked child. Async-signal-safe calls only.
@@ -284,6 +293,14 @@ unsafe fn child_main(a: &ChildArgs) -> ! {
                 continue;
             }
             libc::_exit(126);
+        }
+
+        // The vendor's anti-cheat: its own mount namespace and root, while
+        // we still have the privilege to mount.
+        if let Some(sb) = a.sandbox {
+            if let Err(stage) = sb.enter() {
+                fail(a, stage);
+            }
         }
 
         // Our own session: not in the daemon's terminal's process group.
@@ -444,7 +461,7 @@ mod tests {
             std::env::temp_dir().join(format!("fairplayd-unreleased-{}", std::process::id()));
         let prep = prepare(&s(&["touch", marker.to_str().unwrap()]), &[], "/").unwrap();
         let touch = File::open("/usr/bin/touch").unwrap();
-        let paused = fork_paused(&prep, &touch, &me(), None).unwrap();
+        let paused = fork_paused(&prep, &touch, &me(), None, None).unwrap();
         let pid = paused.pid();
         drop(paused);
         assert!(!matches!(
@@ -460,9 +477,9 @@ mod tests {
     fn released_child_execs_or_reports_why_not() {
         let prep = prepare(&s(&["true"]), &[], "/").unwrap();
         let program = File::open("/bin/true").unwrap();
-        let paused = fork_paused(&prep, &program, &me(), None).unwrap();
+        let paused = fork_paused(&prep, &program, &me(), None, None).unwrap();
         let pid = paused.pid();
-        let result = paused.release().unwrap().wait_exec();
+        let result = paused.release().unwrap().wait_exec(None);
         let status = reap(pid);
         // SAFETY: no preconditions.
         if unsafe { libc::geteuid() } == 0 {
@@ -487,9 +504,9 @@ mod tests {
         let prep = prepare(&s(&["game"]), &[], "/").unwrap();
         // Not executable.
         let program = File::open("/etc/hostname").unwrap();
-        let paused = fork_paused(&prep, &program, &me(), None).unwrap();
+        let paused = fork_paused(&prep, &program, &me(), None, None).unwrap();
         let pid = paused.pid();
-        let e = paused.release().unwrap().wait_exec().unwrap_err();
+        let e = paused.release().unwrap().wait_exec(None).unwrap_err();
         reap(pid);
         assert!(e.message.starts_with("execve:"), "{}", e.message);
     }

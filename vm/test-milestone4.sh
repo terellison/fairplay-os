@@ -63,7 +63,7 @@ cleanup() {
   fi
   [ -n "$CREATED_GROUP" ] && sudo groupdel "$GROUP"
   sudo rm -f "$SOCK"
-  rm -rf "$T"
+  sudo rm -rf "$T"
 }
 trap cleanup EXIT
 
@@ -77,7 +77,7 @@ in_protected() {
 # Run a command as you plus the launcher group.
 as_launcher() {
   sudo setpriv --reuid="$ME_UID" --regid="$ME_GID" --groups="$ME_GROUPS,$LAUNCHER_GID" -- \
-    env HOME="$HOME" PATH="$PATH" FAIRPLAYD_SOCKET="$SOCK" "$@"
+    env HOME="$HOME" PATH="$PATH" FAIRPLAYD_SOCKET="$SOCK" XDG_DATA_HOME="$T/xdg" "$@"
 }
 
 # Wait up to ~10s for a file to match a pattern.
@@ -141,7 +141,9 @@ check_not "the game doesn't keep the launcher group" \
 check "the game has no_new_privs set" grep -q '^NoNewPrivs:[[:space:]]*1' "/proc/$GPID/status"
 
 step "mock vendor joins the game's session as its anti_cheat reader and subscribes"
-cat >"$T/vendor.py" <<'EOF'
+# In the vendor's install directory: the anti-cheat is sandboxed (milestone 9,
+# part B) and sees only that, the game's, its data directory and the socket.
+cat >"$T/vendor/vendor.py" <<'EOF'
 # A stand-in anti-cheat client: plain sockets and JSON, no fairplay code.
 import json, os, socket, sys
 want = int(sys.argv[1])
@@ -159,7 +161,8 @@ while seen < want:
     print("event", json.dumps(msg), flush=True)
     seen += "violation" in msg.get("event", {})
 EOF
-as_launcher "$CTL" launch --join "$SESSION" -- python3 -I "$T/vendor.py" 3 >"$T/vendor.out" 2>&1
+as_launcher "$CTL" launch --join "$SESSION" --install-dir "$T/vendor" -- \
+  python3 -I "$T/vendor/vendor.py" 3 >"$T/vendor.out" 2>&1
 wait_for "$T/vendor.out" '^subscribe' || { bad "vendor subscribed"; indent <"$T/vendor.out"; }
 VPID="$(grep '^{' "$T/vendor.out" | jq -r '.ok.launched.pid')"
 VSTATUS="$(sed -n 's/^status //p' "$T/vendor.out")"
@@ -200,12 +203,12 @@ check "another user can't see the session (not_found)" \
   jqt '.error.code=="not_found"' "$T/nobody.out"
 
 step "the anti_cheat reader may read the game (the anti-cheat's privilege)"
-sudo FAIRPLAYD_SOCKET="$SOCK" "$CTL" launch --run-as 0 --join "$SESSION" -- \
+sudo FAIRPLAYD_SOCKET="$SOCK" XDG_DATA_HOME="$T/xdg-root" "$CTL" launch --run-as 0 --join "$SESSION" -- \
   "$T/vendor/cheatsim" attack --pid "$GPID" --addr "$ADDR" >"$T/member.out" 2>&1
 wait_for "$T/member.out" 'paths leaked'
 grep -E 'LEAKED|BLOCKED|paths' "$T/member.out" | indent
 check "3/3 read by the manifest's anti_cheat reader" grep -q '^3/3 paths leaked' "$T/member.out"
-sudo FAIRPLAYD_SOCKET="$SOCK" "$CTL" launch --no-stdio --run-as 0 --join "$SESSION" -- \
+sudo FAIRPLAYD_SOCKET="$SOCK" XDG_DATA_HOME="$T/xdg-root" "$CTL" launch --no-stdio --run-as 0 --join "$SESSION" -- \
   "$CHEATSIM" attack --pid "$GPID" --addr "$ADDR" >"$T/unnamed.out" 2>/dev/null
 check "a program the manifest doesn't name can't join (forbidden)" \
   jqt '.error.code=="forbidden"' "$T/unnamed.out"

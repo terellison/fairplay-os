@@ -76,6 +76,13 @@ enum Cmd {
         /// EXEC-BLOCKED and how it ended; `spawn <path> [args...]` does the
         /// same without waiting and prints SPAWNED <pid> (milestone 9: the
         /// game starting a helper, or a second process of its own).
+        ///
+        /// Milestone 9, part B, for a mock anti-cheat started this way:
+        /// `attack <pid> <addr>` runs the attacks in this very process;
+        /// `forkattack <pid> <addr>` from a forked child that doesn't exec;
+        /// `become <path> [args...]` execs in place (no fork); `read
+        /// <path>`, `ls <dir>` and `write <path> <text>` try the file
+        /// system. Each prints an EXEC- line when done.
         #[arg(long)]
         dlopen_stdin: bool,
     },
@@ -222,6 +229,35 @@ fn game(depth: u32, dlopen: &[String], dlopen_stdin: bool) -> ExitCode {
                 run(cmd, true);
             } else if let Some(cmd) = line.strip_prefix("spawn ") {
                 run(cmd, false);
+            } else if let Some(rest) = line.strip_prefix("attack ") {
+                in_process_attack(rest, false);
+            } else if let Some(rest) = line.strip_prefix("forkattack ") {
+                in_process_attack(rest, true);
+            } else if let Some(cmd) = line.strip_prefix("become ") {
+                exec_in_place(cmd);
+            } else if let Some(path) = line.strip_prefix("read ") {
+                match std::fs::read_to_string(path) {
+                    Ok(t) => println!("EXEC-READ {path}: {}", t.replace('\0', " ").trim()),
+                    Err(e) => println!("EXEC-ERR read {path}: {e}"),
+                }
+            } else if let Some(dir) = line.strip_prefix("ls ") {
+                match std::fs::read_dir(dir) {
+                    Ok(entries) => {
+                        let mut names: Vec<String> = entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect();
+                        names.sort();
+                        println!("EXEC-LS {dir}: [{}]", names.join(" "));
+                    }
+                    Err(e) => println!("EXEC-ERR ls {dir}: {e}"),
+                }
+            } else if let Some(rest) = line.strip_prefix("write ") {
+                let (path, text) = rest.split_once(' ').unwrap_or((rest, ""));
+                match std::fs::write(path, text) {
+                    Ok(()) => println!("EXEC-WROTE {path}"),
+                    Err(e) => println!("EXEC-ERR write {path}: {e}"),
+                }
             } else if !line.is_empty() {
                 load(&line);
             }
@@ -265,6 +301,60 @@ fn load(path: &str) {
         let f: extern "C" fn() -> libc::c_int = unsafe { std::mem::transmute(sym) };
         println!("LOADED {path} marker={}", f());
     }
+}
+
+/// `<pid> <addr>`: runs every attack from this process, or with `fork`
+/// from a child that doesn't exec (milestone 9: reader status is not
+/// inherited), then prints `EXEC-DONE attack`.
+fn in_process_attack(args: &str, fork_first: bool) {
+    let mut w = args.split_whitespace();
+    let (Some(Ok(pid)), Some(Ok(addr))) =
+        (w.next().map(str::parse::<i32>), w.next().map(parse_hex))
+    else {
+        return println!("EXEC-ERR attack: want <pid> <addr>");
+    };
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    if !fork_first {
+        attack(Pid::from_raw(pid), addr);
+        return println!("EXEC-DONE attack");
+    }
+    // SAFETY: single-threaded; the child runs the attacks and exits.
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => {
+            println!("forked child pid={}", std::process::id());
+            attack(Pid::from_raw(pid), addr);
+            let _ = std::io::stdout().flush();
+            unsafe { libc::_exit(0) };
+        }
+        Ok(ForkResult::Parent { child }) => {
+            let _ = waitpid(child, None);
+            println!("EXEC-DONE forkattack");
+        }
+        Err(e) => println!("EXEC-ERR forkattack: fork: {e}"),
+    }
+}
+
+/// Execs `cmd` (split on whitespace) in place of this process: the same
+/// pid, a different program. Prints only if that fails.
+fn exec_in_place(cmd: &str) {
+    let Ok(words) = cmd
+        .split_whitespace()
+        .map(std::ffi::CString::new)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return println!("EXEC-ERR become: NUL in command");
+    };
+    let Some(c) = words.first() else {
+        return println!("EXEC-ERR become: empty command");
+    };
+    let mut argv: Vec<*const libc::c_char> = words.iter().map(|w| w.as_ptr()).collect();
+    argv.push(std::ptr::null());
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    // SAFETY: argv is NULL-terminated and outlives the call.
+    unsafe { libc::execv(c.as_ptr(), argv.as_ptr()) };
+    println!("EXEC-ERR become: {}", std::io::Error::last_os_error());
 }
 
 /// Forks a child that execs `cmd` (a path, then arguments, split on

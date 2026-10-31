@@ -125,9 +125,12 @@ pub const VIOLATION_ALLOWLISTED: u32 = 2;
 pub struct Violation {
     /// tgid of the process that tried.
     pub caller: u32,
-    /// tgid of the protected process it targeted (0 for non-process targets).
+    /// tgid of the protected process it targeted (0 for non-process
+    /// targets). For a protected caller reaching outside its domain
+    /// (milestone 9), the unprotected process it tried to reach.
     pub target: u32,
     /// The target's protection domain, or 0 if it was no longer in the map.
+    /// For a protected caller reaching outside its domain, the caller's.
     pub domain: u32,
     /// A [`Hook`] value.
     pub hook: u32,
