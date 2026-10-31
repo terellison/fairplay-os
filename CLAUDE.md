@@ -43,7 +43,8 @@ Known VM limits:
 7. Input: report virtual input devices and who created them (don't block: Steam Input and
    accessibility tools use uinput).
 8. Executable-mapping allowlist (also covers overlays and Wine DLL injection).
-9. Vendor anti-cheat: only a vendor-signed binary may join; it runs sandboxed to the game.
+9. Game manifest + readers: launch only what a signed manifest names; only readers it names
+   (the anti-cheat, `wineserver`) may read protected members; the anti-cheat runs sandboxed.
 10. Attestation, including the mode (blocked on TPM, see above).
 11. Player-mode image: signed, read-only, lockdown, Wayland only, atomic rollback.
 12. Proton end to end on x86 hardware.

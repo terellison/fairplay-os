@@ -31,7 +31,7 @@ the parts that need a real gaming PC come later.
 | 6 | fairplayd protects itself from root | Done (opt-in: `--self-protect`) | `./vm/test-milestone6.sh` |
 | 7 | Report fake input devices and who made them | Not started | |
 | 8 | Only approved code may load into the game | Done | `./vm/test-milestone8.sh` |
-| 9 | Vendor anti-cheat: signed and sandboxed | Not started | |
+| 9 | Game manifest: only named readers (the anti-cheat) may read the game | Not started | |
 | 10 | Attestation | Blocked: the VM has no TPM | |
 | 11 | Player-mode system image | Needs an x86 PC | |
 | 12 | A Windows game under **Proton**, protected | Needs an x86 PC | |
@@ -606,9 +606,15 @@ deliberate change to both files.
   can the PID be reused.
 - **no_new_privs**: a per-process flag that stops it, and anything it starts,
   from gaining privileges (e.g. through setuid programs).
-- **Protection domain**: the set of processes allowed to read each other: a
-  game, every process it starts, and its anti-cheat. Each launch gets its
-  own.
+- **Protection domain**: a game, every process it starts, and its
+  anti-cheat. Each launch gets its own. All of them are protected from
+  outsiders, but only the domain's **readers** may read the game.
+- **Reader**: a process allowed to read a protected game's memory: the
+  vendor's anti-cheat, or a helper like Proton's `wineserver`. The game's
+  manifest names them; being started by the game isn't enough.
+- **Game manifest**: a file signed by the game's publisher or anti-cheat
+  vendor that says what may be launched, which anti-cheat and helpers are
+  readers, and which Proton builds are accepted.
 - **Protection degraded**: `session_status`'s way of saying some process the
   game started couldn't be added to its domain (the kernel's list was
   full), so it runs unprotected.
