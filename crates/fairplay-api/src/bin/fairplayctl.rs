@@ -48,6 +48,10 @@ enum Cmd {
         /// Start inside this session's protection domain (e.g. the anti-cheat).
         #[arg(long)]
         join: Option<SessionId>,
+        /// Directory whose code files the program may map executable
+        /// [default: the program's directory]. Relative to the current one.
+        #[arg(long)]
+        install_dir: Option<PathBuf>,
         /// Program and its arguments.
         #[arg(required = true, last = true)]
         command: Vec<String>,
@@ -98,12 +102,13 @@ fn run() -> Result<Option<fairplay_api::ApiError>> {
             no_stdio,
             run_as,
             join,
+            install_dir,
             command,
         } => {
             if !no_stdio {
                 fds = vec![0, 1, 2];
             }
-            launch_request(command, run_as, join)?
+            launch_request(command, run_as, join, install_dir)?
         }
         Cmd::Status { session } => Request::SessionStatus { session },
         Cmd::Violations { session, count } => {
@@ -149,8 +154,10 @@ fn launch_request(
     command: Vec<String>,
     run_as: Option<u32>,
     join: Option<SessionId>,
+    install_dir: Option<PathBuf>,
 ) -> Result<Request> {
     let cwd = std::env::current_dir().context("current directory")?;
+    let install_dir = install_dir.map(|d| utf8(&cwd.join(d))).transpose()?;
     let program = resolve(&command[0], &cwd)?;
     let env = std::env::vars_os()
         .filter_map(|(k, v)| {
@@ -167,6 +174,7 @@ fn launch_request(
         cwd: utf8(&cwd)?,
         run_as,
         join,
+        install_dir,
     })
 }
 

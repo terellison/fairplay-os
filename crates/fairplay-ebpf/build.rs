@@ -17,6 +17,15 @@ const FIELDS: &[(&str, &str, &str, &str)] = &[
     ("mm_exe_file", "mm_struct", "exe_file", "*mut file"),
     ("file_path", "file", "f_path", "path"),
     ("dentry_name", "dentry", "d_name", "qstr"),
+    // Executable-mapping allowlist (hooks/mmap_file.rs, hooks/file_mprotect.rs).
+    ("file_inode", "file", "f_inode", "*mut inode"),
+    ("vma_file", "vm_area_struct", "vm_file", "*mut file"),
+    ("inode_sb", "inode", "i_sb", "*mut super_block"),
+    ("inode_ino", "inode", "i_ino", "u64"),
+    ("inode_mode", "inode", "i_mode", "u16"),
+    ("inode_uid", "inode", "i_uid", "kuid_t"),
+    ("inode_generation", "inode", "i_generation", "u32"),
+    ("sb_dev", "super_block", "s_dev", "u32"),
 ];
 
 fn main() {

@@ -1,16 +1,20 @@
-//! fairplayd (milestones 3 and 4).
+//! fairplayd (milestones 3, 4 and 8).
 //!
 //! Loads the BPF LSM program, owns the PROTECTED map, and serves the design
 //! doc's vendor-facing API on a Unix socket (see the `fairplay-api` crate):
 //! `launch_protected`, `session_status`, `attest`, and a `violations` stream.
 //! Every denied attempt is also printed as a `DENIED` line, as in milestone 3.
+//! It also keeps the executable-mapping allowlist (milestone 8): which files
+//! a protected process may map as code (see `exec_allow`).
 //!
 //!     sudo fairplayd --obj fairplay.o                    # socket API only
 //!     sudo fairplayd --obj fairplay.o --protect <pid>    # milestone 3 style
+//!     sudo fairplayd --obj fairplay.o --overlay /usr/local/lib/overlay.so
 //!
 //! The kernel enforces, fairplayd decides who is protected, and the vendor's
 //! server sets policy. Protection ends when fairplayd exits (fails open).
 
+mod exec_allow;
 mod host;
 mod launch;
 mod server;
@@ -29,7 +33,10 @@ use aya::{
 };
 use clap::Parser;
 use fairplay_api::{ProcessState, ViolationEvent, DEFAULT_LAUNCHER_GROUP, DEFAULT_SOCKET};
-use fairplay_common::{Violation, MAP_PROTECTED, MAP_VIOLATIONS};
+use fairplay_common::{
+    ExecAllow, ExecKey, Violation, FS_SYSTEM, MAP_EXEC_ALLOWED, MAP_EXEC_TRUSTED_FS, MAP_PROTECTED,
+    MAP_VIOLATIONS,
+};
 use tokio::{io::unix::AsyncFd, sync::broadcast};
 
 use crate::state::{c_str, hook_name, Daemon, ProtectedMap, CLI_DOMAIN};
@@ -53,17 +60,34 @@ struct Args {
     /// Process allowed into the --protect processes' domain.
     #[arg(long)]
     allow: Vec<u32>,
+    /// An approved overlay (absolute path of a library): every protected
+    /// process may map it executable. Repeatable. Identified by inode when
+    /// fairplayd starts, so replacing the file un-approves it.
+    #[arg(long)]
+    overlay: Vec<PathBuf>,
 }
 
-/// The kernel's PROTECTED map.
-pub struct BpfMap(HashMap<MapData, u32, u32>);
+/// The kernel's PROTECTED and EXEC_ALLOWED maps.
+pub struct BpfMap {
+    protected: HashMap<MapData, u32, u32>,
+    exec: HashMap<MapData, ExecKey, ExecAllow>,
+}
 
 impl ProtectedMap for BpfMap {
     fn insert(&mut self, pid: u32, domain: u32) -> Result<()> {
-        Ok(self.0.insert(pid, domain, 0)?)
+        Ok(self.protected.insert(pid, domain, 0)?)
     }
     fn remove(&mut self, pid: u32) -> Result<()> {
-        match self.0.remove(&pid) {
+        match self.protected.remove(&pid) {
+            Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+    fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
+        Ok(self.exec.insert(key, value, 0)?)
+    }
+    fn disallow_exec(&mut self, key: ExecKey) -> Result<()> {
+        match self.exec.remove(&key) {
             Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -78,6 +102,8 @@ pub type Shared = Arc<Mutex<Daemon<BpfMap>>>;
 const LSM_PROGRAMS: &[(&str, &str)] = &[
     // (program name, LSM hook), one line per hook.
     ("ptrace_access_check", "ptrace_access_check"),
+    ("mmap_file", "mmap_file"),
+    ("file_mprotect", "file_mprotect"),
 ];
 
 fn main() -> Result<()> {
@@ -97,11 +123,46 @@ fn main() -> Result<()> {
         prog.attach().with_context(|| format!("attaching {name}"))?;
     }
 
-    let mut map = BpfMap(HashMap::try_from(
-        ebpf.take_map(MAP_PROTECTED).context("PROTECTED map")?,
-    )?);
+    // Executable-mapping allowlist (milestone 8). Filled before anything is
+    // protected, so a protected process never sees a half-made allowlist.
+    let mut trusted_fs: HashMap<MapData, u32, u32> = HashMap::try_from(
+        ebpf.take_map(MAP_EXEC_TRUSTED_FS)
+            .context("EXEC_TRUSTED_FS map")?,
+    )?;
+    let trusted = exec_allow::trusted_filesystems()?;
+    for &(dev, kind) in &trusted {
+        trusted_fs.insert(dev, kind, 0)?;
+    }
+    let system_devs: Arc<[u32]> = trusted
+        .iter()
+        .filter(|&&(_, kind)| kind == FS_SYSTEM)
+        .map(|&(dev, _)| dev)
+        .collect();
+    let map = BpfMap {
+        protected: HashMap::try_from(ebpf.take_map(MAP_PROTECTED).context("PROTECTED map")?)?,
+        exec: HashMap::try_from(
+            ebpf.take_map(MAP_EXEC_ALLOWED)
+                .context("EXEC_ALLOWED map")?,
+        )?,
+    };
+    let mut daemon = Daemon::new(map);
+    let mounts = exec_allow::Mounts::read()?;
+    let overlays = args
+        .overlay
+        .iter()
+        .map(|p| exec_allow::overlay_file(p, &mounts))
+        .collect::<Result<Vec<_>>>()?;
+    daemon
+        .allow_overlays(&overlays)
+        .map_err(|e| anyhow::anyhow!("approving overlays: {e}"))?;
+    eprintln!(
+        "fairplayd: executable mappings: {} system filesystem(s), {} approved overlay(s) {:?}",
+        system_devs.len(),
+        overlays.len(),
+        args.overlay
+    );
     for &pid in args.protect.iter().chain(&args.allow) {
-        map.insert(pid, CLI_DOMAIN)?;
+        daemon.map_mut().insert(pid, CLI_DOMAIN)?;
     }
     if !args.protect.is_empty() {
         eprintln!(
@@ -123,7 +184,7 @@ fn main() -> Result<()> {
         ),
     }
 
-    let daemon: Shared = Arc::new(Mutex::new(Daemon::new(map)));
+    let daemon: Shared = Arc::new(Mutex::new(daemon));
     let (events, _) = broadcast::channel::<ViolationEvent>(1024);
 
     // Reaping is plain blocking waitid, so it gets its own thread.
@@ -147,6 +208,7 @@ fn main() -> Result<()> {
             daemon: daemon.clone(),
             events: events.clone(),
             launcher_gid,
+            system_devs,
         };
         tokio::spawn(read_violations(ring, daemon, events));
         tokio::select! {
@@ -196,8 +258,15 @@ async fn read_violations(
             // SAFETY: the BPF side writes exactly one Violation per entry.
             let v: Violation = unsafe { std::ptr::read_unaligned(item.as_ptr().cast()) };
             drop(item);
-            let exe_path = std::fs::read_link(format!("/proc/{}/exe", v.caller))
-                .ok()
+            // Not for a protected caller (e.g. a game whose own mapping was
+            // denied): reading its /proc/<pid>/exe is itself a ptrace
+            // access check, which the kernel would deny and log as a
+            // violation by fairplayd. The kernel's `exe` names it anyway.
+            let caller_protected =
+                v.caller == v.target || daemon.lock().unwrap().session_of_pid(v.caller).is_some();
+            let exe_path = (!caller_protected)
+                .then(|| std::fs::read_link(format!("/proc/{}/exe", v.caller)).ok())
+                .flatten()
                 .map(|p| p.display().to_string());
             report(&v, exe_path.as_deref());
             let ev = daemon.lock().unwrap().record_violation(&v, exe_path);
@@ -208,14 +277,20 @@ async fn read_violations(
 }
 
 fn report(v: &Violation, exe_path: Option<&str>) {
+    let file = c_str(&v.file);
     println!(
-        "DENIED caller={} comm={} exe={} target={} hook={} mode={:#x}",
+        "DENIED caller={} comm={} exe={} target={} hook={} mode={:#x}{}",
         v.caller,
         c_str(&v.comm),
         exe_path.map(str::to_owned).unwrap_or_else(|| c_str(&v.exe)),
         v.target,
         hook_name(v.hook),
-        v.mode
+        v.mode,
+        if file.is_empty() {
+            String::new()
+        } else {
+            format!(" file={file}")
+        }
     );
 }
 
@@ -274,4 +349,26 @@ fn check_bpf_lsm_enabled() -> Result<()> {
         bail!("fairplayd must run as root to load LSM programs");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_flag_repeats() {
+        let a = Args::try_parse_from([
+            "fairplayd",
+            "--obj",
+            "x.o",
+            "--overlay",
+            "/a.so",
+            "--overlay",
+            "/b.so",
+        ])
+        .unwrap();
+        assert_eq!(a.overlay, vec![PathBuf::from("/a.so"), "/b.so".into()]);
+        let a = Args::try_parse_from(["fairplayd", "--obj", "x.o"]).unwrap();
+        assert!(a.overlay.is_empty());
+    }
 }

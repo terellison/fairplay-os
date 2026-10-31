@@ -26,7 +26,7 @@ use tokio::{
 };
 
 use crate::{
-    host, launch,
+    exec_allow, host, launch,
     state::{launch_identity, Peer, Subscription},
     Shared,
 };
@@ -39,6 +39,9 @@ pub struct Ctx {
     pub daemon: Shared,
     pub events: broadcast::Sender<ViolationEvent>,
     pub launcher_gid: Option<u32>,
+    /// Kernel devices of the system filesystems (milestone 8): files there
+    /// that only root can write need no allowlist entry.
+    pub system_devs: Arc<[u32]>,
 }
 
 /// Binds the socket, refusing to steal one a live daemon is serving. The
@@ -126,6 +129,7 @@ fn launch_protected(
         cwd,
         run_as,
         join,
+        install_dir,
     } = req
     else {
         unreachable!()
@@ -142,15 +146,32 @@ fn launch_protected(
         }
     };
     let prep = launch::prepare(&program, &argv, &env, &cwd)?;
+    // The code the program may map (milestone 8), listed before taking the
+    // lock: a big install directory takes a while to walk.
+    let dir = exec_allow::install_dir(&program, install_dir.as_deref())?;
+    let files = exec_allow::launch_files(
+        Path::new(&program),
+        &dir,
+        &ctx.system_devs,
+        exec_allow::Limits::DEFAULT,
+    )?;
 
     // Fork and register under the lock, so the reaper (which also takes it)
     // can't see the child before its session exists.
     let released = {
         let mut d = ctx.daemon.lock().unwrap();
         let ticket = d.begin_launch(peer, join)?;
-        let paused = launch::fork_paused(&prep, &identity, stdio)?;
+        let allowed = d.allow_exec(&ticket, &files)?;
+        let paused = match launch::fork_paused(&prep, &identity, stdio) {
+            Ok(p) => p,
+            Err(e) => {
+                d.abandon_launch(&ticket);
+                return Err(e);
+            }
+        };
         if let Err(e) = d.register(ticket, paused.pid(), peer, identity.uid, argv) {
             // `paused` drops here: the child is killed before it runs anything.
+            d.abandon_launch(&ticket);
             return Err(ApiError::new(
                 ErrorCode::Internal,
                 format!("registering: {e:#}"),
@@ -158,7 +179,7 @@ fn launch_protected(
         }
         let pid = paused.pid();
         eprintln!(
-            "fairplayd: session {}: pid {pid} ({program}) protected in domain {}, running as uid {}{}{}",
+            "fairplayd: session {}: pid {pid} ({program}) protected in domain {}, running as uid {}{}{}; {} code files from {} allowed ({allowed} new)",
             ticket.session,
             ticket.domain,
             identity.uid,
@@ -167,7 +188,9 @@ fn launch_protected(
                 String::new()
             } else {
                 format!(", dropped env {:?}", prep.dropped_env)
-            }
+            },
+            files.len(),
+            dir.display(),
         );
         (ticket.session, paused.release()?)
     };
