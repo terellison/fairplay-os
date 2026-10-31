@@ -54,6 +54,14 @@ pub struct Evidence {
     /// SHA-256 values of [`QUOTED_PCRS`], read next to the quote.
     pub pcrs: BTreeMap<u8, PcrValue>,
     /// The binary IMA log ([`IMA_LOG_PATH`]), if it was readable.
+    ///
+    /// Only part of this is authenticated by the quote: the hash chain covers
+    /// the template data of entries for PCR 10, in order. Entries for other
+    /// PCRs, each entry's template name, and the SHA-1 template digest field
+    /// are not covered and may be anything. Policy that reads the log (e.g.
+    /// "was fairplayd's hash measured") must use only PCR-10 entries'
+    /// template data, and only after [`verify`] returned
+    /// `ima_log_verified: true`.
     pub ima_log: Option<Vec<u8>>,
     /// The key that signed the quote, as the client reports it. The verifier
     /// must not trust this; it checks against the AK it enrolled.
@@ -66,7 +74,9 @@ pub struct Verdict {
     pub quote_valid: bool,
     /// The PCR values the quote vouches for.
     pub pcrs: BTreeMap<u8, PcrValue>,
-    /// An IMA log was present and replays to the quoted PCR 10.
+    /// An IMA log was present and replays to the quoted PCR 10. This vouches
+    /// only for the template data of the log's PCR-10 entries, in order; see
+    /// [`Evidence::ima_log`] for what it does not cover.
     pub ima_log_verified: bool,
     pub secure_boot: Option<bool>,
     pub kernel_lockdown: Option<bool>,
@@ -95,6 +105,9 @@ impl std::error::Error for Error {}
 /// Why the verifier rejected evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rejection {
+    /// The server passed an empty nonce, which would disable replay
+    /// protection. A server bug, not a client failure.
+    EmptyNonce,
     /// The trusted AK isn't a valid P-256 point.
     BadAkPublic,
     /// The signature isn't a TPMT_SIGNATURE we can check (we accept
@@ -126,6 +139,7 @@ pub enum Rejection {
 impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Rejection::EmptyNonce => f.write_str("expected nonce is empty"),
             Rejection::BadAkPublic => f.write_str("trusted AK is not a P-256 public key"),
             Rejection::MalformedSignature(m) => write!(f, "malformed signature: {m}"),
             Rejection::BadSignature => f.write_str("quote signature does not verify with the AK"),
@@ -176,6 +190,12 @@ pub fn verify(
     trusted_ak: &AkPublic,
 ) -> Result<Verdict, Rejection> {
     use p256::ecdsa::signature::Verifier;
+
+    // 0. An empty nonce would match a quote with empty extraData: no
+    // freshness at all. Refuse before looking at anything else.
+    if expected_nonce.is_empty() {
+        return Err(Rejection::EmptyNonce);
+    }
 
     // 1. The signature, over the exact bytes we are about to parse.
     let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(&trusted_ak.0)
@@ -237,4 +257,27 @@ pub fn verify(
 #[doc(hidden)]
 pub mod testing {
     pub use crate::ima::{ima_ng_entry, sha256_extend_value};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_nonce_rejected_first() {
+        // Garbage everywhere else: the empty nonce must be the reason.
+        let ev = Evidence {
+            nonce: Vec::new(),
+            quote: Vec::new(),
+            signature: Vec::new(),
+            pcrs: BTreeMap::new(),
+            ima_log: None,
+            ak_public: AkPublic(Vec::new()),
+        };
+        assert_eq!(verify(&ev, &[], &ev.ak_public), Err(Rejection::EmptyNonce));
+        assert_eq!(
+            verify(&ev, b"n", &ev.ak_public),
+            Err(Rejection::BadAkPublic)
+        );
+    }
 }

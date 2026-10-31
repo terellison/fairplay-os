@@ -8,6 +8,7 @@
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use fairplay_attest::testing::{ima_ng_entry, sha256_extend_value};
@@ -42,25 +43,32 @@ impl Swtpm {
         let dir =
             std::env::temp_dir().join(format!("fairplay-attest-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let port = free_port_pair();
-        let child = Command::new("swtpm")
-            .args(["socket", "--tpm2", "--flags", "not-need-init,startup-clear"])
-            .arg("--tpmstate")
-            .arg(format!("dir={}", dir.display()))
-            .arg("--server")
-            .arg(format!("type=tcp,bindaddr=127.0.0.1,port={port}"))
-            .arg("--ctrl")
-            .arg(format!("type=tcp,bindaddr=127.0.0.1,port={}", port + 1))
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn swtpm");
-        let tpm = Swtpm { child, dir, port };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "swtpm did not start listening");
-            std::thread::sleep(Duration::from_millis(50));
+        // Tests run in parallel threads. Pick ports and wait for swtpm to own
+        // them under one lock, so two tests never race for the same pair.
+        static START: Mutex<()> = Mutex::new(());
+        let _guard = START.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..5 {
+            let port = free_port_pair();
+            let mut child = Command::new("swtpm")
+                .args(["socket", "--tpm2", "--flags", "not-need-init,startup-clear"])
+                .arg("--tpmstate")
+                .arg(format!("dir={}", dir.display()))
+                .arg("--server")
+                .arg(format!("type=tcp,bindaddr=127.0.0.1,port={port}"))
+                .arg("--ctrl")
+                .arg(format!("type=tcp,bindaddr=127.0.0.1,port={}", port + 1))
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn swtpm");
+            if wait_ready(&mut child, port) {
+                return Some(Swtpm { child, dir, port });
+            }
+            // swtpm exited, most likely because another process took a port
+            // between our probe and its bind: try another pair.
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        Some(tpm)
+        panic!("swtpm did not start");
     }
 
     fn tcti(&self) -> String {
@@ -92,6 +100,24 @@ impl Drop for Swtpm {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Both ports accept connections and our swtpm is still running (it exits
+/// on a bind error, so a listener then belongs to someone else).
+fn wait_ready(child: &mut Child, port: u16) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let up = |p: u16| TcpStream::connect(("127.0.0.1", p)).is_ok();
+    loop {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return false;
+        }
+        if up(port) && up(port + 1) {
+            std::thread::sleep(Duration::from_millis(50));
+            return matches!(child.try_wait(), Ok(None));
+        }
+        assert!(Instant::now() < deadline, "swtpm did not start listening");
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
