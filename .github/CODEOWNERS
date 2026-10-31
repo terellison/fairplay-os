@@ -1,0 +1,7 @@
+# Changes to the design, the agents' rules, or their tooling need the owner's
+# review. Everything else can be approved by the lead agent (fairplay-os-lead).
+# Takes effect once the master ruleset requires review from code owners.
+/docs/design.md @terellison
+/CLAUDE.md      @terellison
+/tools/         @terellison
+/.github/       @terellison
