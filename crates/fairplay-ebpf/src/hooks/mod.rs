@@ -14,3 +14,4 @@ mod mmap_file;
 mod ptrace;
 mod socket;
 mod task_kill;
+mod task_set;

@@ -238,3 +238,27 @@ pub fn name_is(name: &[u8; 16], want: &[u8]) -> bool {
     let n = want.len();
     n < 16 && name[n] == 0 && name[..n] == *want
 }
+
+/// `d->d_parent`.
+#[inline(always)]
+pub fn parent(d: *const dentry) -> Result<*const dentry, i64> {
+    unsafe { bpf_probe_read_kernel(dentry_parent(d)) }.map(|p| p as *const dentry)
+}
+
+/// A decimal pid, or `None` if the name isn't one.
+pub fn parse_pid(name: &[u8; 16]) -> Option<u32> {
+    let mut pid: u32 = 0;
+    let mut i = 0;
+    while i < 10 {
+        let c = name[i];
+        if c == 0 {
+            break;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        pid = pid.checked_mul(10)?.checked_add((c - b'0') as u32)?;
+        i += 1;
+    }
+    (i > 0 && name[i] == 0).then_some(pid)
+}

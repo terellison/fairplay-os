@@ -184,7 +184,7 @@ as `protection_degraded`.
 In player mode root may be the cheater, and the cheapest cheat is to switch
 the protection off: kill `fairplayd`, edit `PROTECTED`, or detach its
 programs. With `--self-protect`, `fairplayd` fences every other process,
-root included, away from itself, with four more LSM programs
+root included, away from itself, with more LSM programs
 (`crates/fairplay-ebpf/src/hooks/`, shared logic in `self_protect.rs`):
 
 | Hook | What it refuses from any other process | DENIED `mode=` |
@@ -194,9 +194,19 @@ root included, away from itself, with four more LSM programs
 | `bpf_map` | a file descriptor for any of `fairplayd`'s maps (`bpftool map dump/update id N`, a pin) | requested `FMODE_*` |
 | `bpf_prog` | a file descriptor for any of its programs | 0 |
 | `bpf` | `BPF_PROG_LOAD` (every program type), `BPF_LINK_GET_FD_BY_ID`, `BPF_LINK_DETACH`, `BPF_PROG_DETACH` | the command |
+| `task_setrlimit` | changing any of its resource limits (`prlimit --cpu=1` would have the kernel send SIGXCPU, then SIGKILL) | the `RLIMIT_*` number |
+| `task_setnice` | renicing it | the nice value |
+| `task_setscheduler` | scheduling policy and priority (`chrt`, `sched_setattr`), CPU affinity (`taskset`), `/proc/<pid>/timerslack_ns`, moving it into a cpuset cgroup | 0 |
+| `task_setioprio` | its I/O priority (`ionice`) | the `ioprio` value |
+| `file_open` (`proc_tune_write`) | opening its `/proc/<pid>/oom_score_adj`, `oom_adj` or `autogroup` for writing, also as `/proc/<tid>/` of any of its threads or `task/<tid>/` | the file's `FMODE_*` bits, plus `file=` |
 
 It is keyed on `fairplayd`'s tgid in a one-entry map, `SELF_PROTECT`, which
-is 0 (all four hooks inert) unless asked for. "Its maps and programs" are
+is 0 (all these hooks inert) unless asked for. `fairplayd` may still change
+its own settings: once protected it sets its own `oom_score_adj` to -1000,
+so the OOM killer never picks it. Since `/proc/<tid>/` works for every
+thread, not just the main one, its thread ids are kept in `SELF_THREADS`:
+`fairplayd` lists the ones it has when it turns protection on, and the
+`follow` tracepoints add each new one and remove it when it exits. "Its maps and programs" are
 every BPF object `fairplayd` holds an fd for when it turns protection on
 (read from `/proc/self/fdinfo`), listed by kernel id in `SELF_OBJECTS`;
 `SELF_PROTECT` and `SELF_OBJECTS` are on that list themselves. The ids are
@@ -231,17 +241,16 @@ root. There is no socket call to turn it off. The ways out:
   hibernating and editing the image. Kernel lockdown (integrity), player
   mode.
 - Rebooting into another kernel or developer mode: attestation.
-- Kernel-raised signals root can provoke: `cgroup.kill` or `cgroup.freeze`
-  on `fairplayd`'s cgroup, the OOM killer (raise its `oom_score_adj`, then
-  exhaust memory or lower `memory.max`), `RLIMIT_CPU` via `prlimit`
-  (SIGXCPU, then SIGKILL), and its controlling terminal (SIGINT, SIGHUP).
-  None of these pass through `task_kill`. Player mode should run it as a
-  service with no terminal in its own cgroup, and later hooks can refuse
-  writes to that cgroup's files and to `/proc/<pid>/oom_score_adj`, and
-  `task_setrlimit` on it.
-- Slowing it down rather than stopping it: `nice`, scheduler policy, CPU
-  affinity, I/O priority (`task_setnice`, `task_setscheduler`,
-  `task_setioprio` hooks could refuse those).
+- Its cgroup: `cgroup.kill` or `cgroup.freeze` on `fairplayd`'s cgroup or
+  any ancestor, `memory.max`/`memory.high` (at `oom_score_adj` -1000 the
+  OOM killer skips it, but reclaim can still stall it),
+  `cpu.max`, `cpuset.cpus`, and moving it into another cgroup through that
+  cgroup's `cgroup.procs` (no LSM hook sees a cgroup move, except cpuset's
+  `task_setscheduler` check). Guarding its own cgroup's files alone would
+  not help while it can be moved. Player mode (milestone 11) should run it
+  as a systemd service in its own cgroup and fence that subtree.
+- Its controlling terminal (SIGINT, SIGHUP from the kernel, not through
+  `task_kill`): run it as a service with no terminal.
 - Reading the swap device (pages of `fairplayd` or the game swapped out):
   encrypted swap, or zram only.
 - File descriptors to its BPF objects taken before self-protection started,
@@ -266,8 +275,13 @@ root, tries `kill -9`, `kill -STOP` and `kill -TERM`; `bpftool map dump` and
 off), `prog dump` of a `fairplayd` program and `link detach`; and
 `cheatsim self-attack`: ptrace attach, `process_vm_readv`, opening
 `/proc/<pid>/mem`, `pidfd_getfd`, loading a trivial socket filter, raw
-`BPF_LINK_DETACH` and `BPF_PROG_DETACH`, and opening a program by id. Each
-must fail with one `DENIED` line. A game launched meanwhile is still
+`BPF_LINK_DETACH` and `BPF_PROG_DETACH`, and opening a program by id; and
+`prlimit --cpu` and `--nofile`, `renice`, `chrt --idle`, `taskset`,
+`ionice -c 3`, and writing `oom_score_adj`, `oom_adj` and `autogroup`
+(also through a worker thread's `/proc/<tid>/`). Each must fail with one
+`DENIED` line, and its nice value, policy, affinity, I/O class, CPU limit
+and OOM score (-1000) must be as before. Root still changes all of those
+for any other process. A game launched meanwhile is still
 protected, and its exit still reaches `fairplayd`. Finally `fairplayd` turns
 self-protection off on its own, exits with status 0, and leaves no program
 loaded.

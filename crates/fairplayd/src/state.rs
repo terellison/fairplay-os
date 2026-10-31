@@ -743,6 +743,11 @@ pub fn hook_name(hook: u32) -> &'static str {
         x if x == Hook::ProcMemWrite as u32 => "proc_mem_write",
         x if x == Hook::ProcLink as u32 => "proc_link",
         x if x == Hook::UnixAbstract as u32 => "unix_abstract",
+        x if x == Hook::TaskSetrlimit as u32 => "task_setrlimit",
+        x if x == Hook::TaskSetnice as u32 => "task_setnice",
+        x if x == Hook::TaskSetscheduler as u32 => "task_setscheduler",
+        x if x == Hook::TaskSetioprio as u32 => "task_setioprio",
+        x if x == Hook::ProcTuneWrite as u32 => "proc_tune_write",
         x => match crate::input::Mechanism::of_hook(x) {
             Some(m) => input_hook_name(m),
             None => "unknown",
@@ -1375,6 +1380,14 @@ mod tests {
         assert_eq!(c_str(b"0123456789abcdef"), "0123456789abcdef");
         assert_eq!(hook_name(Hook::TaskKill as u32), "task_kill");
         assert_eq!(hook_name(Hook::Bpf as u32), "bpf");
+        assert_eq!(hook_name(Hook::TaskSetrlimit as u32), "task_setrlimit");
+        assert_eq!(hook_name(Hook::TaskSetnice as u32), "task_setnice");
+        assert_eq!(
+            hook_name(Hook::TaskSetscheduler as u32),
+            "task_setscheduler"
+        );
+        assert_eq!(hook_name(Hook::TaskSetioprio as u32), "task_setioprio");
+        assert_eq!(hook_name(Hook::ProcTuneWrite as u32), "proc_tune_write");
         assert_eq!(hook_name(Hook::UinputCreate as u32), "uinput_create");
         assert_eq!(hook_name(Hook::UhidCreate as u32), "uhid_create");
         assert_eq!(hook_name(Hook::EvdevWrite as u32), "evdev_write");

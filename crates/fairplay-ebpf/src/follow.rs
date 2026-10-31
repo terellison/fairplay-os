@@ -20,6 +20,10 @@
 //!   (PROTECTED, and READERS and SANDBOXED if it was in them). That
 //!   is before the process is reaped, so before its PID can be reused: an
 //!   unrelated process that gets the PID later never inherits the domain.
+//!
+//! While fairplayd protects itself they also keep SELF_THREADS, its thread
+//! ids, for `self_protect::is_fairplayd`: each new thread of fairplayd's
+//! goes in at fork and comes out when it exits.
 
 use aya_ebpf::{
     helpers::bpf_probe_read_kernel, macros::btf_tracepoint, programs::BtfTracePointContext,
@@ -27,7 +31,8 @@ use aya_ebpf::{
 use core::ptr::addr_of;
 
 use crate::{
-    maps::{PROTECTED, READERS, SANDBOXED, UNFOLLOWED},
+    maps::{PROTECTED, READERS, SANDBOXED, SELF_THREADS, UNFOLLOWED},
+    self_protect::guardian,
     vmlinux::{signal_struct, task_struct},
 };
 
@@ -50,6 +55,9 @@ fn try_follow_fork(parent: *const task_struct, child: *const task_struct) -> Res
     };
     // A new thread: its process is already covered by its tgid.
     if pid != tgid {
+        if guardian() == Some(tgid as u32) {
+            let _ = SELF_THREADS.insert(&(pid as u32), &1, 0);
+        }
         return Ok(());
     }
     let parent_tgid = unsafe { bpf_probe_read_kernel(addr_of!((*parent).tgid))? } as u32;
@@ -93,6 +101,10 @@ pub fn unfollow_exit(ctx: BtfTracePointContext) -> i32 {
 
 fn try_unfollow_exit(task: *const task_struct) -> Result<(), i64> {
     let tgid = unsafe { bpf_probe_read_kernel(addr_of!((*task).tgid))? } as u32;
+    if guardian() == Some(tgid) {
+        let pid = unsafe { bpf_probe_read_kernel(addr_of!((*task).pid))? } as u32;
+        let _ = SELF_THREADS.remove(&pid);
+    }
     // Most exits on the machine are not protected processes. (Readers are
     // always in PROTECTED too.)
     if unsafe { PROTECTED.get(&tgid) }.is_none() && unsafe { READERS.get(&tgid) }.is_none() {
