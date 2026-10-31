@@ -19,6 +19,12 @@
 //! its memory or steal its file descriptors, load a BPF program of its own,
 //! and detach programs. Each attempt prints BLOCKED (EPERM or EACCES) or
 //! WORKED.
+//! Milestone 7: `cheatsim clicker` makes a virtual mouse through
+//! `/dev/uinput` and clicks, `cheatsim uhid` makes one through `/dev/uhid`,
+//! and `cheatsim inject --device /dev/input/eventN` writes an event into an
+//! existing device (see `input`).
+
+mod input;
 
 use std::{
     fs::File,
@@ -90,6 +96,44 @@ enum Cmd {
         #[arg(long)]
         prog_id: Option<u32>,
     },
+    /// Make a virtual mouse through /dev/uinput and click with it (an
+    /// autoclicker or triggerbot). Needs write access to /dev/uinput.
+    Clicker {
+        /// The device's name, as sysfs and session_status show it.
+        #[arg(long, default_value = "cheatsim clicker")]
+        name: String,
+        #[arg(long, default_value_t = 3)]
+        clicks: u32,
+        /// Milliseconds between clicks.
+        #[arg(long, default_value_t = 20)]
+        interval_ms: u64,
+        /// Seconds to keep the device after clicking.
+        #[arg(long, default_value_t = 3600)]
+        hold: u64,
+    },
+    /// Make a virtual HID mouse through /dev/uhid and move it.
+    Uhid {
+        #[arg(long, default_value = "cheatsim uhid mouse")]
+        name: String,
+        #[arg(long, default_value_t = 3)]
+        moves: u32,
+        /// Seconds to keep the device after moving.
+        #[arg(long, default_value_t = 3600)]
+        hold: u64,
+        /// Before creating the device, write an event uhid rejects (marks
+        /// the fd as written to).
+        #[arg(long)]
+        bogus_first: bool,
+        /// Wait for a line on stdin before creating the device.
+        #[arg(long)]
+        wait_stdin: bool,
+    },
+    /// Write one event (a SYN_REPORT, which changes nothing) into an
+    /// existing input device node.
+    Inject {
+        #[arg(long)]
+        device: String,
+    },
 }
 
 const SECRET: u64 = 0x5EC2_E713_37C0_DE11;
@@ -109,6 +153,20 @@ fn main() -> ExitCode {
         } => game(depth, &dlopen, dlopen_stdin),
         Cmd::Attack { pid, addr } => attack(Pid::from_raw(pid), addr),
         Cmd::SelfAttack { pid, prog_id } => self_attack(Pid::from_raw(pid), prog_id),
+        Cmd::Clicker {
+            name,
+            clicks,
+            interval_ms,
+            hold,
+        } => input::clicker(&name, clicks, interval_ms, hold),
+        Cmd::Uhid {
+            name,
+            moves,
+            hold,
+            bogus_first,
+            wait_stdin,
+        } => input::uhid(&name, moves, hold, bogus_first, wait_stdin),
+        Cmd::Inject { device } => input::inject(&device),
     }
 }
 

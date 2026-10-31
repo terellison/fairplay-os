@@ -4,7 +4,10 @@
 mod bpf;
 mod bpf_map;
 mod bpf_prog;
+mod file_ioctl;
+mod file_ioctl_compat;
 mod file_mprotect;
+mod file_permission;
 mod mmap_file;
 mod ptrace;
 mod task_kill;

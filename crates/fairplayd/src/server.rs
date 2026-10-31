@@ -26,7 +26,7 @@ use tokio::{
 };
 
 use crate::{
-    exec_allow, host, launch,
+    exec_allow, host, input, launch,
     state::{launch_identity, Peer, Subscription},
     verify, Shared,
 };
@@ -131,6 +131,7 @@ fn launch_protected(
         run_as,
         join,
         install_dir,
+        block_virtual_input,
     } = req
     else {
         unreachable!()
@@ -189,7 +190,10 @@ fn launch_protected(
     // can't see the child before its session exists.
     let released = {
         let mut d = ctx.daemon.lock().unwrap();
-        let ticket = d.begin_launch(peer, join)?;
+        let mut ticket = d.begin_launch(peer, join)?;
+        // The request, or for a new session its manifest, may ask.
+        ticket.block_input = block_virtual_input
+            || (!ticket.join && plan.manifest.verified.manifest.block_virtual_input);
         let allowed = d
             .allow_exec(&ticket, &files)
             .and_then(|n| d.allow_readers(&ticket, &reader_files).map(|r| (n, r)));
@@ -219,11 +223,16 @@ fn launch_protected(
         let pid = paused.pid();
         let info = plan.manifest.info();
         eprintln!(
-            "fairplayd: session {}: pid {pid} ({program}) protected in domain {}, running as uid {}{}{}; {} code files from {} allowed ({allowed} new); manifest {:?} sha256 {} signer {}; {} reader file(s) ({readers} new){}",
+            "fairplayd: session {}: pid {pid} ({program}) protected in domain {}, running as uid {}{}{}{}; {} code files from {} allowed ({allowed} new); manifest {:?} sha256 {} signer {}; {} reader file(s) ({readers} new){}",
             ticket.session,
             ticket.domain,
             identity.uid,
             if ticket.join { ", joined as a reader" } else { "" },
+            if ticket.block_input {
+                ", blocking virtual input"
+            } else {
+                ""
+            },
             if prep.dropped_env.is_empty() {
                 String::new()
             } else {
@@ -249,12 +258,17 @@ fn launch_protected(
 }
 
 fn session_status(ctx: &Ctx, peer: &Peer, session: Option<u64>) -> Result<Reply, ApiError> {
-    let (protected, session) = ctx.daemon.lock().unwrap().status(peer, session)?;
+    // sysfs first: if a device appears between the two reads, its record
+    // is already in the log.
+    let devices = input::scan();
+    let d = ctx.daemon.lock().unwrap();
+    let (protected, session) = d.status(peer, session)?;
+    let virtual_input_devices = input::correlate(devices, d.input_log(), input::pid_alive);
     Ok(Reply::Status(StatusReport {
         protected,
         session,
         lockdown: host::lockdown(),
-        virtual_input_devices: host::virtual_input_devices(),
+        virtual_input_devices,
     }))
 }
 

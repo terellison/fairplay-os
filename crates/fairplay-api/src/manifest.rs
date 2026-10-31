@@ -55,8 +55,9 @@ pub struct Manifest {
     /// Overlays the game accepts; the session may map them executable.
     #[serde(default)]
     pub overlays: Vec<FileEntry>,
-    /// Ask for virtual input devices to be blocked during the session.
-    /// Recorded and reported; enforcement is milestone 7's option.
+    /// Block virtual input from executables not on fairplayd's input
+    /// allowlist while the session runs (milestone 7's option; the launch
+    /// request can also ask for it).
     #[serde(default)]
     pub block_virtual_input: bool,
 }

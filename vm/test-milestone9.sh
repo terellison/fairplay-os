@@ -281,6 +281,15 @@ check "the vendor's key fingerprint, and the manifest's sha256" \
   jqt --arg fp "$VENDOR_FP" --arg sha "$(sha256sum "$T/game/game.json" | cut -d' ' -f1)" \
     '.ok.status.session.manifest | .signer_fingerprint==$fp and .sha256==$sha and .name=="M9 Test Game"' "$T/status.json"
 
+step "(h) a manifest that asks for block_virtual_input gets it (milestone 7)"
+(cd "$T/game" && "$CTL" manifest new --key "$T/vendor.key" --name "Strict" --launch cheatsim \
+  --block-virtual-input --out "$T/game/strict.json") >/dev/null
+ctl launch --no-stdio --run-as 0 --manifest "$T/game/strict.json" -- "$GAME" game >"$T/strict.out" 2>/dev/null
+SPID="$(jq -r '.ok.launched.pid' "$T/strict.out")"
+check "fairplayd blocks virtual input for that session" \
+  grep -q "pid $SPID .*, blocking virtual input" "$T/daemon.err"
+sudo kill "$SPID" 2>/dev/null
+
 step "the game exits"
 exec 3>&-
 sudo kill "$GPID" "$SIB" 2>/dev/null

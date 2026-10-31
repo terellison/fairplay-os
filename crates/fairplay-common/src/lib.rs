@@ -56,16 +56,21 @@ pub const BPF_LINK_DETACH: u32 = 34;
 /// is only checking, e.g. to decide which `/proc/<pid>/stat` fields `ps`
 /// may see, not acting on a request to access the process.
 pub const PTRACE_MODE_NOAUDIT: u32 = 0x04;
+/// Name of the map of executables allowed to make virtual input
+/// (remappers, accessibility tools): [`ExecKey`] with [`ANY_DOMAIN`] ->
+/// [`ExecAllow`], milestone 7.
+pub const MAP_INPUT_ALLOWED: &str = "INPUT_ALLOWED";
+/// Name of the one-entry array (index 0, a `u32`) that is nonzero while
+/// some running session asked for `block_virtual_input`, milestone 7.
+pub const MAP_INPUT_BLOCK: &str = "INPUT_BLOCK";
 
-/// Which LSM hook denied the attempt.
+/// Which LSM hook denied (or, for the input hooks, saw) the attempt.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hook {
     /// `ptrace_access_check`: covers ptrace attach, `process_vm_readv`/`writev`,
     /// and `/proc/<pid>/mem`.
     PtraceAccess = 1,
-    /// `file_open` on `/dev/uinput` during a protected session (milestone 7).
-    UinputOpen = 2,
     /// `mmap_file`: a protected process mapping a file executable that is
     /// not on its allowlist (milestone 8).
     MmapFile = 3,
@@ -86,7 +91,33 @@ pub enum Hook {
     /// `bpf`: another process using a `bpf(2)` command reserved for
     /// fairplayd (loading a program, detaching, opening a link by id).
     Bpf = 19,
+    // Milestone 7, virtual input, numbered after milestone 6. These are
+    // machine-wide: the kernel records every one, with
+    // [`VIOLATION_REPORTED`] unless a session asked for blocking, and
+    // fairplayd decides which sessions hear about it. The target is 0.
+    // (Value 2 was a placeholder for this milestone and is unused.)
+    /// `file_ioctl` / `file_ioctl_compat`: `UI_DEV_CREATE` on `/dev/uinput`,
+    /// which creates a virtual input device.
+    UinputCreate = 20,
+    /// `file_permission`: the first write on an open `/dev/uhid`, which is
+    /// the one that creates the virtual HID device (`UHID_CREATE2`).
+    UhidCreate = 21,
+    /// `file_permission`: the first write on an open `/dev/input/event*`
+    /// node, which injects events into an existing device.
+    EvdevWrite = 22,
+    /// `file_permission`: a write on a `/dev/uinput` fd (input through a
+    /// uinput device) while a session blocks virtual input. Recorded only
+    /// when denied, once per fd.
+    UinputWrite = 23,
 }
+
+/// [`Violation::flags`]: the kernel let it happen and only reports it
+/// (milestone 7's default for virtual input). Without it, it was denied.
+pub const VIOLATION_REPORTED: u32 = 1;
+/// [`Violation::flags`]: the caller's executable is on the input allowlist
+/// (`INPUT_ALLOWED`). Always allowed and never sent to vendors; recorded so
+/// fairplayd can say who made each virtual device.
+pub const VIOLATION_ALLOWLISTED: u32 = 2;
 
 /// One denied attempt, written by the BPF program into the ring buffer.
 #[repr(C)]
@@ -103,8 +134,11 @@ pub struct Violation {
     /// The ptrace access mode bits the caller asked for, or for
     /// [`Hook::MmapFile`] and [`Hook::FileMprotect`] the `PROT_*` bits. For
     /// [`Hook::TaskKill`] the signal, for [`Hook::BpfMap`] the `FMODE_*`
-    /// bits asked for, and for [`Hook::Bpf`] the `bpf(2)` command.
+    /// bits asked for, and for [`Hook::Bpf`] the `bpf(2)` command. For the
+    /// input hooks, the device node's kernel `dev_t` (`major << 20 | minor`).
     pub mode: u32,
+    /// [`VIOLATION_REPORTED`], [`VIOLATION_ALLOWLISTED`]; 0 for a denial.
+    pub flags: u32,
     /// The caller's comm, NUL-padded. Captured in the kernel because the
     /// caller has often exited by the time user space reads the event.
     pub comm: [u8; 16],
@@ -115,7 +149,10 @@ pub struct Violation {
     pub exe: [u8; EXE_NAME_LEN],
     /// For file hooks ([`Hook::MmapFile`], [`Hook::FileMprotect`]): file
     /// name (no directory) of the file it tried to map, same format as
-    /// `exe`. Empty for process targets.
+    /// `exe`. For [`Hook::UinputCreate`]: the name the caller gave the new
+    /// device (sysfs `name`). For [`Hook::UhidCreate`],
+    /// [`Hook::EvdevWrite`] and [`Hook::UinputWrite`]: the device node's
+    /// file name (`uhid`, `event3`, `uinput`). Empty for process targets.
     pub file: [u8; EXE_NAME_LEN],
 }
 
@@ -179,7 +216,8 @@ pub const FS_ANON: u32 = 2;
 #[cfg(feature = "user")]
 mod user {
     // SAFETY: these are repr(C), Copy, contain only integers and have no
-    // padding (ExecKey is 4 + 4 + 8 bytes).
+    // padding (ExecKey is 4 + 4 + 8 bytes; Violation is 6 u32s and three
+    // byte arrays).
     unsafe impl aya::Pod for super::Violation {}
     unsafe impl aya::Pod for super::ExecKey {}
     unsafe impl aya::Pod for super::ExecAllow {}

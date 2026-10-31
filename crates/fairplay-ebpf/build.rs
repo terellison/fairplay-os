@@ -32,6 +32,15 @@ const FIELDS: &[(&str, &str, &str, &str)] = &[
     ("map_id", "bpf_map", "id", "u32"),
     ("prog_aux", "bpf_prog", "aux", "*mut bpf_prog_aux"),
     ("prog_aux_id", "bpf_prog_aux", "id", "u32"),
+    // Virtual input (input.rs): which device node a file is, and the
+    // driver's per-open state.
+    ("inode_rdev", "inode", "i_rdev", "u32"),
+    (
+        "file_private",
+        "file",
+        "private_data",
+        "*mut ::aya_ebpf::cty::c_void",
+    ),
 ];
 
 fn main() {

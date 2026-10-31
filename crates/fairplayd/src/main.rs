@@ -1,17 +1,22 @@
-//! fairplayd (milestones 3, 4, 5, 6, 8 and 9).
+//! fairplayd (milestones 3 to 9).
 //!
 //! Loads the BPF LSM program, owns the PROTECTED map, and serves the design
 //! doc's vendor-facing API on a Unix socket (see the `fairplay-api` crate):
 //! `launch_protected`, `session_status`, `attest`, and a `violations` stream.
 //! Every denied attempt is also printed as a `DENIED` line, as in milestone 3.
 //! It also keeps the executable-mapping allowlist (milestone 8): which files
-//! a protected process may map as code (see `exec_allow`). It launches only
-//! what a signed game manifest names, and only the manifest's readers may
-//! read a protected process (milestone 9, see `verify`).
+//! a protected process may map as code (see `exec_allow`). And it reports
+//! virtual input (milestone 7): who creates uinput and uhid devices or
+//! writes into input devices, with a `REPORTED` line and a violation event
+//! for each one during a session, unless the executable is on the input
+//! allowlist (see `input`). It launches only what a signed game manifest
+//! names, and only the manifest's readers may read a protected process
+//! (milestone 9, see `verify`).
 //!
 //!     sudo fairplayd --obj fairplay.o                    # socket API only
 //!     sudo fairplayd --obj fairplay.o --protect <pid>    # milestone 3 style
 //!     sudo fairplayd --obj fairplay.o --overlay /usr/local/lib/overlay.so
+//!     sudo fairplayd --obj fairplay.o --input-allow /usr/bin/input-remapper-service
 //!     sudo fairplayd --obj fairplay.o --self-protect-for 60
 //!
 //! With `--self-protect` (milestone 6, see `self_protect`) not even root may
@@ -22,6 +27,7 @@
 
 mod exec_allow;
 mod host;
+mod input;
 mod launch;
 mod self_protect;
 mod server;
@@ -35,19 +41,23 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use aya::{
-    maps::{HashMap, MapData, MapError, RingBuf},
+    maps::{Array, HashMap, MapData, MapError, RingBuf},
     programs::{BtfTracePoint, Lsm},
     Btf, Ebpf,
 };
 use clap::Parser;
 use fairplay_api::{ProcessState, ViolationEvent, DEFAULT_LAUNCHER_GROUP, DEFAULT_SOCKET};
 use fairplay_common::{
-    ExecAllow, ExecKey, Violation, FS_SYSTEM, MAP_EXEC_ALLOWED, MAP_EXEC_TRUSTED_FS, MAP_PROTECTED,
-    MAP_READERS, MAP_READER_FILES, MAP_UNFOLLOWED, MAP_VIOLATIONS,
+    ExecAllow, ExecKey, Violation, ANY_DOMAIN, FS_SYSTEM, MAP_EXEC_ALLOWED, MAP_EXEC_TRUSTED_FS,
+    MAP_INPUT_ALLOWED, MAP_INPUT_BLOCK, MAP_PROTECTED, MAP_READERS, MAP_READER_FILES,
+    MAP_UNFOLLOWED, MAP_VIOLATIONS, VIOLATION_REPORTED,
 };
 use tokio::{io::unix::AsyncFd, sync::broadcast};
 
-use crate::state::{c_str, hook_name, Daemon, ProtectedMap, CLI_DOMAIN};
+use crate::{
+    input::InputRecord,
+    state::{c_str, hook_name, unix_now, Daemon, ProtectedMap, CLI_DOMAIN},
+};
 
 #[derive(Parser)]
 #[command(about = "Protect game processes with a BPF LSM program and serve the fairplay API")]
@@ -84,14 +94,22 @@ struct Args {
     /// normally. For tests on a shared machine.
     #[arg(long, value_name = "SECONDS", conflicts_with = "self_protect")]
     self_protect_for: Option<u64>,
+    /// An executable allowed to make virtual input (a remapper or
+    /// accessibility tool; absolute path). Repeatable. Its devices are
+    /// listed as allowlisted and never sent to vendors, and a session's
+    /// block_virtual_input doesn't stop it. Identified by inode when
+    /// fairplayd starts, like --overlay.
+    #[arg(long)]
+    input_allow: Vec<PathBuf>,
 }
 
-/// The kernel's PROTECTED map, UNFOLLOWED beside it, EXEC_ALLOWED, READERS
-/// and READER_FILES.
+/// The kernel's PROTECTED map, UNFOLLOWED beside it, EXEC_ALLOWED,
+/// INPUT_BLOCK, READERS and READER_FILES.
 pub struct BpfMap {
     protected: HashMap<MapData, u32, u32>,
     unfollowed: HashMap<MapData, u32, u64>,
     exec: HashMap<MapData, ExecKey, ExecAllow>,
+    input_block: Array<MapData, u32>,
     readers: HashMap<MapData, u32, u32>,
     reader_files: HashMap<MapData, ExecKey, ExecAllow>,
 }
@@ -137,6 +155,9 @@ impl ProtectedMap for BpfMap {
     fn forget_domain(&mut self, domain: u32) {
         let _ = self.unfollowed.remove(&domain);
     }
+    fn set_input_block(&mut self, on: bool) -> Result<()> {
+        Ok(self.input_block.set(0, u32::from(on), 0)?)
+    }
 }
 
 pub type Shared = Arc<Mutex<Daemon<BpfMap>>>;
@@ -154,6 +175,19 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("bpf", "bpf"),
     ("bpf_map", "bpf_map"),
     ("bpf_prog", "bpf_prog"),
+    ("file_ioctl", "file_ioctl"),
+    ("file_permission", "file_permission"),
+];
+
+/// LSM programs for hooks older kernels lack. fairplayd starts without them
+/// and says what that leaves uncovered.
+const OPTIONAL_LSM_PROGRAMS: &[(&str, &str, &str)] = &[
+    // (program name, LSM hook, what goes unseen without it)
+    (
+        "file_ioctl_compat",
+        "file_ioctl_compat",
+        "uinput devices made by 32-bit programs (the hook is Linux 6.8+)",
+    ),
 ];
 
 /// Tracing programs that keep PROTECTED and READERS in step with the
@@ -183,6 +217,19 @@ fn main() -> Result<()> {
         prog.load(hook, &btf)
             .with_context(|| format!("loading {name} on LSM hook {hook}"))?;
         prog.attach().with_context(|| format!("attaching {name}"))?;
+    }
+    for &(name, hook, gap) in OPTIONAL_LSM_PROGRAMS {
+        let prog: &mut Lsm = ebpf
+            .program_mut(name)
+            .with_context(|| format!("program {name} missing from object"))?
+            .try_into()?;
+        let attached = prog
+            .load(hook, &btf)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| Ok(prog.attach()?));
+        if let Err(e) = attached {
+            eprintln!("fairplayd: warning: no {hook} hook ({e:#}); not seen: {gap}");
+        }
     }
 
     for &(name, tracepoint) in TRACING_PROGRAMS {
@@ -217,6 +264,7 @@ fn main() -> Result<()> {
             ebpf.take_map(MAP_EXEC_ALLOWED)
                 .context("EXEC_ALLOWED map")?,
         )?,
+        input_block: Array::try_from(ebpf.take_map(MAP_INPUT_BLOCK).context("INPUT_BLOCK map")?)?,
         readers: HashMap::try_from(ebpf.take_map(MAP_READERS).context("READERS map")?)?,
         reader_files: HashMap::try_from(
             ebpf.take_map(MAP_READER_FILES)
@@ -225,6 +273,24 @@ fn main() -> Result<()> {
     };
     let mut daemon = Daemon::new(map);
     let mounts = exec_allow::Mounts::read()?;
+
+    // Virtual input allowlist (milestone 7), fixed for the daemon's life.
+    let mut input_allowed: HashMap<MapData, ExecKey, ExecAllow> = HashMap::try_from(
+        ebpf.take_map(MAP_INPUT_ALLOWED)
+            .context("INPUT_ALLOWED map")?,
+    )?;
+    for path in &args.input_allow {
+        let id = exec_allow::input_tool_file(path, &mounts)?;
+        let (key, value) = id.entry(ANY_DOMAIN);
+        input_allowed
+            .insert(key, value, 0)
+            .with_context(|| format!("allowing {}", path.display()))?;
+    }
+    eprintln!(
+        "fairplayd: virtual input: reported during sessions; {} allowlisted executable(s) {:?}",
+        args.input_allow.len(),
+        args.input_allow
+    );
     let overlays = args
         .overlay
         .iter()
@@ -362,6 +428,10 @@ async fn read_violations(
             // SAFETY: the BPF side writes exactly one Violation per entry.
             let v: Violation = unsafe { std::ptr::read_unaligned(item.as_ptr().cast()) };
             drop(item);
+            if input::Mechanism::of_hook(v.hook).is_some() {
+                record_input(&v, &daemon, &events);
+                continue;
+            }
             // Not for a protected caller (e.g. a game whose own mapping was
             // denied): reading its /proc/<pid>/exe is itself a ptrace
             // access check, which the kernel would deny and log as a
@@ -382,10 +452,58 @@ async fn read_violations(
     }
 }
 
+/// A virtual input record (milestone 7): kept for `session_status`, and
+/// during a session, unless the executable is allowlisted, printed as a
+/// `REPORTED` (or, if a session asked for blocking, `DENIED`) line and sent
+/// to every running session's subscribers.
+fn record_input(v: &Violation, daemon: &Shared, events: &broadcast::Sender<ViolationEvent>) {
+    // Only if the creator isn't protected: reading a protected process's
+    // exe is denied and logged (by the map, not our session list: since
+    // milestone 9 that includes the game's children).
+    let caller_protected = daemon.lock().unwrap().is_protected(v.caller);
+    let exe_path = (!caller_protected)
+        .then(|| std::fs::read_link(format!("/proc/{}/exe", v.caller)).ok())
+        .flatten()
+        .map(|p| p.display().to_string());
+    let Some(rec) = InputRecord::from_kernel(v, exe_path.clone(), unix_now()) else {
+        return;
+    };
+    let evs = daemon.lock().unwrap().record_input(rec);
+    if evs.is_empty() {
+        eprintln!(
+            "fairplayd: input: {} by pid {} ({}){} not reported ({})",
+            hook_name(v.hook),
+            v.caller,
+            exe_path.clone().unwrap_or_else(|| c_str(&v.exe)),
+            Some(c_str(&v.file))
+                .filter(|f| !f.is_empty())
+                .map(|f| format!(" file={f}"))
+                .unwrap_or_default(),
+            if v.flags & fairplay_common::VIOLATION_ALLOWLISTED != 0 {
+                "allowlisted"
+            } else {
+                "no session running"
+            },
+        );
+        return;
+    }
+    report(v, exe_path.as_deref());
+    for ev in evs {
+        let _ = events.send(ev);
+    }
+}
+
+/// One line per record: `DENIED`, or `REPORTED` for virtual input the
+/// kernel let through.
 fn report(v: &Violation, exe_path: Option<&str>) {
     let file = c_str(&v.file);
     println!(
-        "DENIED caller={} comm={} exe={} target={} hook={} mode={:#x}{}",
+        "{} caller={} comm={} exe={} target={} hook={} mode={:#x}{}",
+        if v.flags & VIOLATION_REPORTED != 0 {
+            "REPORTED"
+        } else {
+            "DENIED"
+        },
         v.caller,
         c_str(&v.comm),
         exe_path.map(str::to_owned).unwrap_or_else(|| c_str(&v.exe)),
@@ -476,5 +594,24 @@ mod tests {
         assert_eq!(a.overlay, vec![PathBuf::from("/a.so"), "/b.so".into()]);
         let a = Args::try_parse_from(["fairplayd", "--obj", "x.o"]).unwrap();
         assert!(a.overlay.is_empty());
+        assert!(a.input_allow.is_empty());
+    }
+
+    #[test]
+    fn input_allow_flag_repeats() {
+        let a = Args::try_parse_from([
+            "fairplayd",
+            "--obj",
+            "x.o",
+            "--input-allow",
+            "/usr/bin/remapper",
+            "--input-allow",
+            "/usr/bin/a11y",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.input_allow,
+            vec![PathBuf::from("/usr/bin/remapper"), "/usr/bin/a11y".into()]
+        );
     }
 }

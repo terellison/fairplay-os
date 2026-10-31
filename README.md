@@ -17,11 +17,11 @@ each piece does, how they fit, and a glossary.
 | `crates/fairplay-api` | 4 | The socket protocol (JSON types), a client, and `fairplayctl` |
 | `crates/lsm-hello-ebpf` | 1 | Smoke-test LSM program: logs every `file_open` by `cat` |
 | `crates/lsm-hello` | 1 | Loads it and prints its log |
-| `crates/fairplay-ebpf` | 3, 5, 6, 8 | LSM programs on `ptrace_access_check`, `mmap_file` and `file_mprotect` (executable-mapping allowlist), `task_kill`, `bpf`, `bpf_map` and `bpf_prog` (self-protection), plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
-| `crates/fairplayd` | 3-6, 8 | Loads the programs, owns the PROTECTED and EXEC_ALLOWED maps, serves the socket API, streams violations; `--self-protect` fences root away from it |
-| `crates/cheatsim` | 3, 5, 6, 8 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant; `game --dlopen` loads libraries like a tricked game; `self-attack` goes after fairplayd itself |
+| `crates/fairplay-ebpf` | 3, 5-8 | LSM programs on `ptrace_access_check`, `mmap_file` and `file_mprotect` (executable-mapping allowlist), `task_kill`, `bpf`, `bpf_map` and `bpf_prog` (self-protection), `file_ioctl`, `file_ioctl_compat` and `file_permission` (virtual input), plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
+| `crates/fairplayd` | 3-8 | Loads the programs, owns the PROTECTED, EXEC_ALLOWED and INPUT_* maps, serves the socket API, streams violations, says who made each virtual input device; `--self-protect` fences root away from it |
+| `crates/cheatsim` | 3, 5-8 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant; `game --dlopen` loads libraries like a tricked game; `self-attack` goes after fairplayd itself; `clicker`, `uhid`, `inject` fake input |
 | `crates/fairplay-attest` | 10 | API shape only |
-| `vm/` | 1-6, 8 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5, 6 and 8 tests |
+| `vm/` | 1-8 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5, 6, 7 and 8 tests |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
 
@@ -271,6 +271,88 @@ must fail with one `DENIED` line. A game launched meanwhile is still
 protected, and its exit still reaches `fairplayd`. Finally `fairplayd` turns
 self-protection off on its own, exits with status 0, and leaves no program
 loaded.
+## Milestone 7: virtual input, reported with who made it
+
+Aimbots and triggerbots fake input through the kernel, so the kernel says
+who did it. Three hooks record each way in, with the process (tgid), comm
+and executable that did it:
+
+- `file_ioctl` (and `file_ioctl_compat` for 32-bit callers, Linux 6.8+):
+  `UI_DEV_CREATE` on `/dev/uinput`, which creates a virtual input device.
+  The record carries the name the creator gave the device. Any other ioctl
+  costs one comparison.
+- `file_permission`: the first write on an open `/dev/uhid` (that write is
+  `UHID_CREATE2`, which creates a virtual HID device), and the first write
+  on an open `/dev/input/event*` node (injecting events into an existing
+  device). Once per open file (and verdict), not per event. While blocking
+  is on, it also checks writes on `/dev/uinput` fds, which are input
+  through an existing uinput device. A read costs one bit test; any other
+  write, reading the inode's device number.
+
+Devices are recognized by device number (`i_rdev`: 10:223 uinput, 10:239
+uhid, 13:64+ evdev), not by path. **Reported, not blocked, by default**:
+Steam Input and accessibility tools rely on virtual devices.
+
+- `fairplayd --input-allow <path>` (repeatable) allowlists a remapper or
+  accessibility tool, by inode like `--overlay`. Its devices show as
+  allowlisted and never reach vendors.
+- During a session, anything else prints a `REPORTED caller=... exe=...
+  target=0 hook=uinput_create|uhid_create|evdev_write ... file=<device>`
+  line and goes to every running session's violation stream with
+  `"outcome":"reported"` (other hooks' events say `"denied"`).
+- `launch_protected` takes `block_virtual_input: true` (`fairplayctl launch
+  --block-virtual-input`). **Blocking stops input from non-allowlisted
+  virtual devices, including ones created before the match.** While that
+  session runs, a process whose executable isn't allowlisted can't create a
+  uinput or uhid device, can't send input through one (any write on a
+  `/dev/uinput` or `/dev/uhid` fd), and can't write into `/dev/input/event*`:
+  each gets `EPERM`, prints a `DENIED` line and is streamed with
+  `"outcome":"denied"`, once per fd (`hook=uinput_write` for input through
+  an existing uinput device). **This applies to the whole machine, not just
+  the game**, for as long as such a session runs, because input devices are
+  machine-wide. Allowlisted tools keep working throughout, including their
+  devices made earlier. Anyone else's devices go silent until the blocking
+  session ends, then work again; nothing is left behind.
+- With no session running nothing is reported; fairplayd still keeps the
+  records (the last 256) so it can name the creators of devices made
+  before a session started, such as Steam's virtual pads.
+
+`session_status.virtual_input_devices` lists each uinput and uhid device
+(from `/sys/class/input`) with `device` (`input7`), `name`, `kind`,
+`created_by` (pid, comm, exe, exe_path, created_at) and `allowlisted`. A
+uinput device is matched to its creation record by name; a uhid device to
+the live processes that created uhid devices (a uhid device lives as long
+as its fd, and the kernel can't see the HID device's name when it's
+created). If several live processes fit, the entry is `ambiguous`, names
+the newest, and is allowlisted only if all of them are, so a cheat can't
+hide behind a remapper's device name. The violation stream is always exact:
+it comes straight from the kernel's record.
+
+Known limits: the device name is read from uinput's private
+`struct uinput_device` and `struct input_dev`, whose first members (the
+`input_dev` pointer, then the name) have been the same since Linux 2.6 but
+aren't in the BTF we generate. A refused uinput writer is reported once per
+fd for the daemon's lifetime, so a second blocking session later doesn't
+report the same fd again (it is still refused). Synthetic input through XTest (X11 /
+XWayland) is not covered here; the design doc handles that with Wayland
+only. uhid is a module (`modprobe uhid`; on Ubuntu it ships in
+`linux-modules-extra`).
+
+The exit test, inside the VM, as your normal user:
+
+    flock /run/lock/fairplay-vm-tests ./vm/test-milestone7.sh
+
+During a protected session it starts `cheatsim clicker` as root (listed in
+`session_status` as made by `cheatsim`, not allowlisted, and a `reported`
+event), an allowlisted copy of it (allowlisted, no event), an evdev write and
+a uhid device (reported; skipped if `/dev/uhid` can't be loaded), then a
+second session with `block_virtual_input`. During it a new clicker, an evdev
+write and a new uhid device get `EPERM` and `denied` events; so do a clicker
+made before the match (its clicks stop, are reported once, and resume when
+the session ends) and a uhid fd written to before the match that tries to
+create its device during it. An allowlisted clicker made before the match
+keeps clicking, and the allowlisted tool can still create devices. It also
+checks that nothing is reported with no session running.
 
 ## Milestone 8: executable-mapping allowlist
 
@@ -414,7 +496,8 @@ their own; `session_status` will show their key, not the vendor's.
    anything" path is gone.
 6. `session_status` reports `manifest`: its name, `sha256`, `signer`,
    `signer_fingerprint` (`ed25519:` + SHA-256 of the key) and
-   `block_virtual_input` (recorded; enforcing it is milestone 7's option).
+   `block_virtual_input`. A manifest asking for `block_virtual_input` turns
+   on milestone 7's blocking for its session, as the request flag does.
 
 Signature, tamper and hash failures are `forbidden`, with nothing launched.
 `fairplayd --protect <pid> --allow <pid>` (milestone 3) still works;

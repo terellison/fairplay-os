@@ -68,6 +68,29 @@ pub struct FileId {
     pub generation: Option<u32>,
 }
 
+impl FileId {
+    /// The allowlist map entry (EXEC_ALLOWED or INPUT_ALLOWED) for this
+    /// file in `domain`.
+    pub fn entry(&self, domain: u32) -> (ExecKey, ExecAllow) {
+        let key = ExecKey {
+            domain,
+            dev: self.dev,
+            ino: self.ino,
+        };
+        let value = match self.generation {
+            Some(generation) => ExecAllow {
+                generation,
+                flags: EXEC_CHECK_GENERATION,
+            },
+            None => ExecAllow {
+                generation: 0,
+                flags: 0,
+            },
+        };
+        (key, value)
+    }
+}
+
 /// The kernel's dev_t encoding (`MKDEV`), which is what BPF reads from
 /// `super_block.s_dev`. Not glibc's `makedev`.
 pub fn kdev(major: u32, minor: u32) -> u32 {
@@ -225,11 +248,22 @@ pub fn ids_of<'a>(files: impl IntoIterator<Item = &'a File>) -> Result<Vec<FileI
 /// Identity of an approved overlay (`--overlay`). Any regular file, with
 /// symlinks resolved now; no format check, the operator named it.
 pub fn overlay_file(path: &Path, mounts: &Mounts) -> Result<FileId> {
+    named_file("overlay", path, mounts)
+}
+
+/// Identity of an executable allowed to make virtual input
+/// (`--input-allow`, milestone 7), the same way as an overlay. The kernel
+/// compares it with the creating process's `mm->exe_file`.
+pub fn input_tool_file(path: &Path, mounts: &Mounts) -> Result<FileId> {
+    named_file("input tool", path, mounts)
+}
+
+fn named_file(what: &str, path: &Path, mounts: &Mounts) -> Result<FileId> {
     if !path.is_absolute() {
-        bail!("overlay {}: must be an absolute path", path.display());
+        bail!("{what} {}: must be an absolute path", path.display());
     }
     let f = open_regular(path, true)
-        .with_context(|| format!("overlay {}: not a regular file", path.display()))?;
+        .with_context(|| format!("{what} {}: not a regular file", path.display()))?;
     let st = statx(&f, mounts).with_context(|| format!("statx {}", path.display()))?;
     Ok(id_of(&f, &st))
 }
@@ -330,22 +364,11 @@ impl ExecEntries {
                 ),
             ));
         }
-        let by_key: BTreeMap<(u32, u64), Option<u32>> = files
-            .iter()
-            .map(|f| ((f.dev, f.ino), f.generation))
-            .collect();
+        let by_key: BTreeMap<(u32, u64), &FileId> =
+            files.iter().map(|f| ((f.dev, f.ino), f)).collect();
         let mut added = vec![];
         for &key in &new {
-            let value = match by_key[&(key.dev, key.ino)] {
-                Some(generation) => ExecAllow {
-                    generation,
-                    flags: EXEC_CHECK_GENERATION,
-                },
-                None => ExecAllow {
-                    generation: 0,
-                    flags: 0,
-                },
-            };
+            let (_, value) = by_key[&(key.dev, key.ino)].entry(domain);
             if let Err(e) = self.table.insert(map, key, value) {
                 for &k in &added {
                     let _ = self.table.remove(map, k);
@@ -737,6 +760,31 @@ mod tests {
         // A symlink is resolved once, at startup.
         symlink(&f, t.0.join("link.so")).unwrap();
         assert_eq!(overlay_file(&t.0.join("link.so"), &m).unwrap().ino, ino(&f));
+        // Input tools are identified the same way.
+        assert_eq!(
+            input_tool_file(&f, &m).unwrap(),
+            overlay_file(&f, &m).unwrap()
+        );
+        let e = input_tool_file(Path::new("remapper"), &m).unwrap_err();
+        assert!(e.to_string().starts_with("input tool remapper"), "{e}");
+    }
+
+    #[test]
+    fn map_entries_check_the_generation_when_known() {
+        let f = FileId {
+            dev: 1,
+            ino: 2,
+            generation: Some(3),
+        };
+        let (k, v) = f.entry(9);
+        assert_eq!((k.domain, k.dev, k.ino), (9, 1, 2));
+        assert_eq!((v.generation, v.flags), (3, EXEC_CHECK_GENERATION));
+        let (_, v) = FileId {
+            generation: None,
+            ..f
+        }
+        .entry(9);
+        assert_eq!((v.generation, v.flags), (0, 0));
     }
 
     #[test]

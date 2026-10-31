@@ -23,7 +23,7 @@ use fairplay_common::{ExecAllow, ExecKey, READER_FILES_CAPACITY};
 
 use crate::{
     domain::bprm_file,
-    exec_allow::FileIdentity,
+    exec_allow::{file_id, listed},
     maps::{PROTECTED, READERS},
     vmlinux::{file, linux_binprm, task_struct},
 };
@@ -55,7 +55,7 @@ fn try_reader_exec(task: *const task_struct, bprm: *const linux_binprm) -> Resul
     // interpreter.
     let f: *const file = unsafe { bpf_probe_read_kernel(bprm_file(bprm))? };
     let reader = !f.is_null()
-        && matches!(FileIdentity::of(f), Ok(Some(id)) if id.listed(&READER_FILES, domain));
+        && matches!(file_id(f), Ok((dev, ino, generation)) if listed(&READER_FILES, domain, dev, ino, generation));
     if reader {
         // Fails only if READERS is full: then it stays a plain member,
         // which fails closed (it can't read the game).

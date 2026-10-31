@@ -1,7 +1,7 @@
 //! Facts about the machine and its users, read from the kernel and the user
 //! database. Best-effort: a missing file means "unknown", not an error.
 
-use std::{fs, os::fd::AsRawFd, path::Path};
+use std::{fs, os::fd::AsRawFd};
 
 use anyhow::{bail, Result};
 use nix::{
@@ -21,30 +21,6 @@ pub fn parse_lockdown(s: &str) -> Option<String> {
     let start = s.find('[')? + 1;
     let len = s[start..].find(']')?;
     Some(s[start..start + len].to_owned())
-}
-
-/// Names of virtual input devices (`/sys/devices/virtual/input/input*`):
-/// the kind `/dev/uinput` creates. Real keyboards and mice hang off a bus
-/// and don't appear here.
-pub fn virtual_input_devices() -> Vec<String> {
-    virtual_input_devices_in(Path::new("/sys/devices/virtual/input"))
-}
-
-pub fn virtual_input_devices_in(dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return vec![];
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("input"))
-        .map(|e| {
-            fs::read_to_string(e.path().join("name"))
-                .map(|n| n.trim_end().to_owned())
-                .unwrap_or_else(|_| e.file_name().to_string_lossy().into_owned())
-        })
-        .collect();
-    names.sort();
-    names
 }
 
 /// A uid's primary gid and full group list, from the user database.
@@ -123,19 +99,6 @@ mod tests {
             Some("integrity")
         );
         assert_eq!(parse_lockdown("garbage"), None);
-    }
-
-    #[test]
-    fn virtual_input_listing() {
-        let dir = std::env::temp_dir().join(format!("fairplayd-vinput-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("input7")).unwrap();
-        fs::write(dir.join("input7/name"), "clicker\n").unwrap();
-        fs::create_dir_all(dir.join("input3")).unwrap(); // no name file
-        fs::create_dir_all(dir.join("mice")).unwrap(); // not a device
-        assert_eq!(virtual_input_devices_in(&dir), vec!["clicker", "input3"]);
-        fs::remove_dir_all(&dir).unwrap();
-        assert!(virtual_input_devices_in(&dir).is_empty());
     }
 
     #[test]
