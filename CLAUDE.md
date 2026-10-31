@@ -59,20 +59,34 @@ Known VM limits:
 
 - Keep the design doc's split: the kernel enforces, user space decides, the server sets policy.
 - Prefer existing kernel mechanisms (BPF LSM, cgroups v2, IMA) over new kernel code.
-- Never commit to or push `master`. All work goes through a PR; the owner's approval on the
-  PR is the review.
+- Never commit to or push `master`. All work goes through a PR. The lead agent's approval is
+  the review; the owner also approves anything touching `docs/design.md`, `CLAUDE.md`,
+  `tools/` or `.github/` (see `.github/CODEOWNERS`).
 
 ## Working as an agent (GitHub)
 
-Several agents may work on this repo at once. Each acts on GitHub as the
-`fairplay-os-agents` GitHub App, never as the owner, so the owner's approval is a real
-second identity. `master` is protected by two rulesets: all four CI checks must pass on a
-branch that is up to date with `master`, and a PR needs the owner's approval. New
-commits on the branch dismiss an earlier approval; merging `master` in (the owner's
-Update branch button) does not.
+Several agents work on this repo at once, in two roles, each a GitHub App so no agent ever
+acts as the owner:
 
-1. **Check for overlap first:** `gh pr list` and read open PR titles. If another agent is
-   already on the same files or milestone, pick something else or say so.
+- **Workers** act as `fairplay-os-agents`. A worker takes one task from the lead, works on
+  its own branch and worktree, and opens a PR. Workers never approve anything.
+- **The lead** acts as `fairplay-os-lead`, which can review, approve and comment but can't
+  push code. It splits milestones into tasks, assigns them, reviews each PR against the
+  design doc, runs the VM tests itself for PRs that touch BPF or `fairplayd`, approves, and
+  drafts design changes for the owner. The lead never approves a PR it wrote. Its token:
+  `FAIRPLAY_AGENT_ENV=~/.config/fairplay-lead/app.env tools/gh-app-token.sh`.
+- **The owner** approves design and workflow changes (code owners) and can stop everything
+  by turning off auto-merge or uninstalling the lead App.
+
+`master` is protected by two rulesets: all four CI checks must pass on a branch that is up
+to date with `master`, and a PR needs one approval: the lead's, plus the owner's when it
+touches a code-owned file. New commits on the branch dismiss an earlier approval; merging
+`master` in (the Update branch button) does not.
+
+Steps for a worker:
+
+1. **Stick to your task.** Run `gh pr list` and read open PR titles. If another PR already
+   touches the same files, tell the lead before you start rather than racing it.
 2. **Get a token** (1 hour, this repo only; config in `~/.config/fairplay-agents/`):
    ```
    export GH_TOKEN="$(tools/gh-app-token.sh)"
@@ -87,19 +101,20 @@ Update branch button) does not.
    export GIT_AUTHOR_EMAIL='350097673+fairplay-os-agents[bot]@users.noreply.github.com'
    export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
    ```
-3. **One task, one branch:** `agent/<short-topic>` from the latest `origin/master`. Keep the
-   PR small and about one thing; small PRs from parallel agents conflict less.
+3. **One task, one branch:** `agent/<short-topic>` from the latest `origin/master`, in your
+   own `git worktree`. Keep the PR small and about one thing; small PRs conflict less.
 4. **Before pushing:** run what CI runs (`cargo fmt --check`, `cargo clippy -- -D warnings`,
    `cargo test --workspace`, shellcheck, and `vm/test-milestone2.sh` if assetguard or `vm/`
    changed). CI can't load BPF programs: if you touch `crates/*-ebpf` or `fairplayd`, run
-   the milestone 1/3 tests on the VM and paste the output into the PR.
-5. **Open the PR** with what changed, why, and how you tested it, and request the owner's
-   review so the Approve option shows up for them (REST, because Ubuntu's gh 2.45 breaks on
-   `gh pr edit`): `gh api -X POST repos/terellison/fairplay-os/pulls/<n>/requested_reviewers -f 'reviewers[]=terellison'`.
-   Then arm auto-merge: `gh pr merge --auto --squash`. It merges once the owner approves
-   and checks pass; never try to merge any other way.
+   the milestone 1/3/4 tests on the VM and paste the output into the PR. The VM is shared,
+   so run anything that loads BPF programs under the lock, one agent at a time:
+   `flock /run/lock/fairplay-vm-tests ./vm/test-milestone4.sh`.
+5. **Open the PR** with what changed, why, and how you tested it, then arm auto-merge:
+   `gh pr merge --auto --squash`. It merges once the PR is approved and checks pass; never
+   try to merge any other way. The lead finds new PRs on its own, and GitHub asks the owner
+   automatically when the PR touches a code-owned file.
 6. **When `master` moves**, update your branch (merge or rebase `origin/master`) so checks
-   rerun against what will actually land. A merge of `master` keeps the owner's approval;
-   any other new commit dismisses it, and the owner has to approve again.
+   rerun against what will actually land. A merge of `master` keeps approvals; any other
+   new commit dismisses them, and the PR has to be approved again.
 7. **The App can't edit `.github/workflows/`.** If CI needs changing, describe the change
    in the PR or an issue and the owner will make it.
