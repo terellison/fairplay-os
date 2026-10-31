@@ -325,7 +325,9 @@ pub struct ViolationEvent {
     pub target: u32,
     /// LSM hook that denied it, e.g. `ptrace_access_check`, or `mmap_file`
     /// / `file_mprotect` for code the game tried to map that isn't on its
-    /// allowlist (then `caller` and `target` are both the game). For
+    /// allowlist (then `caller` and `target` are both the game), or
+    /// `bprm_check_security` for a program not on it that the game (or a
+    /// process it started) tried to exec; `execve` failed. For
     /// virtual input: `uinput_create`, `uhid_create`, `evdev_write`, or
     /// `uinput_write` (input through a uinput device, refused while a
     /// session blocks virtual input).
@@ -340,7 +342,8 @@ pub struct ViolationEvent {
     /// node's kernel `dev_t` (`major << 20 | minor`).
     pub mode: u32,
     /// File name (no directory) of the file it tried to map, for
-    /// `mmap_file` and `file_mprotect`. For `uinput_create`, the name the
+    /// `mmap_file` and `file_mprotect`, or exec, for
+    /// `bprm_check_security`. For `uinput_create`, the name the
     /// caller gave the device; for the others, the device node (`uhid`,
     /// `event3`, `uinput`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
