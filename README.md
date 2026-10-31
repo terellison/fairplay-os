@@ -576,7 +576,8 @@ The milestone 4, 5, 6 and 8 tests now launch from manifests too.
 
 The design doc lets the vendor's anti-cheat see the game's memory, the
 game's install directory, its own data and the `fairplayd` socket: not the
-home directory, not other programs, not the browser. Two layers do that.
+home directory, not other programs, not the browser. Two walls do that
+(memory and files, 1 and 2 below); 3 to 6 close the gaps around them.
 
 **Not Landlock.** A Landlock-sandboxed process may not ptrace (or
 `process_vm_readv`, or open `/proc/<pid>/mem` of) any process outside its
@@ -640,24 +641,110 @@ the `launch_failed` error.
 `"sandbox": {"data_dir": ..., "read_only": [game dir, anti-cheat dir]}`;
 the game has none. The game is not sandboxed.
 
-**Known gaps.** The sandbox assumes the
-anti-cheat runs as the user: run as root (as the memory tests do, to get
-past Yama) it could mount its way out. If fairplayd restarts, a running
-anti-cheat keeps a bind of the old socket file.
+**Who counts as sandboxed: the `SANDBOXED` map** (tgid -> domain, in
+`crates/fairplay-ebpf/src/maps.rs`). fairplayd puts the anti-cheat in it
+while the child is still paused, before it runs any of its own code. The
+fork tracepoint copies the entry to every process the anti-cheat starts,
+and the exit tracepoint removes it. Being in `SANDBOXED` doesn't let a
+process do anything extra. It only makes the BPF LSM (BPF programs on the
+kernel's Linux Security Module checkpoints) apply the four rules below as
+well. Every sandboxed process is in `PROTECTED` too.
+
+**3. It reads the game but can't change it.** A reader in the sandbox may
+read the game's memory (`process_vm_readv`, reading `/proc/<game>/mem`)
+and its module list (`/proc/<game>/maps`), and nothing more:
+
+- A **seccomp** filter (secure computing mode: a per-process list of
+  system calls the kernel refuses) goes on after the privilege drop, just
+  before the exec. Everything the anti-cheat starts inherits it. It returns
+  EPERM ("operation not permitted") for `ptrace` (attaching, poking memory,
+  making the game run code), `process_vm_writev`, `pidfd_getfd` (copying
+  one of the game's open files, such as Wine's handle on `/`) and
+  `process_madvise`. As defence in depth (#30) it also refuses calls nothing
+  that reads a game needs, each of which could change what the sandbox
+  sees:
+  - namespaces: `setns`, `unshare`, and `clone` with any `CLONE_NEW*` flag.
+    A new user namespace would make even an ordinary user root inside it.
+  - mounts: `mount`, `umount2`, the new mount API (`open_tree`,
+    `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`,
+    `mount_setattr`), `pivot_root`, `chroot`.
+  - the kernel keyring: `keyctl`, `add_key`, `request_key`.
+  - `bpf`.
+
+  `clone3` gets ENOSYS ("not implemented") instead. It passes its flags in
+  memory, where seccomp can't see them, and on ENOSYS glibc falls back to
+  plain `clone` for threads and new processes. A system call made through
+  another ABI (application binary interface: 32-bit compat, x32) kills the
+  process. fairplayd's own mounts and `pivot_root` for the sandbox happen
+  before the filter goes on.
+- Seccomp sees system call numbers, not paths, so `file_open` refuses
+  opening any `/proc/<pid>/mem` (or `task/<tid>/mem`) **for writing**
+  (logged as `hook=proc_mem_write`).
+- `task_kill` refuses signals to anything outside the sandbox, the game
+  included (logged as `hook=task_kill`). Stopping or killing a cheater's
+  game is the server's call.
+
+**4. No way out through `/proc` links.** `/proc/<pid>/root`, `cwd`, `exe`,
+`fd/N` and `map_files/*` (also under `task/<tid>/`) are "magic links":
+opening one goes straight to that process's own view of the files,
+whatever mount namespace the opener is in. The game's `cwd` may be your
+home directory, and Wine holds a handle on `/`. `inode_follow_link`
+refuses following these links for any process outside the sandbox, the
+game included (logged as `hook=proc_link`, naming the link). Reading a link as
+text (`readlink`) still works, as do `fdinfo` and the sandbox's own links.
+
+**5. No abstract Unix sockets.** An abstract socket (`@name`, with no file
+behind it) belongs to the network namespace, which the anti-cheat shares to
+reach its server, so the mount namespace can't hide it. X11 and XWayland
+listen on `@/tmp/.X11-unix/X<n>` (keylogging, screenshots), and so do some
+system daemons. `socket_connect` and `socket_sendmsg` refuse any abstract
+Unix-socket (`AF_UNIX`) address (logged as `hook=unix_abstract`, naming
+the socket). Unix sockets with a path are already limited to what the
+sandbox's files hold, which is only the fairplayd socket.
+
+**6. Its `/proc` lists only its sandbox and the game.** The sandbox's
+`/proc` is mounted `hidepid=invisible,gid=2147483646` (a group no account
+uses). With `hidepid`, procfs (the kernel's `/proc` file system) asks the
+same ptrace checkpoint about every process it would list, and the outward
+rule says no for everything outside the domain. So the anti-cheat doesn't
+see other programs' names, command lines or environments at all. These
+look-only checks are denied quietly; one violation per process per
+directory scan would flood the stream. Attempts to *act* on a process are
+always recorded.
+
+**Known gaps.** The sandbox assumes the anti-cheat runs as the user. Run
+as root (as the memory tests do, to get past Yama), it keeps root's
+capabilities. Seccomp now stops it mounting or making namespaces, but
+other root-only calls aren't filtered, such as `open_by_handle_at`, which
+opens a file by its inode number from any mount namespace. Dropping
+capabilities is the real fix. If fairplayd restarts, a running anti-cheat
+keeps a bind of the old socket file.
 
 The exit test, inside the VM, as your normal user:
 
     flock /run/lock/fairplay-vm-tests ./vm/test-milestone9b.sh
 
 The script's comments and step names list each check. As root: (a) the
-sandboxed mock vendor reads the game; (c) it reads an unprotected `cheatsim
-game` (the "browser") 0/3; (f) a reader's fork-only child, and the reader
-itself after it execs `/bin/sh`, read the game 0/3. As you: (b) the vendor
-can't read a marker file in `$HOME`, and `ls $HOME` finds no such directory;
-(d) it writes and reads back a file in its data directory, which appears in
-the real per-vendor directory, owned by you; its `/tmp` is private; (e) it
-gets its session's `session_status` through the socket; (g) the game itself
-still reads `$HOME` and its install directory.
+sandboxed mock vendor reads the game's memory and `maps`, the kernel lists
+it in `SANDBOXED` and the game not, and `ptrace` gets EPERM; (1) it can't
+write the game (`process_vm_writev` EPERM, a write-open of
+`/proc/<game>/mem` refused with a `DENIED` line, the secret intact) or
+signal it; (5) each system call on the seccomp list above gets EPERM
+(`clone3` ENOSYS), while the game, outside the sandbox, gets the kernel's
+ordinary errors for the same harmless calls; (c) it reads an unprotected
+`cheatsim game` (the "browser") 0/3, and the browser's `/proc` entries
+aren't there; (f) a reader's fork-only child, and the reader itself after
+it execs `/bin/sh`, read the game 0/3. As you: (b) the vendor can't read a
+marker file in `$HOME`, and `ls $HOME` finds no such directory; (2) it
+can't reach that file through the game's `/proc/<pid>/cwd`, `root` or
+`fd/N` either, with one `DENIED` line per attempt; (3) it can't connect or
+send to an abstract socket the game can reach; (4) its `ls /proc` shows
+exactly two processes (itself and the game) and logs nothing; (5) the
+seccomp list again; (d) it writes and reads back a file in its data
+directory, which appears in the real per-vendor directory, owned by you;
+its `/tmp` is private; (e) it gets its session's `session_status` through
+the socket; (g) the game itself still reads `$HOME` and its install
+directory.
 
 ## Known gaps on arm64 QEMU
 
