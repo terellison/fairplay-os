@@ -171,7 +171,21 @@ the protection domain in step with the process tree, from
 - **At exit** (`tp_btf/sched_process_exit`): when the last thread of a
   protected process exits, its entry is removed. That happens before the
   process is reaped, so before its PID can be handed to anything else.
-- **Map full**: if `PROTECTED` (1024 entries) can't take a child, the child
+- **Member cap** (issue #21): one game that forks without end must not fill
+  `PROTECTED` for everyone. A domain may have at most `--member-cap`
+  processes (default 1024) forked into it at once; the processes `fairplayd`
+  launched don't count. Beyond that, a protected process's fork fails with
+  `EAGAIN`, like `RLIMIT_NPROC`, in a `task_alloc` LSM hook. The check and
+  the count are one atomic add, the place is given back at exit (or at
+  `task_free` if the fork failed), so racing forks can't slip past it and
+  the count can't drift (see `crates/fairplay-ebpf/src/members.rs`).
+  `PROTECTED` holds 32 caps' worth (33,792 entries), and `fairplayd` runs at
+  most `32768 / cap - 1` sessions at once, so the caps of running sessions
+  always fit. `session_status` reports `member_cap`, `forked_members` and
+  `forks_denied`; each refused fork is a `task_alloc` violation, at most 8
+  a second per session, each one's `mode` saying how many refusals it
+  stands for.
+- **Map full**: if `PROTECTED` can't take a child anyway, the child
   runs unprotected, and the kernel counts it per domain in `UNFOLLOWED`.
   `session_status` then reports `protection_degraded: true` and
   `unprotected_children`. Its direct parent still shields it from reads (the
@@ -193,7 +207,12 @@ with the game's domain, that a root attack on the grandchild leaks 0/3 with 3
 inside the domain), and that the grandchild's entry is gone while it is
 still an unreaped zombie. As controls, the same game started without
 `fairplayd` leaks 3/3, and with `PROTECTED` filled up a new child is reported
-as `protection_degraded`.
+as `protection_degraded`. With a member cap of 64, `cheatsim forkbomb` (four
+processes forking at once, for two seconds after the first refusal) forks
+exactly 64 and then gets `EAGAIN` every time; `forks_denied` matches its own
+count of refusals, the `task_alloc` lines stay under the rate limit, a
+second game still launches and is protected, and once the bomb is killed
+its domain, the member count and the `COUNTED`/`PENDING` maps are empty.
 
 ## Milestone 6: fairplayd protects itself
 

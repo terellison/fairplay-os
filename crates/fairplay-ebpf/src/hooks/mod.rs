@@ -14,4 +14,6 @@ mod inode_follow_link;
 mod mmap_file;
 mod ptrace;
 mod socket;
+mod task_alloc;
+mod task_free;
 mod task_kill;

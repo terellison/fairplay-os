@@ -23,7 +23,10 @@
 //! `/dev/uinput` and clicks, `cheatsim uhid` makes one through `/dev/uhid`,
 //! and `cheatsim inject --device /dev/input/eventN` writes an event into an
 //! existing device (see `input`).
+//! Issue #21: `cheatsim forkbomb` forks until a fork fails, and says how
+//! many it got and why (see `forkbomb`).
 
+mod forkbomb;
 mod input;
 
 use std::{
@@ -149,6 +152,20 @@ enum Cmd {
         #[arg(long)]
         device: String,
     },
+    /// Fork until a fork fails (issue #21: a game filling PROTECTED), from
+    /// several processes at once, and keep every process alive until
+    /// killed.
+    Forkbomb {
+        /// Processes forking at once.
+        #[arg(long, default_value_t = 4)]
+        workers: u32,
+        /// Stop each worker after this many forks.
+        #[arg(long, default_value_t = 100_000)]
+        max: u32,
+        /// After the first refusal, keep trying for this many seconds.
+        #[arg(long, default_value_t = 0)]
+        keep_trying: u64,
+    },
 }
 
 const SECRET: u64 = 0x5EC2_E713_37C0_DE11;
@@ -182,6 +199,11 @@ fn main() -> ExitCode {
             wait_stdin,
         } => input::uhid(&name, moves, hold, bogus_first, wait_stdin),
         Cmd::Inject { device } => input::inject(&device),
+        Cmd::Forkbomb {
+            workers,
+            max,
+            keep_trying,
+        } => forkbomb::forkbomb(workers, max, keep_trying),
     }
 }
 

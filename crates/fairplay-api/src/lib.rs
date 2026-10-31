@@ -243,6 +243,19 @@ pub struct SessionInfo {
     /// How many such processes (a lower bound).
     #[serde(default)]
     pub unprotected_children: u64,
+    /// The most processes the session's domain may have forked at once
+    /// (fairplayd's `--member-cap`). A protected process's fork beyond it
+    /// fails with `EAGAIN`, and is a `task_alloc` violation. The processes
+    /// fairplayd launched (`game`, `members`) don't count.
+    #[serde(default)]
+    pub member_cap: u32,
+    /// Processes forked into the domain that are still alive.
+    #[serde(default)]
+    pub forked_members: u64,
+    /// Forks refused at the cap, in total. The `task_alloc` violations are
+    /// rate-limited; each says in `mode` how many refusals it stands for.
+    #[serde(default)]
+    pub forks_denied: u64,
     /// The signed manifest the session was launched from (milestone 9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Box<ManifestInfo>>,
@@ -607,6 +620,9 @@ mod tests {
                 violations: 3,
                 protection_degraded: true,
                 unprotected_children: 2,
+                member_cap: 1024,
+                forked_members: 5,
+                forks_denied: 0,
                 manifest: Some(Box::new(ManifestInfo {
                     name: "g".into(),
                     sha256: "00".repeat(32),

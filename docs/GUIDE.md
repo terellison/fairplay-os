@@ -292,8 +292,20 @@ they're **tracepoints**, which only watch:
 `fairplayd` still removes the game it launched itself; the kernel has
 usually done it already, and removing twice is harmless.
 
-**When the list is full.** `PROTECTED` holds 1024 processes. If a new child
-doesn't fit, it runs unprotected. Rather than let that happen silently, the
+**A game that forks without end.** The list is shared by every game on the
+machine, so one game that keeps starting processes (a *fork bomb*, on
+purpose or by a bug) could fill it for everyone. Each game may therefore
+have at most a set number of processes it started itself (the *member
+cap*, 1024 unless `fairplayd --member-cap` says otherwise) alive at once.
+Past that, the kernel refuses the game's next fork with `EAGAIN` ("try
+again"), the same error Linux gives a user over their process limit, and
+reports it as a `task_alloc` violation, at most 8 a second so a fork bomb
+can't drown everything else. The list is sized so the caps of all games
+`fairplayd` will run at once fit; `session_status` shows the cap, how many
+processes the game has started, and how many forks were refused.
+
+**When the list is full.** If a new child still doesn't fit, it runs
+unprotected. Rather than let that happen silently, the
 kernel counts it per domain (the `UNFOLLOWED` map) and `session_status`
 reports **`protection_degraded`**, with how many. What a game server does
 about that is its own policy.
@@ -309,7 +321,10 @@ nothing and print three `DENIED` lines. It also checks that the grandchild
 is in `PROTECTED` with the game's domain, that the Wine and `LD_` variables
 never reached it, that its entry is gone while it's still a zombie, that the
 same game started without `fairplayd` leaks 3/3, and that a full `PROTECTED`
-shows up as `protection_degraded`.
+shows up as `protection_degraded`. And it launches a fork bomb (`cheatsim
+forkbomb`) with a cap of 64: it gets exactly 64 processes and then `EAGAIN`,
+a second game still launches and is protected, and killing the bomb leaves
+nothing behind.
 
 ### fairplayd protects itself (milestone 6)
 

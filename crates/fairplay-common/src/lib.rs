@@ -29,6 +29,30 @@ pub const READER_FILES_CAPACITY: u32 = 1024;
 /// Name of the map from protection domain to the number of processes started
 /// in it that could not be protected (PROTECTED was full).
 pub const MAP_UNFOLLOWED: &str = "UNFOLLOWED";
+/// Name of the map from protection domain to its [`Members`] count
+/// (issue #21): how many processes the kernel has forked into it, and how
+/// many forks it refused at the cap.
+pub const MAP_MEMBERS: &str = "MEMBERS";
+/// Name of the one-entry array (index 0, a `u32`) holding the most
+/// processes a domain may have forked into PROTECTED at once.
+pub const MAP_MEMBER_CAP: &str = "MEMBER_CAP";
+/// Processes one protection domain may have forked into PROTECTED at once,
+/// unless fairplayd's `--member-cap` says otherwise. The processes
+/// fairplayd launches itself (the game, joined programs) don't count. A
+/// Proton game is a few dozen processes.
+pub const DEFAULT_MEMBER_CAP: u32 = 1024;
+/// Forked members all domains together may have: [`DEFAULT_MEMBER_CAP`]
+/// for 32 domains. fairplayd runs at most `MEMBER_BUDGET / cap - 1`
+/// sessions at once (one domain is `--protect`'s), so the caps of running
+/// sessions always fit in PROTECTED.
+pub const MEMBER_BUDGET: u32 = 32 * DEFAULT_MEMBER_CAP;
+/// Entries PROTECTED holds (and READERS and SANDBOXED, whose processes are
+/// all in PROTECTED too): [`MEMBER_BUDGET`], plus room for what fairplayd
+/// puts there itself (at most 512 launched processes, and `--protect`).
+pub const PROTECTED_CAPACITY: u32 = MEMBER_BUDGET + 1024;
+/// [`Hook::TaskAlloc`] records one domain gets per second at most; the
+/// refusals in between are folded into the next record's `mode`.
+pub const FORK_DENIED_RECORDS_PER_SEC: u32 = 8;
 /// Name of the one-entry array holding fairplayd's own tgid while it
 /// protects itself, 0 otherwise (milestone 6).
 pub const MAP_SELF_PROTECT: &str = "SELF_PROTECT";
@@ -135,6 +159,13 @@ pub enum Hook {
     /// that is not on its executable-mapping allowlist. `execve` fails with
     /// EACCES; `mode` is 0.
     BprmCheck = 40,
+    // Issue #21, fork bombs: numbers 45 to 49.
+    /// `task_alloc`: a protected process's fork (a new process, not a
+    /// thread) refused with `EAGAIN` because its domain has
+    /// [`MAP_MEMBER_CAP`] forked members already. Target 0; `mode` is how
+    /// many forks were refused since the domain's previous record (at most
+    /// [`FORK_DENIED_RECORDS_PER_SEC`] records a second).
+    TaskAlloc = 45,
 }
 
 /// [`Violation::flags`]: the kernel let it happen and only reports it
@@ -243,6 +274,25 @@ pub const FS_SYSTEM: u32 = 1;
 /// `ptrace_access_check` already guards, or if the game hands it the fd.
 pub const FS_ANON: u32 = 2;
 
+/// Value of a [`MAP_MEMBERS`] entry. fairplayd creates it, zeroed, when a
+/// domain starts, before the domain has a process; from then on only the
+/// kernel writes it. `live` and `denied` change by atomic add only.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Members {
+    /// Processes forked into the domain that haven't exited, plus forks in
+    /// flight that passed the cap check.
+    pub live: u64,
+    /// Forks refused at the cap, in total.
+    pub denied: u64,
+    /// Rate limit for [`Hook::TaskAlloc`] records: when the current
+    /// one-second window started (`bpf_ktime_get_ns`), the records made in
+    /// it, and refusals not yet in a record. Best effort (not atomic).
+    pub window_start: u64,
+    pub window_records: u32,
+    pub unreported: u32,
+}
+
 #[cfg(feature = "user")]
 mod user {
     // SAFETY: these are repr(C), Copy, contain only integers and have no
@@ -251,4 +301,6 @@ mod user {
     unsafe impl aya::Pod for super::Violation {}
     unsafe impl aya::Pod for super::ExecKey {}
     unsafe impl aya::Pod for super::ExecAllow {}
+    // Members: three u64s then two u32s, 32 bytes, no padding.
+    unsafe impl aya::Pod for super::Members {}
 }
