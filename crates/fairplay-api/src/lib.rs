@@ -275,7 +275,9 @@ pub struct ViolationEvent {
     /// LSM hook that denied it, e.g. `ptrace_access_check`, or `mmap_file`
     /// / `file_mprotect` for code the game tried to map that isn't on its
     /// allowlist (then `caller` and `target` are both the game). For
-    /// virtual input: `uinput_create`, `uhid_create` or `evdev_write`.
+    /// virtual input: `uinput_create`, `uhid_create`, `evdev_write`, or
+    /// `uinput_write` (input through a uinput device, refused while a
+    /// session blocks virtual input).
     pub hook: String,
     /// Whether the kernel stopped it. Virtual input is `reported` unless a
     /// session asked for `block_virtual_input`; everything else is
@@ -288,8 +290,8 @@ pub struct ViolationEvent {
     pub mode: u32,
     /// File name (no directory) of the file it tried to map, for
     /// `mmap_file` and `file_mprotect`. For `uinput_create`, the name the
-    /// caller gave the device; for `uhid_create` and `evdev_write`, the
-    /// device node (`uhid`, `event3`).
+    /// caller gave the device; for the others, the device node (`uhid`,
+    /// `event3`, `uinput`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     /// Seconds since the Unix epoch, when fairplayd read the record.

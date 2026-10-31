@@ -280,8 +280,10 @@ and executable that did it:
 - `file_permission`: the first write on an open `/dev/uhid` (that write is
   `UHID_CREATE2`, which creates a virtual HID device), and the first write
   on an open `/dev/input/event*` node (injecting events into an existing
-  device). Once per open file, not per event. A read costs one bit test;
-  any other write, reading the inode's device number.
+  device). Once per open file (and verdict), not per event. While blocking
+  is on, it also checks writes on `/dev/uinput` fds, which are input
+  through an existing uinput device. A read costs one bit test; any other
+  write, reading the inode's device number.
 
 Devices are recognized by device number (`i_rdev`: 10:223 uinput, 10:239
 uhid, 13:64+ evdev), not by path. **Reported, not blocked, by default**:
@@ -295,17 +297,18 @@ Steam Input and accessibility tools rely on virtual devices.
   line and goes to every running session's violation stream with
   `"outcome":"reported"` (other hooks' events say `"denied"`).
 - `launch_protected` takes `block_virtual_input: true` (`fairplayctl launch
-  --block-virtual-input`): while that session runs, the kernel refuses
-  non-allowlisted creation and evdev writes with `EPERM`, printed as
-  `DENIED` and streamed with `"outcome":"denied"`. **This applies to the
-  whole machine, not just the game**, for as long as such a session runs:
-  input devices are machine-wide. Allowlisted tools keep working; any other
-  remapper, macro tool or virtual controller can't make new devices until
-  that game exits. Devices made before it started keep working: writes on
-  a uinput fd aren't checked, and later writes on a uhid fd whose first
-  write (the create) went through are that device's own input and pass.
-  Writes into evdev nodes stay refused, since each injects into another
-  device.
+  --block-virtual-input`). **Blocking stops input from non-allowlisted
+  virtual devices, including ones created before the match.** While that
+  session runs, a process whose executable isn't allowlisted can't create a
+  uinput or uhid device, can't send input through one (any write on a
+  `/dev/uinput` or `/dev/uhid` fd), and can't write into `/dev/input/event*`:
+  each gets `EPERM`, prints a `DENIED` line and is streamed with
+  `"outcome":"denied"`, once per fd (`hook=uinput_write` for input through
+  an existing uinput device). **This applies to the whole machine, not just
+  the game**, for as long as such a session runs, because input devices are
+  machine-wide. Allowlisted tools keep working throughout, including their
+  devices made earlier. Anyone else's devices go silent until the blocking
+  session ends, then work again; nothing is left behind.
 - With no session running nothing is reported; fairplayd still keeps the
   records (the last 256) so it can name the creators of devices made
   before a session started, such as Steam's virtual pads.
@@ -324,7 +327,9 @@ it comes straight from the kernel's record.
 Known limits: the device name is read from uinput's private
 `struct uinput_device` and `struct input_dev`, whose first members (the
 `input_dev` pointer, then the name) have been the same since Linux 2.6 but
-aren't in the BTF we generate. Synthetic input through XTest (X11 /
+aren't in the BTF we generate. A refused uinput writer is reported once per
+fd for the daemon's lifetime, so a second blocking session later doesn't
+report the same fd again (it is still refused). Synthetic input through XTest (X11 /
 XWayland) is not covered here; the design doc handles that with Wayland
 only. uhid is a module (`modprobe uhid`; on Ubuntu it ships in
 `linux-modules-extra`).
@@ -337,8 +342,12 @@ During a protected session it starts `cheatsim clicker` as root (listed in
 `session_status` as made by `cheatsim`, not allowlisted, and a `reported`
 event), an allowlisted copy of it (allowlisted, no event), an evdev write and
 a uhid device (reported; skipped if `/dev/uhid` can't be loaded), then a
-second session with `block_virtual_input` (the clicker, evdev write and uhid
-device get `EPERM` and `denied` events; the allowlisted one still works), and
+second session with `block_virtual_input`. During it a new clicker, an evdev
+write and a new uhid device get `EPERM` and `denied` events; so do a clicker
+made before the match (its clicks stop, are reported once, and resume when
+the session ends) and a uhid fd written to before the match that tries to
+create its device during it. An allowlisted clicker made before the match
+keeps clicking, and the allowlisted tool can still create devices. It also
 checks that nothing is reported with no session running.
 
 ## Milestone 8: executable-mapping allowlist

@@ -9,8 +9,11 @@
 # (fairplayd --input-allow) shows as allowlisted and is never reported. A
 # write into an existing /dev/input/event* node and a uhid device are
 # reported the same way. A session launched with block_virtual_input makes
-# the kernel refuse non-allowlisted creation (EPERM) while it runs. With no
-# session running, nothing is reported. Run inside the VM, as your normal
+# the kernel refuse, while it runs, non-allowlisted creation and input
+# through virtual devices made earlier (a clicker started before the match
+# goes silent, then clicks again after; a uhid fd written to before the match
+# still can't create its device), while an allowlisted clicker keeps
+# clicking. With no session running, nothing is reported. Run inside the VM, as your normal
 # user (not root), from the repo root:  ./vm/test-milestone7.sh
 #
 # Needs sudo, BPF LSM (vm/check-milestone1.sh), bpftool and jq, and the
@@ -56,6 +59,7 @@ DAEMON_PID=""; STREAM_PID=""
 # Everything we start as root runs one of these two programs.
 ours() { sudo pkill -f "^$T/(bin/cheatsim|tools/remapper) (clicker|uhid|inject)" 2>/dev/null; }
 cleanup() {
+  exec 4>&-
   ours
   [ -n "$STREAM_PID" ] && sudo kill "$STREAM_PID" 2>/dev/null
   if [ -S "$SOCK" ]; then
@@ -196,49 +200,66 @@ else
 fi
 
 step "(e) a second session asks for block_virtual_input"
+# Made before it, still sending input when it starts: a non-allowlisted
+# clicker (must go silent) and an allowlisted one (must keep clicking).
+run pre "$CHEAT" clicker --name "m7 pre" --clicks 100000 --interval-ms 50
+check "a non-allowlisted clicker, made before blocking" grep -q "^CREATED uinput m7 pre$" "$T/pre.out"
+run live "$REMAP" clicker --name "m7 remapper live" --clicks 100000 --interval-ms 50
+check "an allowlisted clicker, made before blocking" grep -q "^CREATED uinput m7 remapper live$" "$T/live.out"
 if [ "$HAVE_UHID" = 1 ]; then
-  # Made before blocking and still sending input (5 s of moves) while it starts.
-  run early "$CHEAT" uhid --name "m7 uhid early" --moves 250
-  check "a second uhid device, made before blocking" grep -q "^CREATED uhid m7 uhid early$" "$T/early.out"
+  # The ordering trick: write something harmless to /dev/uhid before the
+  # match, create the device during it.
+  mkfifo "$T/uhidcmd"
+  exec 4<>"$T/uhidcmd"
+  sudo "$CHEAT" uhid --name "m7 uhid late" --bogus-first --wait-stdin <"$T/uhidcmd" >"$T/late-uhid.out" 2>&1 &
+  check "a uhid fd written to (bogus event) before blocking" wait_for "$T/late-uhid.out" "^BOGUS-WRITTEN"
 fi
 sudo "$CTL" --socket "$SOCK" launch --no-stdio --block-virtual-input --run-as "$ME_UID" -- "$T/game/cheatsim" game >"$T/game2.out" 2>&1
 SESSION2="$(jq -r '.ok.launched.session' "$T/game2.out")"
 GPID2="$(jq -r '.ok.launched.pid' "$T/game2.out")"
 echo "      session=$SESSION2 pid=$GPID2"
 check "fairplayd: blocking on" grep -q "is now denied" "$T/daemon.err"
+check "the clicker made before blocking can't click: EPERM on write" \
+  wait_for "$T/pre.out" "^CLICK-BLOCKED: Operation not permitted"
+check "DENIED line: hook=uinput_write file=uinput" \
+  wait_for "$T/daemon.out" "^DENIED .*exe=($CHEAT|cheatsim) target=0 hook=uinput_write .*file=uinput$"
 run blocked "$CHEAT" clicker --name "m7 blocked"
-check "the clicker can't create its device: EPERM" \
+check "a new clicker can't create its device: EPERM" \
   grep -q "^CREATE-BLOCKED uinput m7 blocked: UI_DEV_CREATE: Operation not permitted" "$T/blocked.out"
 check "DENIED line: hook=uinput_create file=m7 blocked" \
   wait_for "$T/daemon.out" "^DENIED .*exe=($CHEAT|cheatsim) target=0 hook=uinput_create .*file=m7 blocked$"
 run remap2 "$REMAP" clicker --name "m7 remapper 2"
-check "the allowlisted remapper still can" grep -q "^CREATED uinput m7 remapper 2$" "$T/remap2.out"
+check "the allowlisted remapper can still create one" grep -q "^CREATED uinput m7 remapper 2$" "$T/remap2.out"
+check "... and click with it" wait_for "$T/remap2.out" "^CLICKED 3$"
 run inject2 "$CHEAT" inject --device "$EVDEV"
 check "the evdev write is refused: EPERM" grep -q "^INJECT-BLOCKED $EVDEV: Operation not permitted" "$T/inject2.out"
 check "DENIED line: hook=evdev_write" \
   wait_for "$T/daemon.out" "^DENIED .*exe=($CHEAT|cheatsim) target=0 hook=evdev_write .*file=$EVNAME$"
 if [ "$HAVE_UHID" = 1 ]; then
   run uhid2 "$CHEAT" uhid --name "m7 uhid blocked"
-  check "the uhid device can't be created: EPERM" \
+  check "a uhid device can't be created: EPERM" \
     grep -q "^CREATE-BLOCKED uhid m7 uhid blocked: UHID_CREATE2: Operation not permitted" "$T/uhid2.out"
+  echo go >&4
+  check "nor one whose fd was written to before blocking: EPERM" \
+    wait_for "$T/late-uhid.out" "^CREATE-BLOCKED uhid m7 uhid late: UHID_CREATE2: Operation not permitted"
+  exec 4>&-
 else
   skip "uhid blocking (no /dev/uhid)"
 fi
+sleep 1   # a few more refused clicks from m7 pre
+check "the pre-made clicker was reported once, not once per click" \
+  test "$(grep -c '^DENIED .*hook=uinput_write' "$T/daemon.out")" -eq 1
+check_not "the allowlisted clicker made before blocking was never refused" grep -q "CLICK-BLOCKED" "$T/live.out"
 status "$SESSION"
-check "the clicker made before blocking is still listed (blocking stops new devices only)" \
-  test -n "$(device "m7 clicker")"
-if [ "$HAVE_UHID" = 1 ]; then
-  check "a uhid device made before blocking kept sending input through it" \
-    wait_for "$T/early.out" "^MOVED 250$"
-  check_not "... and none of its writes was refused" grep -q "MOVE-FAILED" "$T/early.out"
-fi
+check "the clicker made before blocking is still listed" test -n "$(device "m7 pre")"
 sudo "$CTL" --socket "$SOCK" status "$SESSION2" >"$T/status2.json"
 check "the blocking session has its own violations (the attempts above)" \
-  jqt '.ok.status.session.violations >= 2' "$T/status2.json"
+  jqt '.ok.status.session.violations >= 3' "$T/status2.json"
 
 step "(f) the blocking session ends: reported, not denied, again"
 kill "$GPID2"
 check "fairplayd: blocking off" wait_for "$T/daemon.err" "is now reported only"
+check "the pre-made clicker clicks again" wait_for "$T/pre.out" "^CLICK-RESUMED$"
 run after "$CHEAT" clicker --name "m7 after"
 check "CREATED" grep -q "^CREATED uinput m7 after$" "$T/after.out"
 check "REPORTED line" wait_for "$T/daemon.out" "^REPORTED .*hook=uinput_create .*file=m7 after$"
@@ -247,18 +268,17 @@ step "the vendor's stream for session $SESSION"
 sleep 0.3
 grep '"violation"' "$T/events.jsonl" >"$T/v.jsonl"
 jq -c '.event.violation | {caller, exe, target, hook, outcome, file}' "$T/v.jsonl" | indent
+# Order across processes depends on timing, so compare as sorted lists.
+WANT='[["uinput_create","reported","m7 clicker"],["evdev_write","reported",$ev],
+       ["uinput_create","reported","m7 pre"],
+       ["uinput_write","denied","uinput"],["uinput_create","denied","m7 blocked"],["evdev_write","denied",$ev],
+       ["uinput_create","reported","m7 after"]]'
 if [ "$HAVE_UHID" = 1 ]; then
-  WANT='[["uinput_create","reported","m7 clicker"],["evdev_write","reported",$ev],["uhid_create","reported","uhid"],
-         ["uhid_create","reported","uhid"],
-         ["uinput_create","denied","m7 blocked"],["evdev_write","denied",$ev],["uhid_create","denied","uhid"],
-         ["uinput_create","reported","m7 after"]]'
-else
-  WANT='[["uinput_create","reported","m7 clicker"],["evdev_write","reported",$ev],
-         ["uinput_create","denied","m7 blocked"],["evdev_write","denied",$ev],
-         ["uinput_create","reported","m7 after"]]'
+  WANT="$WANT"' + [["uhid_create","reported","uhid"],["uhid_create","reported","uhid"],
+                   ["uhid_create","denied","uhid"],["uhid_create","denied","uhid"]]'
 fi
-check "one event per attempt, in order, each marked reported or denied" \
-  jqt -s --arg ev "$EVNAME" "[.[].event.violation | [.hook, .outcome, .file]] == $WANT" "$T/v.jsonl"
+check "one event per attempt (or per refused fd), each marked reported or denied" \
+  jqt -s --arg ev "$EVNAME" "([.[].event.violation | [.hook, .outcome, .file]] | sort) == ($WANT | sort)" "$T/v.jsonl"
 check "all from cheatsim, against no process (target 0), filed under session $SESSION" \
   jqt -s --argjson s "$SESSION" 'all(.[].event.violation; .exe=="cheatsim" and .target==0 and .session==$s)' "$T/v.jsonl"
 check "the clicker's event names the process session_status named ($CLICKER_PID)" \

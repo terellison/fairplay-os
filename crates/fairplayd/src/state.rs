@@ -636,6 +636,7 @@ pub fn input_hook_name(m: crate::input::Mechanism) -> &'static str {
         Uinput => "uinput_create",
         Uhid => "uhid_create",
         Evdev => "evdev_write",
+        UinputWrite => "uinput_write",
     }
 }
 
@@ -1219,6 +1220,7 @@ mod tests {
         assert_eq!(hook_name(Hook::UinputCreate as u32), "uinput_create");
         assert_eq!(hook_name(Hook::UhidCreate as u32), "uhid_create");
         assert_eq!(hook_name(Hook::EvdevWrite as u32), "evdev_write");
+        assert_eq!(hook_name(Hook::UinputWrite as u32), "uinput_write");
         assert_eq!(hook_name(2), "unknown");
         assert_eq!(hook_name(77), "unknown");
     }

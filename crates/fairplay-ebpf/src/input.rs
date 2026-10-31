@@ -9,7 +9,9 @@
 //! - `/dev/input/event*`: a write injects events into an existing device.
 //!
 //! Everything is reported, never denied, unless a running session asked for
-//! blocking (INPUT_BLOCK). Executables on INPUT_ALLOWED (remappers,
+//! blocking (INPUT_BLOCK). Then a non-allowlisted process may neither create
+//! a virtual device nor send input through one (writes on a `/dev/uinput`
+//! or `/dev/uhid` fd), whenever the device was made. Executables on INPUT_ALLOWED (remappers,
 //! accessibility tools) are never denied and fairplayd doesn't send them to
 //! vendors; they are still recorded so it can say who made each device.
 //!
@@ -122,9 +124,16 @@ pub fn ioctl_verdict(f: *const file, cmd: u32) -> i32 {
     verdict(Hook::UinputCreate, UINPUT_DEV, Name::Str(name))
 }
 
-/// `file_permission`: writes to `/dev/uhid` and to evdev nodes. Reads, and
-/// writes to anything that isn't a character device, cost the mask test
-/// and two reads of the inode.
+/// `file_permission`: writes to `/dev/uinput`, `/dev/uhid` and evdev nodes.
+/// Reads, and writes to anything that isn't a character device, cost the
+/// mask test and two reads of the inode.
+///
+/// While a session blocks virtual input, every write by a non-allowlisted
+/// process through any of the three is denied, whenever the device was
+/// made: a device created before the match goes silent until blocking
+/// ends, then works again. Each fd is recorded when its verdict changes
+/// (its first write, the first denied one, the first allowed one after
+/// that), not once per event.
 #[inline(always)]
 pub fn write_verdict(f: *const file, mask: i32) -> i32 {
     if mask & MAY_WRITE == 0 || f.is_null() {
@@ -135,7 +144,14 @@ pub fn write_verdict(f: *const file, mask: i32) -> i32 {
         return 0;
     }
     let minor = rdev & MINOR_MASK;
-    let hook = if rdev == UHID_DEV {
+    let hook = if rdev == UINPUT_DEV {
+        // Input through a uinput device. Its creation is reported by
+        // `ioctl_verdict`; without blocking a write is nothing new.
+        if !blocking() {
+            return 0;
+        }
+        Hook::UinputWrite
+    } else if rdev == UHID_DEV {
         Hook::UhidCreate
     } else if rdev >> 20 == INPUT_MAJOR && minor >= EVDEV_MINOR_BASE {
         Hook::EvdevWrite
@@ -146,22 +162,22 @@ pub fn write_verdict(f: *const file, mask: i32) -> i32 {
         unsafe { bpf_probe_read_kernel(file_private(f)) }.unwrap_or(core::ptr::null_mut()) as u64;
     let key = [f as u64, private];
     let seen = unsafe { INPUT_SEEN.get(&key) }.copied().unwrap_or(0);
-    // A uhid fd whose first write (the create) went through has its device:
-    // later writes are that device's own input, like writes to a uinput fd,
-    // and blocking stops new devices, not existing ones. Writes into evdev
-    // nodes inject into other devices, so each is checked.
-    if hook == Hook::UhidCreate && seen == SEEN_ALLOWED {
-        return 0;
-    }
     let (flags, ret) = decide();
-    // Record the first write on this fd, and the first denied one (blocking
-    // may have started after the fd's first write went through).
     let state = if ret != 0 { SEEN_DENIED } else { SEEN_ALLOWED };
-    if seen == 0 || (state == SEEN_DENIED && seen != SEEN_DENIED) {
-        record(current_tgid(), 0, hook, rdev, flags, Name::File(f));
+    if state != seen {
+        // uinput writes are only worth a record when refused.
+        if hook != Hook::UinputWrite || state == SEEN_DENIED {
+            record(current_tgid(), 0, hook, rdev, flags, Name::File(f));
+        }
         let _ = INPUT_SEEN.insert(&key, &state, 0);
     }
     ret
+}
+
+/// Is a running session blocking virtual input?
+#[inline(always)]
+fn blocking() -> bool {
+    INPUT_BLOCK.get(0).is_some_and(|&b| b != 0)
 }
 
 /// INPUT_SEEN values.
@@ -187,7 +203,7 @@ fn current_tgid() -> u32 {
 fn decide() -> (u32, i32) {
     if allowlisted() {
         (VIOLATION_REPORTED | VIOLATION_ALLOWLISTED, 0)
-    } else if INPUT_BLOCK.get(0).is_some_and(|&b| b != 0) {
+    } else if blocking() {
         (0, -EPERM)
     } else {
         (VIOLATION_REPORTED, 0)

@@ -96,6 +96,10 @@ pub enum Hook {
     /// `file_permission`: the first write on an open `/dev/input/event*`
     /// node, which injects events into an existing device.
     EvdevWrite = 22,
+    /// `file_permission`: a write on a `/dev/uinput` fd (input through a
+    /// uinput device) while a session blocks virtual input. Recorded only
+    /// when denied, once per fd.
+    UinputWrite = 23,
 }
 
 /// [`Violation::flags`]: the kernel let it happen and only reports it
@@ -137,9 +141,9 @@ pub struct Violation {
     /// For file hooks ([`Hook::MmapFile`], [`Hook::FileMprotect`]): file
     /// name (no directory) of the file it tried to map, same format as
     /// `exe`. For [`Hook::UinputCreate`]: the name the caller gave the new
-    /// device (sysfs `name`). For [`Hook::UhidCreate`] and
-    /// [`Hook::EvdevWrite`]: the device node's file name (`uhid`,
-    /// `event3`). Empty for process targets.
+    /// device (sysfs `name`). For [`Hook::UhidCreate`],
+    /// [`Hook::EvdevWrite`] and [`Hook::UinputWrite`]: the device node's
+    /// file name (`uhid`, `event3`, `uinput`). Empty for process targets.
     pub file: [u8; EXE_NAME_LEN],
 }
 

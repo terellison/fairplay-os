@@ -7,6 +7,8 @@
 //!
 //! Each prints one line a test can wait for: `CREATED ...` or
 //! `CREATE-BLOCKED ...: <error>`, `INJECTED ...` or `INJECT-BLOCKED ...`.
+//! The clicker keeps clicking when a click is refused and prints
+//! `CLICK-BLOCKED: <error>` / `CLICK-RESUMED` each time that changes.
 //! Devices live until `--hold` runs out or the process is killed (the kernel
 //! removes them when the fd closes).
 
@@ -73,9 +75,9 @@ fn hold(secs: u64) {
     thread::sleep(Duration::from_secs(secs));
 }
 
-/// A uinput mouse named `name` that clicks `clicks` times, then stays for
-/// `hold_secs`.
-pub fn clicker(name: &str, clicks: u32, hold_secs: u64) -> ExitCode {
+/// A uinput mouse named `name` that clicks `clicks` times, `interval_ms`
+/// apart, then stays for `hold_secs`.
+pub fn clicker(name: &str, clicks: u32, interval_ms: u64, hold_secs: u64) -> ExitCode {
     let f = match open_rw("/dev/uinput") {
         Ok(f) => f,
         Err(e) => {
@@ -107,21 +109,37 @@ pub fn clicker(name: &str, clicks: u32, hold_secs: u64) -> ExitCode {
     }
     println!("CREATED uinput {name}");
     let mut w = &f;
+    let (mut ok, mut blocked, mut was_blocked) = (0u32, 0u32, false);
     for _ in 0..clicks {
-        for (k, c, v) in [
+        let click = [
             (EV_KEY, BTN_LEFT, 1),
             (EV_SYN, SYN_REPORT, 0),
             (EV_KEY, BTN_LEFT, 0),
             (EV_SYN, SYN_REPORT, 0),
-        ] {
-            if let Err(e) = w.write_all(&input_event(k, c, v)) {
-                println!("CLICK-FAILED: {e}");
-                return ExitCode::FAILURE;
+        ]
+        .into_iter()
+        .try_for_each(|(k, c, v)| w.write_all(&input_event(k, c, v)));
+        match click {
+            Ok(()) => {
+                if was_blocked {
+                    println!("CLICK-RESUMED");
+                }
+                ok += 1;
             }
+            Err(ref e) if !was_blocked => println!("CLICK-BLOCKED: {e}"),
+            Err(_) => {}
         }
-        thread::sleep(Duration::from_millis(20));
+        if click.is_err() {
+            blocked += 1;
+        }
+        was_blocked = click.is_err();
+        thread::sleep(Duration::from_millis(interval_ms));
     }
-    println!("CLICKED {clicks}");
+    if blocked == 0 {
+        println!("CLICKED {ok}");
+    } else {
+        println!("CLICKED {ok} ({blocked} blocked)");
+    }
     hold(hold_secs);
     let _ = ioctl(&f, UI_DEV_DESTROY, 0);
     ExitCode::SUCCESS
@@ -148,8 +166,16 @@ const MOUSE_DESCRIPTOR: &[u8] = &[
 ];
 
 /// A uhid mouse named `name` that moves `moves` times, then stays for
-/// `hold_secs`.
-pub fn uhid(name: &str, moves: u32, hold_secs: u64) -> ExitCode {
+/// `hold_secs`. With `bogus_first`, first writes an event of no known type
+/// (uhid rejects it), printing `BOGUS-WRITTEN`; with `wait_stdin`, waits
+/// for a line on stdin before creating the device.
+pub fn uhid(
+    name: &str,
+    moves: u32,
+    hold_secs: u64,
+    bogus_first: bool,
+    wait_stdin: bool,
+) -> ExitCode {
     let mut f = match open_rw("/dev/uhid") {
         Ok(f) => f,
         Err(e) => {
@@ -157,6 +183,17 @@ pub fn uhid(name: &str, moves: u32, hold_secs: u64) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if bogus_first {
+        let r = f.write_all(&0x7fffu32.to_ne_bytes());
+        println!(
+            "BOGUS-WRITTEN ({})",
+            r.err().map_or("accepted".into(), |e| e.to_string())
+        );
+    }
+    if wait_stdin {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+    }
     let mut ev = vec![0u8; CREATE2_RD_DATA + UHID_DATA_MAX];
     ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
     let n = name.len().min(127);

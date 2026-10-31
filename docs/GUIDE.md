@@ -428,18 +428,20 @@ which device the file is.
   and whether that program is allowlisted.
 - A game whose server wants more can launch with `block_virtual_input`:
   while it runs, fake input from programs not on the allowlist is refused
-  (**EPERM**) and shows up as `DENIED`. Players should know this covers the
-  **whole computer**, not just the game, because input devices aren't
-  per-program: until that game exits, only allowlisted tools can make new
-  fake devices. Ones that already exist keep working.
+  (**EPERM**) and shows up as `DENIED`. Blocking stops input from
+  non-allowlisted virtual devices, **including ones created before the
+  match**: a clicker started earlier goes silent, then works again when
+  the game exits. Players should know this covers the **whole computer**,
+  not just the game, because input devices aren't per-program: until that
+  game exits, only allowlisted tools can make or use fake devices.
 - With no protected game running, nothing is reported.
 
 **Milestone 7's test** (`vm/test-milestone7.sh`) starts a protected game,
 then `cheatsim clicker` as root (listed as made by `cheatsim`, reported), an
 allowlisted copy of it (listed as allowlisted, not reported), an evdev
 write and a uhid device (reported), then a second game that asks for
-blocking (the cheats get `EPERM`, the allowlisted tool still works). On
-this VM the uhid steps are skipped: its kernel module isn't installed.
+blocking: the cheats get `EPERM`, including a clicker started before the
+match, while the allowlisted tool keeps working.
 
 ### Lessons learned writing BPF programs
 

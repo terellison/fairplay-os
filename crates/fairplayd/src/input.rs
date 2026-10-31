@@ -43,6 +43,9 @@ pub enum Mechanism {
     Uinput,
     Uhid,
     Evdev,
+    /// Input through an existing uinput device, refused while a session
+    /// blocks virtual input.
+    UinputWrite,
 }
 
 impl Mechanism {
@@ -51,6 +54,7 @@ impl Mechanism {
             x if x == Hook::UinputCreate as u32 => Some(Self::Uinput),
             x if x == Hook::UhidCreate as u32 => Some(Self::Uhid),
             x if x == Hook::EvdevWrite as u32 => Some(Self::Evdev),
+            x if x == Hook::UinputWrite as u32 => Some(Self::UinputWrite),
             _ => None,
         }
     }
@@ -64,7 +68,8 @@ pub struct InputRecord {
     pub comm: String,
     pub exe: String,
     pub exe_path: Option<String>,
-    /// uinput: the device's name; uhid / evdev: the node (`uhid`, `event3`).
+    /// uinput: the device's name; otherwise the node (`uhid`, `event3`,
+    /// `uinput`).
     pub name: String,
     /// Device node, kernel `dev_t`.
     pub rdev: u32,
@@ -284,6 +289,7 @@ mod tests {
             ),
             rec(Mechanism::Uinput, 20, "cheatsim", "clicker", false),
             rec(Mechanism::Evdev, 30, "cheatsim", "event0", false),
+            rec(Mechanism::UinputWrite, 40, "cheatsim", "clicker", false),
         ]);
         let out = correlate(
             vec![
@@ -414,6 +420,11 @@ mod tests {
         assert!(InputRecord::from_kernel(&v, None, 1).unwrap().denied);
         v.flags = VIOLATION_REPORTED | VIOLATION_ALLOWLISTED;
         assert!(!InputRecord::from_kernel(&v, None, 1).unwrap().reportable());
+        v.hook = Hook::UinputWrite as u32;
+        assert_eq!(
+            InputRecord::from_kernel(&v, None, 1).unwrap().mechanism,
+            Mechanism::UinputWrite
+        );
         v.hook = Hook::PtraceAccess as u32;
         assert!(InputRecord::from_kernel(&v, None, 1).is_none());
     }

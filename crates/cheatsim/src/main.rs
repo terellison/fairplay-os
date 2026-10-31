@@ -102,6 +102,9 @@ enum Cmd {
         name: String,
         #[arg(long, default_value_t = 3)]
         clicks: u32,
+        /// Milliseconds between clicks.
+        #[arg(long, default_value_t = 20)]
+        interval_ms: u64,
         /// Seconds to keep the device after clicking.
         #[arg(long, default_value_t = 3600)]
         hold: u64,
@@ -115,6 +118,13 @@ enum Cmd {
         /// Seconds to keep the device after moving.
         #[arg(long, default_value_t = 3600)]
         hold: u64,
+        /// Before creating the device, write an event uhid rejects (marks
+        /// the fd as written to).
+        #[arg(long)]
+        bogus_first: bool,
+        /// Wait for a line on stdin before creating the device.
+        #[arg(long)]
+        wait_stdin: bool,
     },
     /// Write one event (a SYN_REPORT, which changes nothing) into an
     /// existing input device node.
@@ -141,8 +151,19 @@ fn main() -> ExitCode {
         } => game(depth, &dlopen, dlopen_stdin),
         Cmd::Attack { pid, addr } => attack(Pid::from_raw(pid), addr),
         Cmd::SelfAttack { pid, prog_id } => self_attack(Pid::from_raw(pid), prog_id),
-        Cmd::Clicker { name, clicks, hold } => input::clicker(&name, clicks, hold),
-        Cmd::Uhid { name, moves, hold } => input::uhid(&name, moves, hold),
+        Cmd::Clicker {
+            name,
+            clicks,
+            interval_ms,
+            hold,
+        } => input::clicker(&name, clicks, interval_ms, hold),
+        Cmd::Uhid {
+            name,
+            moves,
+            hold,
+            bogus_first,
+            wait_stdin,
+        } => input::uhid(&name, moves, hold, bogus_first, wait_stdin),
         Cmd::Inject { device } => input::inject(&device),
     }
 }
