@@ -25,7 +25,8 @@
 //! -> {"op":"session_status","session":1}
 //! <- {"ok":{"status":{"protected":true,"session":{...},"lockdown":"none","virtual_input_devices":[]}}}
 //! -> {"op":"attest","nonce":"00ff"}
-//! <- {"error":{"code":"unavailable","message":"...","nonce":"00ff"}}
+//! <- {"ok":{"evidence":{"version":1,"nonce":"00ff","quote":"...",...}}}
+//! <- {"error":{"code":"unavailable","message":"no TPM ...","nonce":"00ff"}}
 //! -> {"op":"violations","session":1}
 //! <- {"ok":{"subscribed":{"session":1}}}
 //! <- {"event":{"violation":{"session":1,"caller":777,"comm":"cheatsim",...}}}
@@ -35,8 +36,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod attest;
 pub mod client;
 pub mod manifest;
+
+pub use attest::WireEvidence;
 
 /// Where fairplayd listens unless told otherwise.
 pub const DEFAULT_SOCKET: &str = "/run/fairplayd.sock";
@@ -120,8 +124,10 @@ pub enum Request {
     },
     /// The caller's sessions (every session, for root).
     ListSessions {},
-    /// Evidence of what booted, for a server-chosen nonce (hex). Milestone 10;
-    /// answers `unavailable` until there is a TPM.
+    /// Evidence of what booted, for a server-chosen nonce (hex, 1 to
+    /// [`MAX_NONCE_BYTES`] bytes): a TPM quote over the boot PCRs and the
+    /// IMA log ([`Reply::Evidence`], milestone 10). `unavailable` on a
+    /// machine without a TPM; fairplayd never makes evidence up.
     Attest { nonce: String },
 }
 
@@ -148,6 +154,9 @@ pub enum Reply {
         session: Option<SessionId>,
     },
     Sessions(Vec<SessionInfo>),
+    /// The answer to `attest`, for the caller to pass to its server (see
+    /// [`attest`]).
+    Evidence(Box<WireEvidence>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,7 +334,9 @@ pub struct ViolationEvent {
     pub target: u32,
     /// LSM hook that denied it, e.g. `ptrace_access_check`, or `mmap_file`
     /// / `file_mprotect` for code the game tried to map that isn't on its
-    /// allowlist (then `caller` and `target` are both the game). For
+    /// allowlist (then `caller` and `target` are both the game), or
+    /// `bprm_check_security` for a program not on it that the game (or a
+    /// process it started) tried to exec; `execve` failed. For
     /// virtual input: `uinput_create`, `uhid_create`, `evdev_write`, or
     /// `uinput_write` (input through a uinput device, refused while a
     /// session blocks virtual input).
@@ -340,7 +351,8 @@ pub struct ViolationEvent {
     /// node's kernel `dev_t` (`major << 20 | minor`).
     pub mode: u32,
     /// File name (no directory) of the file it tried to map, for
-    /// `mmap_file` and `file_mprotect`. For `uinput_create`, the name the
+    /// `mmap_file` and `file_mprotect`, or exec, for
+    /// `bprm_check_security`. For `uinput_create`, the name the
     /// caller gave the device; for the others, the device node (`uhid`,
     /// `event3`, `uinput`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,10 +462,15 @@ pub fn decode_request(line: &[u8]) -> Result<Request, ApiError> {
 
 /// Checks an attestation nonce: non-empty hex, at most [`MAX_NONCE_BYTES`].
 pub fn valid_nonce(nonce: &str) -> bool {
-    !nonce.is_empty()
-        && nonce.len().is_multiple_of(2)
-        && nonce.len() <= 2 * MAX_NONCE_BYTES
-        && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+    parse_nonce(nonce).is_some()
+}
+
+/// An attestation nonce's bytes, if it is [valid](valid_nonce).
+pub fn parse_nonce(nonce: &str) -> Option<Vec<u8>> {
+    if nonce.is_empty() || nonce.len() > 2 * MAX_NONCE_BYTES {
+        return None;
+    }
+    attest::from_hex(nonce)
 }
 
 #[cfg(test)]

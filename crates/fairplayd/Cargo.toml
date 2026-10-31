@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[features]
+default = ["tpm"]
+# `attest` quotes with the TPM (libtss2: apt install libtss2-dev). Without
+# it, `attest` always answers `unavailable`.
+tpm = ["fairplay-attest/tpm"]
+
 [dependencies]
 anyhow.workspace = true
 aya = "0.13"

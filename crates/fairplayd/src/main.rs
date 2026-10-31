@@ -1,4 +1,4 @@
-//! fairplayd (milestones 3 to 9).
+//! fairplayd (milestones 3 to 10).
 //!
 //! Loads the BPF LSM program, owns the PROTECTED map, and serves the design
 //! doc's vendor-facing API on a Unix socket (see the `fairplay-api` crate):
@@ -11,7 +11,8 @@
 //! for each one during a session, unless the executable is on the input
 //! allowlist (see `input`). It launches only what a signed game manifest
 //! names, and only the manifest's readers may read a protected process
-//! (milestone 9, see `verify`).
+//! (milestone 9, see `verify`). `attest` answers with a TPM quote (milestone
+//! 10, see `attest`), or `unavailable` without a TPM.
 //!
 //!     sudo fairplayd --obj fairplay.o                    # socket API only
 //!     sudo fairplayd --obj fairplay.o --protect <pid>    # milestone 3 style
@@ -25,6 +26,7 @@
 //! The kernel enforces, fairplayd decides who is protected, and the vendor's
 //! server sets policy. Protection ends when fairplayd exits (fails open).
 
+mod attest;
 mod exec_allow;
 mod host;
 mod input;
@@ -102,6 +104,17 @@ struct Args {
     /// fairplayd starts, like --overlay.
     #[arg(long)]
     input_allow: Vec<PathBuf>,
+    /// The TPM `attest` quotes with, as a libtss2 TCTI string (e.g.
+    /// `swtpm:host=127.0.0.1,port=2321` for a software TPM in tests).
+    #[arg(long, default_value = "device:/dev/tpmrm0")]
+    tpm_tcti: String,
+    /// The binary IMA log `attest` sends.
+    #[arg(long, default_value = fairplay_attest::IMA_LOG_PATH)]
+    ima_log: PathBuf,
+    /// Send no IMA log with `attest` (for a software TPM, whose PCR 10 the
+    /// kernel's log doesn't match).
+    #[arg(long, conflicts_with = "ima_log")]
+    no_ima_log: bool,
 }
 
 /// The kernel's PROTECTED map, UNFOLLOWED beside it, EXEC_ALLOWED,
@@ -163,6 +176,16 @@ impl ProtectedMap for BpfMap {
     fn forget_domain(&mut self, domain: u32) {
         let _ = self.unfollowed.remove(&domain);
     }
+    fn live_domains(&self) -> Result<std::collections::BTreeSet<u32>> {
+        // Entries can come and go while we walk; only a member's fork adds
+        // one, so a draining domain's member can be missed only if it
+        // forked and exited mid-walk, and the cost is a child losing the
+        // game's files (it fails closed).
+        self.protected
+            .iter()
+            .map(|r| Ok(r?.1))
+            .collect::<Result<_>>()
+    }
     fn set_input_block(&mut self, on: bool) -> Result<()> {
         Ok(self.input_block.set(0, u32::from(on), 0)?)
     }
@@ -178,6 +201,7 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("ptrace_access_check", "ptrace_access_check"),
     ("mmap_file", "mmap_file"),
     ("file_mprotect", "file_mprotect"),
+    ("bprm_check_security", "bprm_check_security"),
     // Self-protection (milestone 6); inert unless --self-protect.
     ("task_kill", "task_kill"),
     ("bpf", "bpf"),
@@ -385,7 +409,12 @@ fn main() -> Result<()> {
             launcher_gid,
             system_devs,
             socket: args.socket.clone(),
+            attest: Arc::new(attest::AttestConfig {
+                tcti: args.tpm_tcti.clone(),
+                ima_log: (!args.no_ima_log).then(|| args.ima_log.clone()),
+            }),
         };
+        tokio::spawn(release_drained(daemon.clone()));
         tokio::spawn(read_violations(ring, daemon, events));
         let deadline = async {
             match protect_for {
@@ -405,6 +434,17 @@ fn main() -> Result<()> {
         eprintln!("fairplayd: stopping; protected processes still running are no longer protected");
         Ok(())
     })
+}
+
+/// Once a second, releases the allowlists of sessions whose launched
+/// processes have exited, as soon as the last process they started is gone
+/// too (see `Daemon::release_drained`).
+async fn release_drained(daemon: Shared) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        daemon.lock().unwrap().release_drained();
+    }
 }
 
 async fn shutdown_signal() {
