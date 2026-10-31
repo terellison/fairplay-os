@@ -29,6 +29,7 @@ mod exec_allow;
 mod host;
 mod input;
 mod launch;
+mod sandbox;
 mod self_protect;
 mod server;
 mod state;
@@ -50,7 +51,7 @@ use fairplay_api::{ProcessState, ViolationEvent, DEFAULT_LAUNCHER_GROUP, DEFAULT
 use fairplay_common::{
     ExecAllow, ExecKey, Violation, ANY_DOMAIN, FS_SYSTEM, MAP_EXEC_ALLOWED, MAP_EXEC_TRUSTED_FS,
     MAP_INPUT_ALLOWED, MAP_INPUT_BLOCK, MAP_PROTECTED, MAP_READERS, MAP_READER_FILES,
-    MAP_UNFOLLOWED, MAP_VIOLATIONS, VIOLATION_REPORTED,
+    MAP_SANDBOXED, MAP_UNFOLLOWED, MAP_VIOLATIONS, VIOLATION_REPORTED,
 };
 use tokio::{io::unix::AsyncFd, sync::broadcast};
 
@@ -112,6 +113,7 @@ pub struct BpfMap {
     input_block: Array<MapData, u32>,
     readers: HashMap<MapData, u32, u32>,
     reader_files: HashMap<MapData, ExecKey, ExecAllow>,
+    sandboxed: HashMap<MapData, u32, u32>,
 }
 
 fn ignore_missing(r: Result<(), MapError>) -> Result<()> {
@@ -136,6 +138,12 @@ impl ProtectedMap for BpfMap {
     }
     fn remove_reader(&mut self, pid: u32) -> Result<()> {
         ignore_missing(self.readers.remove(&pid))
+    }
+    fn add_sandboxed(&mut self, pid: u32, domain: u32) -> Result<()> {
+        Ok(self.sandboxed.insert(pid, domain, 0)?)
+    }
+    fn remove_sandboxed(&mut self, pid: u32) -> Result<()> {
+        ignore_missing(self.sandboxed.remove(&pid))
     }
     fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
         Ok(self.exec.insert(key, value, 0)?)
@@ -177,6 +185,12 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("bpf_prog", "bpf_prog"),
     ("file_ioctl", "file_ioctl"),
     ("file_permission", "file_permission"),
+    // The anti-cheat's sandbox (milestone 9, part B); inert for processes
+    // not in SANDBOXED.
+    ("file_open", "file_open"),
+    ("inode_follow_link", "inode_follow_link"),
+    ("socket_connect", "socket_connect"),
+    ("socket_sendmsg", "socket_sendmsg"),
 ];
 
 /// LSM programs for hooks older kernels lack. fairplayd starts without them
@@ -266,6 +280,7 @@ fn main() -> Result<()> {
         )?,
         input_block: Array::try_from(ebpf.take_map(MAP_INPUT_BLOCK).context("INPUT_BLOCK map")?)?,
         readers: HashMap::try_from(ebpf.take_map(MAP_READERS).context("READERS map")?)?,
+        sandboxed: HashMap::try_from(ebpf.take_map(MAP_SANDBOXED).context("SANDBOXED map")?)?,
         reader_files: HashMap::try_from(
             ebpf.take_map(MAP_READER_FILES)
                 .context("READER_FILES map")?,
@@ -369,6 +384,7 @@ fn main() -> Result<()> {
             events: events.clone(),
             launcher_gid,
             system_devs,
+            socket: args.socket.clone(),
         };
         tokio::spawn(read_violations(ring, daemon, events));
         let deadline = async {

@@ -14,9 +14,10 @@
 //!   `domain::task_domain` covers that gap by treating a not-yet-registered
 //!   child of a protected process as protected. A reader's child is a
 //!   protected member only: reader status is never inherited (`readers`).
+//!   A sandboxed process's child is sandboxed too (milestone 9, part B).
 //! - **exit**: `sched_process_exit` fires in `do_exit` for each exiting
 //!   thread. When the last thread of a process exits, its entries go
-//!   (PROTECTED, and READERS if it was a reader). That
+//!   (PROTECTED, and READERS and SANDBOXED if it was in them). That
 //!   is before the process is reaped, so before its PID can be reused: an
 //!   unrelated process that gets the PID later never inherits the domain.
 
@@ -26,7 +27,7 @@ use aya_ebpf::{
 use core::ptr::addr_of;
 
 use crate::{
-    maps::{PROTECTED, READERS, UNFOLLOWED},
+    maps::{PROTECTED, READERS, SANDBOXED, UNFOLLOWED},
     vmlinux::{signal_struct, task_struct},
 };
 
@@ -57,6 +58,13 @@ fn try_follow_fork(parent: *const task_struct, child: *const task_struct) -> Res
     };
     if PROTECTED.insert(&(tgid as u32), &domain, 0).is_err() {
         note_unfollowed(domain);
+    }
+    // A sandboxed process's children stay sandboxed (milestone 9, part B),
+    // like its mount namespace and seccomp filter do.
+    if let Some(&d) = unsafe { SANDBOXED.get(&parent_tgid) } {
+        if SANDBOXED.insert(&(tgid as u32), &d, 0).is_err() {
+            note_unfollowed(d);
+        }
     }
     Ok(())
 }
@@ -100,6 +108,7 @@ fn try_unfollow_exit(task: *const task_struct) -> Result<(), i64> {
     if live == 0 {
         let _ = PROTECTED.remove(&tgid);
         let _ = READERS.remove(&tgid);
+        let _ = SANDBOXED.remove(&tgid);
     }
     Ok(())
 }

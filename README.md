@@ -18,10 +18,10 @@ each piece does, how they fit, and a glossary.
 | `crates/lsm-hello-ebpf` | 1 | Smoke-test LSM program: logs every `file_open` by `cat` |
 | `crates/lsm-hello` | 1 | Loads it and prints its log |
 | `crates/fairplay-ebpf` | 3, 5-8 | LSM programs on `ptrace_access_check`, `mmap_file` and `file_mprotect` (executable-mapping allowlist), `task_kill`, `bpf`, `bpf_map` and `bpf_prog` (self-protection), `file_ioctl`, `file_ioctl_compat` and `file_permission` (virtual input), plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
-| `crates/fairplayd` | 3-8 | Loads the programs, owns the PROTECTED, EXEC_ALLOWED and INPUT_* maps, serves the socket API, streams violations, says who made each virtual input device; `--self-protect` fences root away from it |
+| `crates/fairplayd` | 3-9 | Loads the programs, owns the PROTECTED, EXEC_ALLOWED and INPUT_* maps, serves the socket API, streams violations, says who made each virtual input device; `--self-protect` fences root away from it; launches from signed manifests and sandboxes the anti-cheat (milestone 9) |
 | `crates/cheatsim` | 3, 5-8 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant; `game --dlopen` loads libraries like a tricked game; `self-attack` goes after fairplayd itself; `clicker`, `uhid`, `inject` fake input |
 | `crates/fairplay-attest` | 10 | API shape only |
-| `vm/` | 1-8 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5, 6, 7 and 8 tests |
+| `vm/` | 1-9 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4, 5, 6, 7, 8 and 9 (parts A and B) tests |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
 
@@ -520,8 +520,6 @@ and is matched by inode. fs-verity (the kernel checks each page against a
 hash fixed when the file was sealed) is the later fix, for this and for
 milestone 8's allowlist.
 
-Part B, sandboxing the anti-cheat with Landlock, is next.
-
 The exit test, inside the VM, as your normal user:
 
     flock /run/lock/fairplay-vm-tests ./vm/test-milestone9.sh
@@ -538,6 +536,93 @@ join; (f) a tampered manifest, one signed by another key, and an exe whose
 hash changed are each refused, with no session created; (g)
 `session_status` shows the signer's fingerprint and the manifest's hash.
 The milestone 4, 5, 6 and 8 tests now launch from manifests too.
+
+## Milestone 9, part B: the anti-cheat sees the game and nothing else
+
+The design doc lets the vendor's anti-cheat see the game's memory, the
+game's install directory, its own data and the `fairplayd` socket: not the
+home directory, not other programs, not the browser. Two layers do that.
+
+**Not Landlock.** A Landlock-sandboxed process may not ptrace (or
+`process_vm_readv`, or open `/proc/<pid>/mem` of) any process outside its
+own Landlock domain. The game isn't Landlocked, so a Landlocked anti-cheat
+couldn't read it. Checked on this kernel (6.8, Landlock ABI 4): a root
+process reads `/proc/<sleep>/mem` of a `sleep` it started, then calls
+`landlock_restrict_self` with a ruleset that handles only `EXECUTE`, and
+the same read fails with `EACCES`.
+
+**1. Memory, in the kernel** (`crates/fairplay-ebpf/src/hooks/ptrace.rs`).
+`ptrace_access_check` now also points outward: a protected process (the
+anti-cheat, the game, anything either starts) may reach only processes of
+its own domain. Reaching an unprotected process, even one of the same user
+such as the browser, is denied and filed under the caller's session
+(`Violation::domain` is the caller's). Checks the kernel makes on its own
+account (`PTRACE_MODE_NOAUDIT`, e.g. which `/proc/<pid>/stat` fields `ps`
+may show) are denied quietly. Covered: ptrace attach, `process_vm_readv` /
+`writev`, `/proc/<pid>/mem`, `environ`, `maps`, `smaps`, `pagemap`,
+`auxv`, `stack`, `syscall`, the `fd/`, `cwd`, `root` and `exe` links, and
+`pidfd_getfd`.
+
+**2. Files, with a mount namespace** (`crates/fairplayd/src/sandbox.rs`),
+for `anti_cheat` joins only. Before the privilege drop and exec, the
+paused child `unshare(CLONE_NEWNS)`s, makes every mount private, builds a
+new root on a tmpfs at `/run/fairplay-sandbox` (visible only in its
+namespace) and `pivot_root`s into it. Paths keep their host names, so the
+game's files and `/proc/<game>/exe` mean the same inside and out. It holds:
+
+| Path | How |
+| --- | --- |
+| `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32` | read-only bind, or the same symlink (merged `/usr`); skipped if missing |
+| `/etc/ld.so.cache`, `ssl/`, `resolv.conf`, `hosts`, `nsswitch.conf`, `passwd`, `group`, `localtime` | read-only binds, if present |
+| the game's install directory, the anti-cheat's own | read-only binds (`nodev`) |
+| `$XDG_DATA_HOME/fairplay/<signer fingerprint>/` | read-write, `noexec`, `nodev`; created as the user it runs as, mode 0700 |
+| the `fairplayd` socket | read-only bind (connecting needs no write access) |
+| `/proc` | a fresh procfs |
+| `/dev` | tmpfs with `null`, `zero`, `full`, `random`, `urandom`, `tty` bound in, `shm` (tmpfs), `fd`, `stdin`, `stdout`, `stderr` links |
+| `/tmp` | a private tmpfs |
+
+Everything gets `nosuid`, every bind keeps the host mount's own `ro`,
+`nodev` and `noexec`, and the new root itself is remounted read-only.
+`XDG_DATA_HOME` comes from the launch's environment if absolute, else
+`~/.local/share`. The environment loses `DISPLAY`, `WAYLAND_DISPLAY`,
+`XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR` and
+`SSH_AUTH_SOCK`, and gets `HOME` and `FAIRPLAY_DATA_DIR` set to the data
+directory and `TMPDIR=/tmp`. It starts in the requested working directory
+if the sandbox has it, else in the data directory. The network stays (the
+vendor talks to its server); there is no home directory, no display socket
+and no D-Bus.
+
+The user's directories are opened with that user's permissions, then
+cloned into detached mounts (`open_tree(OPEN_TREE_CLONE)`) that the child
+attaches with `move_mount`: never re-resolved by path as root. The mount
+list is built before `fork` (the child of a threaded daemon may only make
+async-signal-safe calls), and the child still blocks on its pipe until
+fairplayd has registered it. A user directory that would cover a sandbox
+path (`/`, `/etc`, `/tmp`, ...) is refused. A step that fails is named in
+the `launch_failed` error.
+
+`session_status` shows it: each sandboxed member has
+`"sandbox": {"data_dir": ..., "read_only": [game dir, anti-cheat dir]}`;
+the game has none. The game is not sandboxed.
+
+**Known gaps.** The sandbox assumes the
+anti-cheat runs as the user: run as root (as the memory tests do, to get
+past Yama) it could mount its way out. If fairplayd restarts, a running
+anti-cheat keeps a bind of the old socket file.
+
+The exit test, inside the VM, as your normal user:
+
+    flock /run/lock/fairplay-vm-tests ./vm/test-milestone9b.sh
+
+The script's comments and step names list each check. As root: (a) the
+sandboxed mock vendor reads the game; (c) it reads an unprotected `cheatsim
+game` (the "browser") 0/3; (f) a reader's fork-only child, and the reader
+itself after it execs `/bin/sh`, read the game 0/3. As you: (b) the vendor
+can't read a marker file in `$HOME`, and `ls $HOME` finds no such directory;
+(d) it writes and reads back a file in its data directory, which appears in
+the real per-vendor directory, owned by you; its `/tmp` is private; (e) it
+gets its session's `session_status` through the socket; (g) the game itself
+still reads `$HOME` and its install directory.
 
 ## Known gaps on arm64 QEMU
 

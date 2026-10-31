@@ -6,7 +6,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::fs::PermissionsExt,
     },
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -26,7 +26,7 @@ use tokio::{
 };
 
 use crate::{
-    exec_allow, host, input, launch,
+    exec_allow, host, input, launch, sandbox,
     state::{launch_identity, Peer, Subscription},
     verify, Shared,
 };
@@ -42,6 +42,8 @@ pub struct Ctx {
     /// Kernel devices of the system filesystems (milestone 8): files there
     /// that only root can write need no allowlist entry.
     pub system_devs: Arc<[u32]>,
+    /// The API socket, which the anti-cheat's sandbox includes.
+    pub socket: PathBuf,
 }
 
 /// Binds the socket, refusing to steal one a live daemon is serving. The
@@ -147,7 +149,7 @@ fn launch_protected(
             ))
         }
     };
-    let prep = launch::prepare(&argv, &env, &cwd)?;
+    let mut prep = launch::prepare(&argv, &env, &cwd)?;
     // Milestone 9: only what the manifest names, opened and hashed with the
     // caller's file permissions. The program is exec'd from the descriptor
     // that was hashed.
@@ -186,6 +188,40 @@ fn launch_protected(
     files.extend(exec_allow::ids_of(plan.exec.iter().map(|c| &c.file))?);
     let reader_files = exec_allow::ids_of(plan.readers.iter().map(|c| &c.file))?;
 
+    // Milestone 9, part B: the anti-cheat sees the game's install directory,
+    // its own, its data directory and this socket, nothing else of the file
+    // system. Built here, before the fork.
+    let sandbox = match join {
+        Some(id) => {
+            let game_dir = ctx.daemon.lock().unwrap().game_dir(peer, id)?;
+            let home = host::home_dir(identity.uid).ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::BadRequest,
+                    format!("uid {} has no home directory", identity.uid),
+                )
+            })?;
+            let sb = sandbox::prepare(sandbox::Request {
+                id: &identity,
+                home: &home,
+                env: &env,
+                fingerprint: &plan.manifest.verified.signer_fingerprint,
+                game_dir: &game_dir,
+                own_dir: &dir,
+                socket: &ctx.socket,
+                cwd: &cwd,
+            })?;
+            let dropped = std::mem::take(&mut prep.dropped_env);
+            prep = launch::prepare(
+                &argv,
+                &sandbox::sandbox_env(&env, &sb.data_dir),
+                &sb.cwd.to_string_lossy(),
+            )?;
+            prep.dropped_env = dropped;
+            Some(sb)
+        }
+        None => None,
+    };
+
     // Fork and register under the lock, so the reaper (which also takes it)
     // can't see the child before its session exists.
     let released = {
@@ -204,7 +240,13 @@ fn launch_protected(
                 return Err(e);
             }
         };
-        let paused = match launch::fork_paused(&prep, &plan.program.file, &identity, stdio) {
+        let paused = match launch::fork_paused(
+            &prep,
+            &plan.program.file,
+            &identity,
+            stdio,
+            sandbox.as_ref(),
+        ) {
             Ok(p) => p,
             Err(e) => {
                 d.abandon_launch(&ticket);
@@ -221,13 +263,35 @@ fn launch_protected(
             ));
         }
         let pid = paused.pid();
+        match &sandbox {
+            Some(sb) => {
+                // In SANDBOXED before it runs, or it doesn't run: `paused`
+                // drops on the error path and the child is killed.
+                if let Err(e) = d.mark_sandboxed(&ticket, pid) {
+                    return Err(ApiError::new(
+                        ErrorCode::Internal,
+                        format!("marking pid {pid} sandboxed: {e:#}"),
+                    ));
+                }
+                d.set_sandbox(ticket.session, pid, sb.info.clone());
+            }
+            None => d.set_game_dir(ticket.session, &dir),
+        }
         let info = plan.manifest.info();
         eprintln!(
-            "fairplayd: session {}: pid {pid} ({program}) protected in domain {}, running as uid {}{}{}{}; {} code files from {} allowed ({allowed} new); manifest {:?} sha256 {} signer {}; {} reader file(s) ({readers} new){}",
+            "fairplayd: session {}: pid {pid} ({program}) protected in domain {}, running as uid {}{}{}{}{}; {} code files from {} allowed ({allowed} new); manifest {:?} sha256 {} signer {}; {} reader file(s) ({readers} new){}",
             ticket.session,
             ticket.domain,
             identity.uid,
             if ticket.join { ", joined as a reader" } else { "" },
+            match &sandbox {
+                Some(sb) => format!(
+                    ", sandboxed (data {}, read-only {})",
+                    sb.info.data_dir,
+                    sb.info.read_only.join(" ")
+                ),
+                None => String::new(),
+            },
             if ticket.block_input {
                 ", blocking virtual input"
             } else {
@@ -253,7 +317,7 @@ fn launch_protected(
         (ticket.session, paused.release()?)
     };
     let (session, released) = released;
-    let pid = released.wait_exec()?;
+    let pid = released.wait_exec(sandbox.as_ref())?;
     Ok(Reply::Launched { session, pid })
 }
 

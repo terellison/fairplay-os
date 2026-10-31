@@ -4,13 +4,18 @@
 //! SIGSTOP too, since the LSM check comes before the kernel delivers them.
 //! Signal 0 (does it exist?) is allowed. Signals the kernel raises on its
 //! own (SIGCHLD, SIGPIPE, a terminal's SIGINT) skip this hook.
+//!
+//! Milestone 9, part B: a sandboxed process (the vendor's anti-cheat and
+//! what it starts) may signal only its own sandbox's processes. Stopping,
+//! continuing or killing the game, or anything else, is denied and filed
+//! under its domain; what happens to a cheater's game is the server's call.
 
 use aya_ebpf::{helpers::bpf_probe_read_kernel, macros::lsm, programs::LsmContext};
 use core::ptr::addr_of;
 use fairplay_common::Hook;
 
 use crate::{
-    domain::{record_violation, EPERM},
+    domain::{record_in, record_violation, sandboxed, sandboxed_in, Name, EPERM},
     self_protect::outsider,
     vmlinux::task_struct,
 };
@@ -35,12 +40,26 @@ fn should_deny(ctx: &LsmContext) -> Result<bool, i64> {
     if sig == 0 {
         return Ok(false);
     }
+    let p: *const task_struct = unsafe { ctx.arg(0) };
+    // Any thread of the target (tgkill names a thread).
+    let tgid = unsafe { bpf_probe_read_kernel(addr_of!((*p).tgid))? } as u32;
+    if let Some((caller, domain)) = sandboxed() {
+        if tgid != caller && !sandboxed_in(tgid, domain) {
+            record_in(
+                caller,
+                tgid,
+                domain,
+                Hook::TaskKill,
+                sig as u32,
+                0,
+                Name::None,
+            );
+            return Ok(true);
+        }
+    }
     let Some((caller, fairplayd)) = outsider() else {
         return Ok(false);
     };
-    let p: *const task_struct = unsafe { ctx.arg(0) };
-    // Any thread of fairplayd (tgkill names a thread).
-    let tgid = unsafe { bpf_probe_read_kernel(addr_of!((*p).tgid))? } as u32;
     if tgid != fairplayd {
         return Ok(false);
     }

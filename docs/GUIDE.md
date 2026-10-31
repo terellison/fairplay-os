@@ -31,7 +31,7 @@ the parts that need a real gaming PC come later.
 | 6 | fairplayd protects itself from root | Done (opt-in: `--self-protect`) | `./vm/test-milestone6.sh` |
 | 7 | Report fake input devices and who made them | Done | `./vm/test-milestone7.sh` |
 | 8 | Only approved code may load into the game | Done | `./vm/test-milestone8.sh` |
-| 9 | Vendor anti-cheat: signed and sandboxed | Part A done; sandbox next | `./vm/test-milestone9.sh` |
+| 9 | Vendor anti-cheat: signed and sandboxed | Done | `./vm/test-milestone9.sh`, `./vm/test-milestone9b.sh` |
 | 10 | Attestation | Blocked: the VM has no TPM | |
 | 11 | Player-mode system image | Needs an x86 PC | |
 | 12 | A Windows game under **Proton**, protected | Needs an x86 PC | |
@@ -494,8 +494,42 @@ cheater's key), has the game's child try to read its parent and a sibling
 game start a named helper (can read) and the same program copied to an
 unnamed path (can't), and checks that unnamed programs can't join and that a
 tampered manifest, a wrong signature and a changed program are all refused
-with nothing started. Part B, locking the anti-cheat into a **Landlock**
-sandbox so it sees the game but not your files, comes next.
+with nothing started.
+
+### The anti-cheat sees the game and nothing else (milestone 9, part B)
+
+The design doc promises something no kernel anti-cheat can: the vendor's
+anti-cheat sees the game, and nothing else of your PC. Two walls make that
+true.
+
+- **Memory.** The kernel checkpoint that guards reading another process's
+  memory now also works the other way round: the anti-cheat (and the game,
+  and anything they start) may only reach processes of its own game. Your
+  browser, Discord or password manager are off limits, even though they run
+  as the same user. Every attempt is refused and reported in the session.
+  What it can still see of other programs is their names and command lines
+  in `/proc`, the same as `ps` shows.
+- **Files.** `fairplayd` starts the anti-cheat in its own **mount
+  namespace**: a private view of the file system. It builds a fresh, empty
+  root, puts in only what's needed using **bind mounts** (system libraries
+  read-only, a few settings files, the game's folder and the anti-cheat's
+  own folder read-only, one writable data folder for the vendor, the
+  `fairplayd` socket, a private `/tmp`), and then switches the anti-cheat
+  into it with **pivot_root**. Your home folder simply isn't there. The
+  network is, because the vendor talks to its server.
+
+Why not **Landlock**, the obvious tool? A Landlocked program isn't allowed
+to read the memory of anything outside its Landlock sandbox, and the game
+isn't in one, so the anti-cheat couldn't do its job. We checked this on the
+VM's kernel.
+
+**Milestone 9 part B's test** (`vm/test-milestone9b.sh`) has a mock vendor
+read the game (works), try to read a stand-in "browser" (blocked, reported),
+look for a file in your home folder (not there), write to its data folder
+(works, and the file lands in the real folder), and ask `fairplayd` about
+its session (works). It also checks two part A rules: a reader's child, and
+a reader that turns itself into a shell, can't read the game. And the game
+itself isn't sandboxed: it still sees your home folder.
 
 ### Lessons learned writing BPF programs
 
@@ -729,6 +763,20 @@ deliberate change to both files.
   full), so it runs unprotected.
 - **Session**: one `launch_protected` game plus anything launched into its
   domain, as `fairplayd` tracks it.
+- **Mount namespace**: a process's own private view of which file systems
+  are attached where. Changes inside one (attaching, detaching) don't show
+  anywhere else. The anti-cheat's sandbox is one.
+- **Bind mount**: making a file or folder that already exists appear at a
+  second place too, optionally read-only. It's the same file, not a copy:
+  what the anti-cheat writes in its bound data folder lands in the real one.
+- **pivot_root**: swapping a process's root folder (`/`) for another one, so
+  the old file system is no longer reachable from it at all. The last step
+  of building the sandbox.
+- **tmpfs**: a file system that lives only in memory and vanishes when
+  unmounted. The sandbox's empty root, `/tmp` and `/dev` are tmpfs.
+- **Abstract Unix socket**: a Unix socket with a name but no file (written
+  `@name`). It belongs to the network side of the system, so a mount
+  namespace can't hide it.
 
 **The socket API**
 
@@ -823,8 +871,9 @@ deliberate change to both files.
 - **Flatpak**: a way to install desktop apps in their own sandbox, without
   needing root.
 - **Landlock**: a Linux feature that lets a program be confined to the files
-  it's allowed to touch. We'd use it to keep the vendor's anti-cheat away
-  from your files.
+  it's allowed to touch. It also stops the program from reading the memory
+  of anything outside its sandbox, which is why the anti-cheat's sandbox
+  (milestone 9) uses a mount namespace instead.
 - **Sandbox**: confining a program so it can only reach what it needs.
 - **Atomic update / rollback**: an update applies all at once or not at all,
   and a bad one can be undone by booting the previous version.

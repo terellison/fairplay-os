@@ -5,14 +5,15 @@
 
 use std::{
     collections::BTreeMap,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
 use fairplay_api::{
-    ApiError, ErrorCode, Outcome, ProcessInfo, ProcessState, Reply, SessionId, SessionInfo,
-    ViolationEvent,
+    ApiError, ErrorCode, Outcome, ProcessInfo, ProcessState, Reply, SandboxInfo, SessionId,
+    SessionInfo, ViolationEvent,
 };
 use fairplay_common::{ExecAllow, ExecKey, Hook, Violation};
 
@@ -37,6 +38,10 @@ pub trait ProtectedMap {
     /// exec'ing a file in READER_FILES.
     fn add_reader(&mut self, pid: u32, domain: u32) -> Result<()>;
     fn remove_reader(&mut self, pid: u32) -> Result<()>;
+    /// Marks `pid` as sandboxed in `domain` (milestone 9, part B): the
+    /// kernel's sandbox hooks apply to it and everything it starts.
+    fn add_sandboxed(&mut self, pid: u32, domain: u32) -> Result<()>;
+    fn remove_sandboxed(&mut self, pid: u32) -> Result<()>;
     fn allow_reader_file(&mut self, key: ExecKey, value: ExecAllow) -> Result<()>;
     fn disallow_reader_file(&mut self, key: ExecKey) -> Result<()>;
     /// How many processes started in `domain` the kernel could not add
@@ -153,6 +158,8 @@ struct Proc {
     pid: u32,
     argv: Vec<String>,
     state: ProcessState,
+    /// The anti-cheat's sandbox (milestone 9, part B).
+    sandbox: Option<Box<SandboxInfo>>,
 }
 
 impl Proc {
@@ -165,6 +172,7 @@ impl Proc {
             pid: self.pid,
             argv: self.argv.clone(),
             state: self.state,
+            sandbox: self.sandbox.clone(),
         }
     }
 }
@@ -181,6 +189,8 @@ struct Session {
     violations: u64,
     /// The manifest the game was launched from (milestone 9).
     manifest: Option<Arc<SessionManifest>>,
+    /// The game's install directory, which its anti-cheat may see.
+    game_dir: Option<PathBuf>,
     /// Asked for `block_virtual_input` (milestone 7).
     block_input: bool,
 }
@@ -330,6 +340,45 @@ impl<M: ProtectedMap> Daemon<M> {
         })
     }
 
+    /// The game's install directory, for its anti-cheat's sandbox. The same
+    /// checks as [`Daemon::join_manifest`].
+    pub fn game_dir(&self, peer: &Peer, id: SessionId) -> Result<PathBuf, ApiError> {
+        self.joinable(peer, id)?.game_dir.clone().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("session {id} has no install directory"),
+            )
+        })
+    }
+
+    /// Records a new session's install directory (after
+    /// [`Daemon::register`]).
+    pub fn set_game_dir(&mut self, id: SessionId, dir: &Path) {
+        if let Some(s) = self.sessions.get_mut(&id) {
+            s.game_dir = Some(dir.to_owned());
+        }
+    }
+
+    /// Puts a registered (not yet released) child into SANDBOXED, so the
+    /// kernel treats it as the sandboxed anti-cheat from its first
+    /// instruction. The caller must not release the child unless this
+    /// succeeds.
+    pub fn mark_sandboxed(&mut self, t: &Ticket, pid: u32) -> Result<()> {
+        self.map.add_sandboxed(pid, t.domain)
+    }
+
+    /// Records that a process launched into `id` runs sandboxed (after
+    /// [`Daemon::register`]).
+    pub fn set_sandbox(&mut self, id: SessionId, pid: u32, info: SandboxInfo) {
+        if let Some(p) = self
+            .sessions
+            .get_mut(&id)
+            .and_then(|s| s.procs_mut().find(|p| p.pid == pid && p.running()))
+        {
+            p.sandbox = Some(Box::new(info));
+        }
+    }
+
     /// Only the session's launcher (or root) may add to its domain, and
     /// only while its game runs.
     fn joinable(&self, peer: &Peer, id: SessionId) -> Result<&Session, ApiError> {
@@ -421,6 +470,7 @@ impl<M: ProtectedMap> Daemon<M> {
             pid,
             argv,
             state: ProcessState::Running,
+            sandbox: None,
         };
         if t.join && !self.sessions.contains_key(&t.session) {
             anyhow::bail!("session {} vanished", t.session);
@@ -453,6 +503,7 @@ impl<M: ProtectedMap> Daemon<M> {
                     started_at: now(),
                     violations: 0,
                     manifest,
+                    game_dir: None,
                     block_input: t.block_input,
                 },
             );
@@ -475,6 +526,9 @@ impl<M: ProtectedMap> Daemon<M> {
         // The kernel already dropped it at exit; this is belt and braces.
         if let Err(e) = self.map.remove_reader(pid) {
             eprintln!("fairplayd: removing pid {pid} from READERS: {e:#}");
+        }
+        if let Err(e) = self.map.remove_sandboxed(pid) {
+            eprintln!("fairplayd: removing pid {pid} from SANDBOXED: {e:#}");
         }
         p.state = state;
         // The domain's last process is gone: its files are no longer
@@ -686,6 +740,9 @@ pub fn hook_name(hook: u32) -> &'static str {
         x if x == Hook::BpfMap as u32 => "bpf_map",
         x if x == Hook::BpfProg as u32 => "bpf_prog",
         x if x == Hook::Bpf as u32 => "bpf",
+        x if x == Hook::ProcMemWrite as u32 => "proc_mem_write",
+        x if x == Hook::ProcLink as u32 => "proc_link",
+        x if x == Hook::UnixAbstract as u32 => "unix_abstract",
         x => match crate::input::Mechanism::of_hook(x) {
             Some(m) => input_hook_name(m),
             None => "unknown",
@@ -741,6 +798,7 @@ mod tests {
         exec_fail_at: Option<usize>,
         readers: HashMap<u32, u32>,
         reader_files: HashMap<ExecKey, ExecAllow>,
+        sandboxed: HashMap<u32, u32>,
         input_block: bool,
         fail_input_block: bool,
     }
@@ -782,6 +840,14 @@ mod tests {
         }
         fn remove_reader(&mut self, pid: u32) -> Result<()> {
             self.readers.remove(&pid);
+            Ok(())
+        }
+        fn add_sandboxed(&mut self, pid: u32, domain: u32) -> Result<()> {
+            self.sandboxed.insert(pid, domain);
+            Ok(())
+        }
+        fn remove_sandboxed(&mut self, pid: u32) -> Result<()> {
+            self.sandboxed.remove(&pid);
             Ok(())
         }
         fn allow_reader_file(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
@@ -1042,6 +1108,10 @@ mod tests {
         d.register(j, 51, &alice, 1000, vec!["ac".into()], None)
             .unwrap();
         assert_eq!(d.map.entries.get(&51), Some(&t.domain));
+        // Sandboxed (milestone 9, part B) before it runs; the game isn't.
+        d.mark_sandboxed(&j, 51).unwrap();
+        assert_eq!(d.map.sandboxed.get(&51), Some(&t.domain));
+        assert!(!d.map.sandboxed.contains_key(&50));
 
         // The anti-cheat, asking about "my session", finds the game's.
         let ac = Peer {
@@ -1060,6 +1130,7 @@ mod tests {
         // Its exit unprotects it and leaves the game alone.
         assert_eq!(d.child_exited(51, EXITED_0), Some(t.session));
         assert_eq!(d.map.entries.len(), 1);
+        assert!(d.map.sandboxed.is_empty());
         assert!(d.status(&alice, Some(t.session)).unwrap().0);
 
         // Once the game is gone nobody joins.
