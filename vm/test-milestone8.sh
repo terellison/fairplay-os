@@ -76,13 +76,13 @@ wait_for() { for _ in $(seq 100); do grep -q "$2" "$1" 2>/dev/null && return 0; 
 # Ask the game to load something; wait for its LOADED/BLOCKED line.
 ask() {
   local before
-  before="$(grep -cE '^(LOADED|BLOCKED|MPROTECT-)' "$T/game.out")"
+  before="$(grep -cE '^(LOADED|BLOCKED|MPROTECT-|EXEC-)' "$T/game.out")"
   echo "$1" >&3
   for _ in $(seq 100); do
-    [ "$(grep -cE '^(LOADED|BLOCKED|MPROTECT-)' "$T/game.out")" -gt "$before" ] && break
+    [ "$(grep -cE '^(LOADED|BLOCKED|MPROTECT-|EXEC-)' "$T/game.out")" -gt "$before" ] && break
     sleep 0.1
   done
-  grep -E '^(LOADED|BLOCKED|MPROTECT-)' "$T/game.out" | tail -1 | tee "$T/last" | indent
+  grep -E '^(LOADED|BLOCKED|MPROTECT-|EXEC-)' "$T/game.out" | tail -1 | tee "$T/last" | indent
 }
 
 # A library whose cheatsim_marker() returns $2.
@@ -129,7 +129,7 @@ check "its 3 code files (cheatsim, lib_ok.so, lib_swap.so) are on the allowlist"
   grep -q "session $SESSION: pid $GPID .*; 3 code files from $T/game allowed" "$T/daemon.err"
 check "EXEC_ALLOWED holds them plus the overlay (4 entries)" test "$(exec_entries)" -eq 4
 
-sudo "$CTL" --socket "$SOCK" violations "$SESSION" --count 3 >"$T/events.jsonl" 2>&1 &
+sudo "$CTL" --socket "$SOCK" violations "$SESSION" --count 4 >"$T/events.jsonl" 2>&1 &
 STREAM_PID=$!
 wait_for "$T/events.jsonl" subscribed || bad "vendor stream subscribed"
 
@@ -163,18 +163,32 @@ check "DENIED line: hook=file_mprotect file=cheat.so" \
 ask "mprotect $T/game/lib_ok.so"
 check "MPROTECT-OK for an allowed library" grep -q "^MPROTECT-OK $T/game/lib_ok.so" "$T/last"
 
+step "(g) exec: the game forks a child (in its domain since milestone 5) that execs a program"
+ask "exec /usr/bin/true"
+check "EXEC-OK for a system binary (/usr/bin/true)" grep -q "^EXEC-OK /usr/bin/true$" "$T/last"
+cp /usr/bin/true "$T/drop/helper"   # same code, but yours and dropped after launch
+ask "exec $T/drop/helper"
+check "EXEC-BLOCKED for a binary dropped after launch (the kernel kills the child)" \
+  grep -q "^EXEC-BLOCKED $T/drop/helper: killed by SIGSEGV" "$T/last"
+check "DENIED line: hook=mmap_file file=helper, by the child (not the game)" \
+  grep -qE "^DENIED caller=([0-9]+) .*target=\\1 hook=mmap_file .*file=helper$" "$T/daemon.out"
+check_not "... and the child's caller pid is not the game's" \
+  grep -q "^DENIED caller=$GPID .*file=helper$" "$T/daemon.out"
+
 step "the vendor's stream"
 for _ in $(seq 50); do kill -0 "$STREAM_PID" 2>/dev/null || break; sleep 0.1; done
 grep '"violation"' "$T/events.jsonl" >"$T/v.jsonl"
 jq -c '.event.violation | {caller, target, hook, file, mode}' "$T/v.jsonl" | indent
-check "3 violation events: mmap_file cheat.so, mmap_file lib_swap.so, file_mprotect cheat.so" \
-  jqt -s --argjson s "$SESSION" --argjson g "$GPID" '[.[].event.violation] |
-    length == 3 and all(.[]; .session==$s and .caller==$g and .target==$g and .comm=="cheatsim")
-    and ([.[] | [.hook, .file]] == [["mmap_file","cheat.so"],["mmap_file","lib_swap.so"],["file_mprotect","cheat.so"]])' "$T/v.jsonl"
+check "4 violation events: mmap_file cheat.so, mmap_file lib_swap.so, file_mprotect cheat.so, mmap_file helper" \
+  jqt -s --argjson s "$SESSION" '[.[].event.violation] |
+    length == 4 and all(.[]; .session==$s and .caller==.target)
+    and ([.[] | [.hook, .file]] == [["mmap_file","cheat.so"],["mmap_file","lib_swap.so"],["file_mprotect","cheat.so"],["mmap_file","helper"]])' "$T/v.jsonl"
+check "the first three came from the game itself" \
+  jqt -s --argjson g "$GPID" '[.[].event.violation][0:3] | all(.[]; .caller==$g and .comm=="cheatsim")' "$T/v.jsonl"
 check_not "no other DENIED lines (in particular none by fairplayd itself)" \
-  grep -v "caller=$GPID " <(grep '^DENIED' "$T/daemon.out")
+  grep -v -e "hook=mmap_file" -e "hook=file_mprotect" <(grep '^DENIED' "$T/daemon.out")
 "$CTL" status "$SESSION" >"$T/status.json" 2>/dev/null || sudo "$CTL" --socket "$SOCK" status "$SESSION" >"$T/status.json"
-check "session_status counts 3 violations" jqt '.ok.status.session.violations==3' "$T/status.json"
+check "session_status counts 4 violations" jqt '.ok.status.session.violations==4' "$T/status.json"
 
 step "JIT-style code still works in a protected process"
 cat >"$T/jit.py" <<'EOF'

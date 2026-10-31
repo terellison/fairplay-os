@@ -1,6 +1,7 @@
 //! cheatsim: the attacker for milestone 3.
 //!
 //! Terminal 1:  cheatsim game            # prints its pid and the secret's address
+//!              cheatsim game --depth 2  # same, from a grandchild (milestone 5)
 //! Terminal 2:  sudo fairplayd --obj ... --protect <pid>
 //! Terminal 3:  sudo cheatsim attack --pid <pid> --addr <addr>
 //!
@@ -25,11 +26,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nix::{
     sys::{
-        ptrace,
+        prctl, ptrace,
+        signal::Signal,
         uio::{process_vm_readv, RemoteIoVec},
-        wait::waitpid,
+        wait::{waitpid, WaitStatus},
     },
-    unistd::Pid,
+    unistd::{fork, getpid, getppid, ForkResult, Pid},
 };
 
 #[derive(Parser)]
@@ -42,6 +44,11 @@ struct Args {
 enum Cmd {
     /// A stand-in game holding a secret value in memory.
     Game {
+        /// Fork this many levels first; the deepest descendant holds the
+        /// secret and prints its pid and address (milestone 5: a Proton game
+        /// is a chain of processes). Every level dies with its parent.
+        #[arg(long, default_value_t = 0)]
+        depth: u32,
         /// After startup, dlopen() this library (repeatable) and print
         /// LOADED or BLOCKED: a game being tricked into loading a cheat, or
         /// loading an overlay (milestone 8).
@@ -51,7 +58,9 @@ enum Cmd {
         /// as it arrives (so a test can drop or replace files first). A line
         /// `mprotect <path>` instead maps the file read-only and then asks
         /// for PROT_EXEC with mprotect(), printing MPROTECT-OK or
-        /// MPROTECT-BLOCKED.
+        /// MPROTECT-BLOCKED; a line `exec <path>` forks a child that execs
+        /// the program, printing EXEC-OK if it exited 0, else EXEC-BLOCKED
+        /// and how it ended.
         #[arg(long)]
         dlopen_stdin: bool,
     },
@@ -76,14 +85,48 @@ fn parse_hex(s: &str) -> Result<u64, String> {
 fn main() -> ExitCode {
     match Args::parse().cmd {
         Cmd::Game {
+            depth,
             dlopen,
             dlopen_stdin,
-        } => game(&dlopen, dlopen_stdin),
+        } => game(depth, &dlopen, dlopen_stdin),
         Cmd::Attack { pid, addr } => attack(Pid::from_raw(pid), addr),
     }
 }
 
-fn game(dlopen: &[String], dlopen_stdin: bool) -> ExitCode {
+fn game(depth: u32, dlopen: &[String], dlopen_stdin: bool) -> ExitCode {
+    for level in 1..=depth {
+        let parent = getpid();
+        // SAFETY: single-threaded so far; the child just carries on here.
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                // Die with the parent, so killing the game stops the chain.
+                if let Err(e) = prctl::set_pdeathsig(Signal::SIGTERM) {
+                    eprintln!("cheatsim: PR_SET_PDEATHSIG: {e}");
+                    return ExitCode::FAILURE;
+                }
+                // The parent may have died before the line above.
+                if getppid() != parent {
+                    return ExitCode::FAILURE;
+                }
+            }
+            Ok(ForkResult::Parent { child }) => {
+                eprintln!(
+                    "cheatsim: level {} (pid {}) started level {level} (pid {child})",
+                    level - 1,
+                    std::process::id()
+                );
+                // Wait for it, then leave with its status.
+                return match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, 0)) => ExitCode::SUCCESS,
+                    _ => ExitCode::FAILURE,
+                };
+            }
+            Err(e) => {
+                eprintln!("cheatsim: fork: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let secret = Box::new(SECRET);
     println!(
         "pid={} addr={:#x}",
@@ -96,10 +139,12 @@ fn game(dlopen: &[String], dlopen_stdin: bool) -> ExitCode {
     if dlopen_stdin {
         for line in std::io::stdin().lines() {
             let Ok(line) = line else { break };
-            match line.strip_prefix("mprotect ") {
-                Some(path) => make_executable(path),
-                None if !line.is_empty() => load(&line),
-                None => {}
+            if let Some(path) = line.strip_prefix("mprotect ") {
+                make_executable(path);
+            } else if let Some(path) = line.strip_prefix("exec ") {
+                run(path);
+            } else if !line.is_empty() {
+                load(&line);
             }
         }
     }
@@ -140,6 +185,37 @@ fn load(path: &str) {
     } else {
         let f: extern "C" fn() -> libc::c_int = unsafe { std::mem::transmute(sym) };
         println!("LOADED {path} marker={}", f());
+    }
+}
+
+/// Forks a child that execs `path` (no arguments) and reports how it
+/// ended: a game starting a helper program, or being tricked into starting
+/// a dropped one.
+fn run(path: &str) {
+    let Ok(c) = std::ffi::CString::new(path) else {
+        return println!("EXEC-BLOCKED {path}: NUL in path");
+    };
+    let argv = [c.as_ptr(), std::ptr::null()];
+    // SAFETY: single-threaded; the child only calls execv and _exit.
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => unsafe {
+            libc::execv(c.as_ptr(), argv.as_ptr());
+            // Exit code 100 + errno: execve itself returned an error.
+            libc::_exit(100 + *libc::__errno_location());
+        },
+        Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
+            Ok(WaitStatus::Exited(_, 0)) => println!("EXEC-OK {path}"),
+            Ok(WaitStatus::Exited(_, code)) if code > 100 => println!(
+                "EXEC-BLOCKED {path}: execve failed: {}",
+                std::io::Error::from_raw_os_error(code - 100)
+            ),
+            Ok(WaitStatus::Exited(_, code)) => println!("EXEC-BLOCKED {path}: exited {code}"),
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                println!("EXEC-BLOCKED {path}: killed by {sig:?}")
+            }
+            other => println!("EXEC-BLOCKED {path}: {other:?}"),
+        },
+        Err(e) => println!("EXEC-BLOCKED {path}: fork: {e}"),
     }
 }
 

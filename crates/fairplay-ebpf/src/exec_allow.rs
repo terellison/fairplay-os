@@ -88,7 +88,11 @@ fn allowed(file: *const file, domain: u32) -> Result<bool, i64> {
         let ino: u64 = bpf_probe_read_kernel(inode_ino(inode))?;
         let generation: u32 = bpf_probe_read_kernel(inode_generation(inode))?;
         for d in [domain, ANY_DOMAIN] {
-            let key = ExecKey { domain: d, dev, ino };
+            let key = ExecKey {
+                domain: d,
+                dev,
+                ino,
+            };
             if let Some(v) = EXEC_ALLOWED.get(&key) {
                 if v.flags & EXEC_CHECK_GENERATION == 0 || v.generation == generation {
                     return Ok(true);

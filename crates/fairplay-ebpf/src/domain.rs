@@ -28,18 +28,42 @@ pub const EPERM: i32 = 1;
 /// `None` if normal kernel rules apply: the target is not protected, the
 /// caller is the target itself, or the caller is in the target's protection
 /// domain (the game and its own anti-cheat).
+#[allow(dead_code)] // for hooks that only have the target's tgid
 pub fn denied_caller(target: u32) -> Option<u32> {
-    let domain = unsafe { PROTECTED.get(&target) }?;
+    let domain = *unsafe { PROTECTED.get(&target) }?;
+    denied_caller_in(target, domain)
+}
+
+/// [`denied_caller`] for a target already known to be in `domain` (see
+/// [`task_domain`]).
+pub fn denied_caller_in(target: u32, domain: u32) -> Option<u32> {
     let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
     if caller == target {
         return None;
     }
-    if let Some(caller_domain) = unsafe { PROTECTED.get(&caller) } {
+    if let Some(&caller_domain) = unsafe { PROTECTED.get(&caller) } {
         if caller_domain == domain {
             return None;
         }
     }
     Some(caller)
+}
+
+/// `task`'s tgid and protection domain, if it is protected: its own
+/// PROTECTED entry or, failing that, its parent's. A child of a protected
+/// process is visible in /proc (with a copy of the parent's memory) a moment
+/// before `follow` registers it; this covers that gap. It also keeps direct
+/// children protected if PROTECTED was too full to register them.
+pub fn task_domain(task: *const task_struct) -> Result<Option<(u32, u32)>, i64> {
+    let tgid = unsafe { bpf_probe_read_kernel(addr_of!((*task).tgid))? } as u32;
+    if let Some(&domain) = unsafe { PROTECTED.get(&tgid) } {
+        return Ok(Some((tgid, domain)));
+    }
+    let parent_tgid = unsafe {
+        let parent: *const task_struct = bpf_probe_read_kernel(addr_of!((*task).real_parent))?;
+        bpf_probe_read_kernel(addr_of!((*parent).tgid))?
+    } as u32;
+    Ok(unsafe { PROTECTED.get(&parent_tgid) }.map(|&domain| (tgid, domain)))
 }
 
 /// Writes a [`Violation`] for the current task to VIOLATIONS. Drops it if the
@@ -66,6 +90,9 @@ pub fn record_violation_on_file(
     unsafe {
         (*v).caller = caller;
         (*v).target = target;
+        // Lets fairplayd file an attempt on any process the game started
+        // under the game's session. 0 if the target is no longer in the map.
+        (*v).domain = PROTECTED.get(&target).copied().unwrap_or(0);
         (*v).hook = hook as u32;
         (*v).mode = mode;
         (*v).comm = bpf_get_current_comm().unwrap_or([0; 16]);

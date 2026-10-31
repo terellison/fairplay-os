@@ -16,11 +16,18 @@ use fairplay_common::{ExecAllow, ExecKey, Hook, Violation};
 
 use crate::exec_allow::{ExecEntries, FileId};
 
-/// The kernel's PROTECTED map (tgid -> protection domain) and EXEC_ALLOWED
-/// map (files a domain may map executable), or a fake in tests.
+/// The kernel's PROTECTED map (tgid -> protection domain), with UNFOLLOWED
+/// and EXEC_ALLOWED (files a domain may map executable), or a fake in tests.
+/// The kernel also adds the processes a protected process starts, and
+/// removes each when it exits; fairplayd only manages the ones it launched.
 pub trait ProtectedMap {
     fn insert(&mut self, pid: u32, domain: u32) -> Result<()>;
     fn remove(&mut self, pid: u32) -> Result<()>;
+    /// How many processes started in `domain` the kernel could not add
+    /// (the UNFOLLOWED map). Nonzero means protection is degraded.
+    fn unfollowed(&self, domain: u32) -> u64;
+    /// Drops `domain`'s UNFOLLOWED count, once nothing will ask for it.
+    fn forget_domain(&mut self, domain: u32);
     fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()>;
     fn disallow_exec(&mut self, key: ExecKey) -> Result<()>;
 }
@@ -164,7 +171,8 @@ impl Session {
         std::iter::once(&mut self.game).chain(&mut self.members)
     }
 
-    fn info(&self, id: SessionId) -> SessionInfo {
+    /// `unfollowed`: the domain's count from [`ProtectedMap::unfollowed`].
+    fn info(&self, id: SessionId, unfollowed: u64) -> SessionInfo {
         SessionInfo {
             session: id,
             launcher_uid: self.launcher_uid,
@@ -173,6 +181,8 @@ impl Session {
             members: self.members.iter().map(Proc::info).collect(),
             started_at: self.started_at,
             violations: self.violations,
+            protection_degraded: unfollowed > 0,
+            unprotected_children: unfollowed,
         }
     }
 }
@@ -392,7 +402,9 @@ impl<M: ProtectedMap> Daemon<M> {
             .iter()
             .take(ended.len().saturating_sub(MAX_ENDED_KEPT))
         {
-            self.sessions.remove(id);
+            if let Some(s) = self.sessions.remove(id) {
+                self.map.forget_domain(s.domain);
+            }
         }
     }
 
@@ -405,15 +417,19 @@ impl<M: ProtectedMap> Daemon<M> {
     }
 
     /// Turns a kernel record into an event, filed under the session whose
-    /// process it targeted. A record can arrive just after the target
-    /// exited, so ended processes count too; the newest session wins (PIDs
-    /// are reused only after we reap, which is after we stop protecting).
+    /// process it targeted: one we launched, or any process in the
+    /// session's domain (the kernel adds everything the game starts). A
+    /// record can arrive just after the target exited, so ended processes
+    /// count too; the newest session wins (PIDs are reused only after we
+    /// reap, which is after we stop protecting).
     pub fn record_violation(&mut self, v: &Violation, exe_path: Option<String>) -> ViolationEvent {
         let session = self
             .sessions
             .iter_mut()
             .rev()
-            .find(|(_, s)| s.procs().any(|p| p.pid == v.target))
+            .find(|(_, s)| {
+                (v.domain != 0 && s.domain == v.domain) || s.procs().any(|p| p.pid == v.target)
+            })
             .map(|(&id, s)| {
                 s.violations += 1;
                 id
@@ -461,7 +477,10 @@ impl<M: ProtectedMap> Daemon<M> {
             return Ok((false, None));
         };
         let s = self.visible(peer, id)?;
-        Ok((s.game.running(), Some(s.info(id))))
+        Ok((
+            s.game.running(),
+            Some(s.info(id, self.map.unfollowed(s.domain))),
+        ))
     }
 
     pub fn subscribe(&self, peer: &Peer, id: Option<SessionId>) -> Result<Subscription, ApiError> {
@@ -479,7 +498,10 @@ impl<M: ProtectedMap> Daemon<M> {
         Reply::Sessions(
             self.sessions
                 .keys()
-                .filter_map(|&id| self.visible(peer, id).ok().map(|s| s.info(id)))
+                .filter_map(|&id| {
+                    let s = self.visible(peer, id).ok()?;
+                    Some(s.info(id, self.map.unfollowed(s.domain)))
+                })
                 .collect(),
         )
     }
@@ -524,6 +546,7 @@ mod tests {
     struct FakeMap {
         entries: HashMap<u32, u32>,
         fail_insert: bool,
+        unfollowed: HashMap<u32, u64>,
         exec: HashMap<ExecKey, ExecAllow>,
         /// Fail exec inserts once this many entries exist.
         exec_fail_at: Option<usize>,
@@ -538,6 +561,12 @@ mod tests {
         fn remove(&mut self, pid: u32) -> Result<()> {
             self.entries.remove(&pid);
             Ok(())
+        }
+        fn unfollowed(&self, domain: u32) -> u64 {
+            self.unfollowed.get(&domain).copied().unwrap_or(0)
+        }
+        fn forget_domain(&mut self, domain: u32) {
+            self.unfollowed.remove(&domain);
         }
         fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
             anyhow::ensure!(
@@ -675,6 +704,7 @@ mod tests {
         Violation {
             caller,
             target,
+            domain: 0,
             hook: Hook::PtraceAccess as u32,
             mode: 0x11,
             comm,
@@ -914,6 +944,104 @@ mod tests {
         // Records that arrive after the game exited still count.
         d.child_exited(30, EXITED_0);
         assert_eq!(d.record_violation(&denied(666, 30), None).session, Some(a));
+    }
+
+    #[test]
+    fn violations_on_a_descendant_go_to_the_game_session() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        let a = launch(&mut d, &alice, 40);
+        let b = launch(&mut d, &alice, 41);
+        // 4000 is a grandchild of the game: the kernel registered it in the
+        // game's domain, fairplayd never heard of it.
+        let ev = d.record_violation(
+            &Violation {
+                domain: a.domain,
+                ..denied(666, 4000)
+            },
+            None,
+        );
+        assert_eq!(ev.session, Some(a.session));
+        assert_eq!(ev.target, 4000);
+        assert_eq!(
+            d.status(&alice, Some(a.session))
+                .unwrap()
+                .1
+                .unwrap()
+                .violations,
+            1
+        );
+        assert_eq!(
+            d.status(&alice, Some(b.session))
+                .unwrap()
+                .1
+                .unwrap()
+                .violations,
+            0
+        );
+        // Still filed there after the game exits (the grandchild may not have).
+        d.child_exited(40, EXITED_0);
+        let ev = d.record_violation(
+            &Violation {
+                domain: a.domain,
+                ..denied(666, 4000)
+            },
+            None,
+        );
+        assert_eq!(ev.session, Some(a.session));
+        // Command-line domain or unknown: no session.
+        for domain in [0, CLI_DOMAIN, 999] {
+            let ev = d.record_violation(
+                &Violation {
+                    domain,
+                    ..denied(666, 4001)
+                },
+                None,
+            );
+            assert_eq!(ev.session, None, "domain {domain}");
+        }
+    }
+
+    #[test]
+    fn unfollowed_children_mark_the_session_degraded() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        let a = launch(&mut d, &alice, 70);
+        let b = launch(&mut d, &alice, 71);
+        let info = |d: &Daemon<FakeMap>, id| d.status(&alice, Some(id)).unwrap().1.unwrap();
+        assert!(!info(&d, a.session).protection_degraded);
+
+        // The kernel couldn't add two of the game's children to PROTECTED.
+        d.map.unfollowed.insert(a.domain, 2);
+        let i = info(&d, a.session);
+        assert!(i.protection_degraded);
+        assert_eq!(i.unprotected_children, 2);
+        assert!(
+            d.status(&alice, Some(a.session)).unwrap().0,
+            "the game itself still is"
+        );
+        assert!(
+            !info(&d, b.session).protection_degraded,
+            "other sessions unaffected"
+        );
+        let listed = match d.list(&alice) {
+            Reply::Sessions(v) => v,
+            r => panic!("{r:?}"),
+        };
+        assert!(listed[0].protection_degraded && !listed[1].protection_degraded);
+
+        // The count is dropped with the session, not before.
+        d.child_exited(70, EXITED_0);
+        assert!(info(&d, a.session).protection_degraded);
+        for pid in 100..(MAX_ENDED_KEPT as u32 + 101) {
+            launch(&mut d, &alice, pid);
+            d.child_exited(pid, EXITED_0);
+        }
+        assert_eq!(
+            d.status(&alice, Some(a.session)).unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        assert!(d.map.unfollowed.is_empty());
     }
 
     #[test]

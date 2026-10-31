@@ -27,10 +27,10 @@ the parts that need a real gaming PC come later.
 | 2 | assetguard vs a real Perforce server | Done | `./vm/test-milestone2.sh` |
 | 3 | Protected process | Done | `cheatsim` + `fairplayd` (README) |
 | 4 | fairplayd socket API | Done | `./vm/test-milestone4.sh` |
-| 5 | Protection follows the game's child processes | Next | |
+| 5 | Protection follows the game's child processes | Done | `./vm/test-milestone5.sh` |
 | 6 | fairplayd protects itself from root | Not started | |
 | 7 | Report fake input devices and who made them | Not started | |
-| 8 | Only approved code may load into the game | Not started | |
+| 8 | Only approved code may load into the game | Done | `./vm/test-milestone8.sh` |
 | 9 | Vendor anti-cheat: signed and sandboxed | Not started | |
 | 10 | Attestation | Blocked: the VM has no TPM | |
 | 11 | Player-mode system image | Needs an x86 PC | |
@@ -239,7 +239,8 @@ The game's own anti-cheat (a process in the session) may see its session too.
 **Cleaning up.** When a protected program exits, `fairplayd` removes its PID
 from the list *before* **reaping** it. Until it's reaped, the exited process
 is a **zombie** whose PID the kernel won't hand out again, so a new, unrelated
-process can never inherit the protection.
+process can never inherit the protection. (Since milestone 5 the kernel also
+does this itself, for every process in a domain; see below.)
 
 **Milestone 4's test** (`vm/test-milestone4.sh`) plays every part: a launcher
 starts `cheatsim game`, a mock anti-cheat (a short Python script that speaks
@@ -259,6 +260,100 @@ still running.
 **"Best-effort"** is deliberate. Someone with physical access and a custom
 kernel can defeat any of this. The point is that attestation then *shows* a
 different kernel, and the server can act on that.
+
+### The domain follows the game (milestone 5)
+
+A Windows game under **Proton** isn't one process. Steam starts `proton`,
+which starts `wine`, which starts `game.exe`, with `wineserver` running
+alongside. `fairplayd` launches only the first, so every process the game
+starts has to join its protection domain on its own, the instant it exists.
+A cheat that could read the game's grandchild would read the game.
+
+The kernel does this, with two more small BPF programs (in
+`fairplay-ebpf/src/follow.rs`). They aren't checkpoints that can say no;
+they're **tracepoints**, which only watch:
+
+- **When a process forks**, if the parent is in `PROTECTED`, the new child
+  goes in with the parent's domain. This happens inside the parent's `fork`
+  call, before the child has run anything. (For the split second when the
+  child exists but isn't listed yet, the bouncer treats a child of a
+  protected process as protected.) New *threads* don't need an entry: the
+  process they belong to has one.
+- **When the last thread of a protected process exits**, its entry goes,
+  while the process is still a zombie. As with the game itself, the PID
+  can't be reused until the entry is gone, so a cheat started at just the
+  right moment can't inherit a place in the game's domain.
+
+`fairplayd` still removes the game it launched itself; the kernel has
+usually done it already, and removing twice is harmless.
+
+**When the list is full.** `PROTECTED` holds 1024 processes. If a new child
+doesn't fit, it runs unprotected. Rather than let that happen silently, the
+kernel counts it per domain (the `UNFOLLOWED` map) and `session_status`
+reports **`protection_degraded`**, with how many. What a game server does
+about that is its own policy.
+
+The launch environment now also drops `WINEDLLOVERRIDES` and `WINEDLLPATH`,
+which would let a cheat's DLL load inside a Proton game, the way
+`LD_PRELOAD` does for Linux programs. Children inherit the clean environment.
+
+**Milestone 5's test** (`vm/test-milestone5.sh`) launches `cheatsim game
+--depth 2`: the game forks a child, the child forks a grandchild, and the
+grandchild holds the secret. A root attack on the grandchild must leak
+nothing and print three `DENIED` lines. It also checks that the grandchild
+is in `PROTECTED` with the game's domain, that the Wine and `LD_` variables
+never reached it, that its entry is gone while it's still a zombie, that the
+same game started without `fairplayd` leaks 3/3, and that a full `PROTECTED`
+shows up as `protection_degraded`.
+
+### Only approved code loads into the game (milestone 8)
+
+Reading the game's memory is blocked, but a cheat could still get its code
+*into* the game: drop a library file somewhere and trick the game into
+loading it (a plugin folder, a config file that names a path), or, since
+milestone 5, get the game to start a dropped program, which would then be
+inside the game's domain. Clearing `LD_PRELOAD` at launch doesn't catch
+those.
+
+Every way of loading code from a file ends the same way: the kernel
+**maps** the file into memory with permission to run it (**PROT_EXEC**).
+`dlopen` does that, the loader does it for every library, `execve` does it
+for a new program, and Wine does it for DLLs. So two more checkpoints watch
+exactly that, for protected processes only: `mmap_file` (map a file as
+code) and `file_mprotect` (map it as data, then switch it to code). The
+file must be one of:
+
+- a **system file**: on the system disk, owned by root, writable by nobody
+  else. The loader, libc and graphics drivers are covered without a list;
+- one that was in the game's **install directory** at launch. `fairplayd`
+  walks that directory and lists every program and library file in it;
+- an **approved overlay** (Steam, Discord, MangoHud), named with
+  `fairplayd --overlay`.
+
+The list holds **inodes**, not file names. A file dropped after launch, or a
+library swapped for a different one at the same path, is a new inode, so it
+isn't on the list. Code a game generates in memory (a **JIT**, as Wine, .NET
+and shader compilers use) isn't a file and isn't checked: putting code there
+from outside would need a write into the game's memory, which milestone 3
+already blocks.
+
+What a blocked load looks like: `dlopen` fails ("failed to map segment"),
+`mprotect` fails with `EPERM`, and a blocked program start kills the new
+process (the kernel has already given up the old program by the time it
+maps the new one). Each shows up as a `DENIED` line and in the violation
+stream with the file's name.
+
+**Known weakness.** If the game's own files are writable by the player (they
+usually are), a cheat can rewrite an allowed file in place: same inode, new
+content. Checking content hashes (IMA or fs-verity) would close that; it's a
+design question for later.
+
+**Milestone 8's test** (`vm/test-milestone8.sh`) asks a protected `cheatsim`
+to load a dropped library (blocked), one from its install directory (loads),
+one swapped after launch (blocked) and an approved overlay (loads), to make
+a dropped file executable with `mprotect` (blocked), and to start
+`/usr/bin/true` (works) and a dropped copy of it (killed). The same dropped
+library loads fine in an unprotected game.
 
 ### Lessons learned writing BPF programs
 
@@ -335,7 +430,7 @@ Every pull request (and every push to `master`) runs
 | Shell scripts | `shellcheck` on everything in `vm/` |
 
 **What it can't prove:** GitHub's machines don't boot with BPF LSM turned on,
-so CI can't *load* our BPF programs. Milestones 1, 3 and 4 (and the later
+so CI can't *load* our BPF programs. Milestones 1, 3, 4 and 5 (and the later
 BPF milestones) are still tested on the VM, as in the README. If a PR touches
 `crates/*-ebpf` or `fairplayd`, run those before merging.
 
@@ -374,6 +469,11 @@ deliberate change to both files.
 - **aya-tool**, **bindgen**, **bpf-linker**: build tools; see
   [above](#why-the-bpf-crates-build-separately).
 - **Hook**: a point in the kernel where our program gets called.
+- **Tracepoint** (`tp_btf`): a named spot in the kernel, such as "a process
+  just forked" or "a process is exiting", where a BPF program can watch
+  but not refuse. `tp_btf` is the kind that hands the program the kernel's
+  own structs (here, the parent and child processes). Milestone 5 uses two
+  to keep `PROTECTED` up to date.
 - **CO-RE** (Compile Once, Run Everywhere): BPF relocations that let one
   compiled program adapt to each kernel's struct layout at load time. We don't
   use it yet, so programs are built per kernel.
@@ -399,6 +499,22 @@ deliberate change to both files.
   modify another.
 - **inode**: the file itself, as opposed to its name. A program that has a
   file open keeps the old inode even after the name points somewhere new.
+- **Inode-based allowlist**: a list of approved files by inode (plus the
+  disk they're on) instead of by path, so replacing a file at an approved
+  path doesn't make the replacement approved. Milestone 8's `EXEC_ALLOWED`.
+- **mmap**: asking the kernel to make a file (or plain memory) appear in a
+  process's memory. How programs and libraries get loaded.
+- **PROT_EXEC**: the permission bit on a memory mapping that lets the CPU
+  run it as code. **mprotect** changes those bits on an existing mapping.
+- **dlopen**: loading a library while a program runs (plugins, overlays).
+- **JIT** (just-in-time compiler): code a program writes into its own memory
+  and then runs, as Wine, .NET, LuaJIT and shader compilers do.
+- **memfd**: a file that lives only in memory, with no name on disk; JITs
+  use it to map the same code twice.
+- **ELF / PE**: the file formats of Linux programs and libraries, and of
+  Windows ones (`.exe`, `.dll`).
+- **Overlay**: a library that draws inside the game's window (Steam,
+  Discord, MangoHud), which means loading code into the game.
 - **Daemon**: a program that runs in the background and serves requests.
   `fairplayd` is one (the "d" is for daemon).
 - **uid / gid**: user ID and group ID, the numbers Linux uses for accounts
@@ -412,7 +528,11 @@ deliberate change to both files.
 - **no_new_privs**: a per-process flag that stops it, and anything it starts,
   from gaining privileges (e.g. through setuid programs).
 - **Protection domain**: the set of processes allowed to read each other: a
-  game and its anti-cheat. Each launch gets its own.
+  game, every process it starts, and its anti-cheat. Each launch gets its
+  own.
+- **Protection degraded**: `session_status`'s way of saying some process the
+  game started couldn't be added to its domain (the kernel's list was
+  full), so it runs unprotected.
 - **Session**: one `launch_protected` game plus anything launched into its
   domain, as `fairplayd` tracks it.
 

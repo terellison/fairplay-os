@@ -152,10 +152,19 @@ pub struct SessionInfo {
     pub uid: u32,
     pub game: ProcessInfo,
     /// Other processes launched into the domain (the vendor's anti-cheat).
+    /// Processes these start join the domain on their own and aren't listed.
     pub members: Vec<ProcessInfo>,
     /// Seconds since the Unix epoch.
     pub started_at: u64,
     pub violations: u64,
+    /// Some process started in this domain could not be protected (the
+    /// kernel's map was full) and runs outside it. The game itself may
+    /// still be protected; what a server makes of this is its policy.
+    #[serde(default)]
+    pub protection_degraded: bool,
+    /// How many such processes (a lower bound).
+    #[serde(default)]
+    pub unprotected_children: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +448,8 @@ mod tests {
                 members: vec![],
                 started_at: 1,
                 violations: 3,
+                protection_degraded: true,
+                unprotected_children: 2,
             }),
             lockdown: Some("none".into()),
             virtual_input_devices: vec![],
