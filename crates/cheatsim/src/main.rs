@@ -71,9 +71,11 @@ enum Cmd {
         /// as it arrives (so a test can drop or replace files first). A line
         /// `mprotect <path>` instead maps the file read-only and then asks
         /// for PROT_EXEC with mprotect(), printing MPROTECT-OK or
-        /// MPROTECT-BLOCKED; a line `exec <path>` forks a child that execs
-        /// the program, printing EXEC-OK if it exited 0, else EXEC-BLOCKED
-        /// and how it ended.
+        /// MPROTECT-BLOCKED; a line `exec <path> [args...]` forks a child
+        /// that execs the program, printing EXEC-OK if it exited 0, else
+        /// EXEC-BLOCKED and how it ended; `spawn <path> [args...]` does the
+        /// same without waiting and prints SPAWNED <pid> (milestone 9: the
+        /// game starting a helper, or a second process of its own).
         #[arg(long)]
         dlopen_stdin: bool,
     },
@@ -216,8 +218,10 @@ fn game(depth: u32, dlopen: &[String], dlopen_stdin: bool) -> ExitCode {
             let Ok(line) = line else { break };
             if let Some(path) = line.strip_prefix("mprotect ") {
                 make_executable(path);
-            } else if let Some(path) = line.strip_prefix("exec ") {
-                run(path);
+            } else if let Some(cmd) = line.strip_prefix("exec ") {
+                run(cmd, true);
+            } else if let Some(cmd) = line.strip_prefix("spawn ") {
+                run(cmd, false);
             } else if !line.is_empty() {
                 load(&line);
             }
@@ -263,14 +267,26 @@ fn load(path: &str) {
     }
 }
 
-/// Forks a child that execs `path` (no arguments) and reports how it
-/// ended: a game starting a helper program, or being tricked into starting
-/// a dropped one.
-fn run(path: &str) {
-    let Ok(c) = std::ffi::CString::new(path) else {
-        return println!("EXEC-BLOCKED {path}: NUL in path");
+/// Forks a child that execs `cmd` (a path, then arguments, split on
+/// whitespace) and, if `wait`, reports how it ended: a game starting a
+/// helper program, or being tricked into starting a dropped one.
+fn run(cmd: &str, wait: bool) {
+    let Ok(words) = cmd
+        .split_whitespace()
+        .map(std::ffi::CString::new)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return println!("EXEC-BLOCKED {cmd}: NUL in command");
     };
-    let argv = [c.as_ptr(), std::ptr::null()];
+    let Some(c) = words.first() else {
+        return println!("EXEC-BLOCKED: empty command");
+    };
+    let path = c.to_string_lossy().into_owned();
+    let mut argv: Vec<*const libc::c_char> = words.iter().map(|w| w.as_ptr()).collect();
+    argv.push(std::ptr::null());
+    // Lines printed by the child must not sit in a copy of our buffer.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
     // SAFETY: single-threaded; the child only calls execv and _exit.
     match unsafe { fork() } {
         Ok(ForkResult::Child) => unsafe {
@@ -278,6 +294,7 @@ fn run(path: &str) {
             // Exit code 100 + errno: execve itself returned an error.
             libc::_exit(100 + *libc::__errno_location());
         },
+        Ok(ForkResult::Parent { child }) if !wait => println!("SPAWNED {child} {path}"),
         Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
             Ok(WaitStatus::Exited(_, 0)) => println!("EXEC-OK {path}"),
             Ok(WaitStatus::Exited(_, code)) if code > 100 => println!(

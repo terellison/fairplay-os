@@ -22,6 +22,9 @@
 #             Proton game (proton -> wine -> game.exe), only the first
 #             process is launched by fairplayd.
 #   attacker  `cheatsim attack`, run as root on purpose.
+#   manifest  game.json, signed with a throwaway key (milestone 9): names
+#             cheatsim and /bin/sh as launch executables, and cat as an
+#             anti_cheat reader (it reads the grandchild's environment).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -108,6 +111,11 @@ mkdir -p "$T/bin"
 cp "$REPO"/target/release/{fairplayd,fairplayctl,cheatsim} "$T/bin/"
 CTL="$T/bin/fairplayctl"; CHEATSIM="$T/bin/cheatsim"
 export FAIRPLAYD_SOCKET="$SOCK"
+"$CTL" manifest keygen --out "$T/vendor.key" >/dev/null &&
+  "$CTL" manifest new --key "$T/vendor.key" --name "M5 Test Game" \
+    --launch "$CHEATSIM" --launch "$(readlink -f /bin/sh)" --anti-cheat "$(readlink -f /usr/bin/cat)" \
+    --out "$T/game.json" >/dev/null || exit 2
+MANIFEST="$T/game.json"
 
 step "start fairplayd on $SOCK"
 if ! getent group "$GROUP" >/dev/null; then
@@ -134,7 +142,7 @@ check "fork and exit tracing programs attached" \
 
 step "launch a game that starts a grandchild, with code-injecting variables set"
 as_launcher env WINEDLLOVERRIDES='dxgi=n,b' WINEDLLPATH="$T/cheat-dlls" LD_PRELOAD="$T/cheat.so" \
-  FAIRPLAY_M5_MARK=kept "$CTL" launch -- "$CHEATSIM" game --depth 2 >"$T/game.out" 2>&1
+  FAIRPLAY_M5_MARK=kept "$CTL" launch --manifest "$MANIFEST" -- "$CHEATSIM" game --depth 2 >"$T/game.out" 2>&1
 wait_for "$T/game.out" '^pid=' || { bad "game started"; indent <"$T/game.out"; exit 1; }
 SESSION="$(grep '^{' "$T/game.out" | jq -r '.ok.launched.session')"
 GPID="$(grep '^{' "$T/game.out" | jq -r '.ok.launched.pid')"
@@ -166,16 +174,17 @@ grep "session $SESSION: pid $GPID" "$T/daemon.err" | indent
 for v in WINEDLLOVERRIDES WINEDLLPATH LD_PRELOAD; do
   check "fairplayd logged dropping $v" grep -q "session $SESSION: pid $GPID .*dropped env .*\"$v\"" "$T/daemon.err"
 done
-# Read the grandchild's environment from inside the domain: as root from
-# outside, the read itself would be denied.
+# Read the grandchild's environment as the session's anti_cheat reader
+# (milestone 9: being in the domain isn't enough): as root from outside,
+# the read itself would be denied.
 as_launcher "$CTL" launch --join "$SESSION" -- /usr/bin/cat "/proc/$GC/environ" >"$T/environ.raw" 2>&1
 wait_for "$T/environ.raw" 'FAIRPLAY_M5_MARK'
 tr '\0' '\n' <"$T/environ.raw" | grep -v '^{' >"$T/environ"
-check "a domain member can read the grandchild (its environment)" grep -q '^FAIRPLAY_M5_MARK=kept$' "$T/environ"
+check "the anti_cheat reader can read the grandchild (its environment)" grep -q '^FAIRPLAY_M5_MARK=kept$' "$T/environ"
 for v in WINEDLLOVERRIDES WINEDLLPATH LD_PRELOAD; do
   check_not "$v doesn't reach the grandchild" grep -q "^$v=" "$T/environ"
 done
-check "no DENIED line for the domain member's read" test "$(denied "$GC")" -eq 3
+check "no DENIED line for the reader's read" test "$(denied "$GC")" -eq 3
 
 step "a descendant leaves PROTECTED when it exits, before its PID is freed"
 # Stop the child so it can't reap the grandchild: the grandchild's PID stays
@@ -216,7 +225,7 @@ step "PROTECTED full: the child runs unprotected and the session says so"
 # code is in $T/bin, not next to /bin/sh: say so, or the executable-mapping
 # allowlist (milestone 8) stops the exec.
 mkfifo "$T/go"
-as_launcher "$CTL" launch --install-dir "$T/bin" -- /bin/sh -c "read x <'$T/go'; exec '$CHEATSIM' game --depth 1" >"$T/full.out" 2>&1
+as_launcher "$CTL" launch --manifest "$MANIFEST" --install-dir "$T/bin" -- /bin/sh -c "read x <'$T/go'; exec '$CHEATSIM' game --depth 1" >"$T/full.out" 2>&1
 FSESSION="$(grep '^{' "$T/full.out" | jq -r '.ok.launched.session')"
 FGAME="$(grep '^{' "$T/full.out" | jq -r '.ok.launched.pid')"
 FDOM="$(domain_of "$FGAME")"

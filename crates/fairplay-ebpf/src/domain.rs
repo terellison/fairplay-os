@@ -12,10 +12,10 @@ use core::ptr::addr_of;
 use fairplay_common::{Hook, Violation, EXE_NAME_LEN};
 
 use crate::{
-    maps::{PROTECTED, VIOLATIONS},
+    maps::{PROTECTED, READERS, VIOLATIONS},
     vmlinux::{
-        bpf_map, bpf_prog, bpf_prog_aux, dentry, file, inode, kuid_t, mm_struct, path, qstr,
-        super_block, task_struct, vm_area_struct,
+        bpf_map, bpf_prog, bpf_prog_aux, dentry, file, inode, kuid_t, linux_binprm, mm_struct,
+        path, qstr, super_block, task_struct, vm_area_struct,
     },
 };
 
@@ -26,8 +26,8 @@ pub const EPERM: i32 = 1;
 
 /// The current task's tgid if it must be kept away from `target` (a tgid),
 /// `None` if normal kernel rules apply: the target is not protected, the
-/// caller is the target itself, or the caller is in the target's protection
-/// domain (the game and its own anti-cheat).
+/// caller is the target itself, or the caller is one of the target domain's
+/// readers (the vendor's anti-cheat, `wineserver`).
 #[allow(dead_code)] // for hooks that only have the target's tgid
 pub fn denied_caller(target: u32) -> Option<u32> {
     let domain = *unsafe { PROTECTED.get(&target) }?;
@@ -35,14 +35,16 @@ pub fn denied_caller(target: u32) -> Option<u32> {
 }
 
 /// [`denied_caller`] for a target already known to be in `domain` (see
-/// [`task_domain`]).
+/// [`task_domain`]). Being a protected member of the same domain is not
+/// enough (milestone 9): the game's own processes can't read each other,
+/// so a wrapper the player launched can't read the game it started.
 pub fn denied_caller_in(target: u32, domain: u32) -> Option<u32> {
     let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
     if caller == target {
         return None;
     }
-    if let Some(&caller_domain) = unsafe { PROTECTED.get(&caller) } {
-        if caller_domain == domain {
+    if let Some(&reader_domain) = unsafe { READERS.get(&caller) } {
+        if reader_domain == domain {
             return None;
         }
     }

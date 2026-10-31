@@ -14,6 +14,10 @@
 //! tree. Its tracing programs are attached from fairplayd's
 //! `TRACING_PROGRAMS`.
 //!
+//! `readers` (milestone 9) decides who may read a protected process besides
+//! itself: processes that exec'd a manifest-named reader file. Its tracing
+//! program is in `TRACING_PROGRAMS` too.
+//!
 //! `self_protect` (milestone 6) keeps every other process, root included,
 //! away from fairplayd itself while it runs with `--self-protect`.
 //!
@@ -38,6 +42,7 @@ mod follow;
 mod hooks;
 mod input;
 mod maps;
+mod readers;
 mod self_protect;
 
 #[cfg(not(test))]

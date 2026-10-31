@@ -8,7 +8,8 @@
 //! 3. The caller puts the child's PID into PROTECTED ([`Paused::pid`]).
 //! 4. [`Paused::release`] writes one byte; the child drops to the caller's
 //!    identity (groups, then gid, then uid), enters the working directory,
-//!    and `execve`s. If the caller drops a `Paused` without releasing it,
+//!    and execs the program through the file descriptor fairplayd hashed it
+//!    from (`fexecve`, milestone 9), never by path. If the caller drops a `Paused` without releasing it,
 //!    the child is killed without ever running the program.
 //! 5. [`Released::wait_exec`] reports whether `execve` worked: a
 //!    close-on-exec pipe reads EOF on success, or the failing step and errno.
@@ -30,7 +31,6 @@ const MAX_ARGS: usize = 4096;
 /// Everything the child needs, as C strings.
 #[derive(Debug)]
 pub struct Prepared {
-    program: CString,
     argv: Vec<CString>,
     envp: Vec<CString>,
     cwd: CString,
@@ -39,16 +39,8 @@ pub struct Prepared {
 }
 
 /// Validates a `launch_protected` request.
-pub fn prepare(
-    program: &str,
-    argv: &[String],
-    env: &[String],
-    cwd: &str,
-) -> Result<Prepared, ApiError> {
+pub fn prepare(argv: &[String], env: &[String], cwd: &str) -> Result<Prepared, ApiError> {
     let bad = |m: String| ApiError::new(ErrorCode::BadRequest, m);
-    if !program.starts_with('/') {
-        return Err(bad("program must be an absolute path".into()));
-    }
     if !cwd.starts_with('/') {
         return Err(bad("cwd must be an absolute path".into()));
     }
@@ -72,7 +64,6 @@ pub fn prepare(
         envp.push(c(kv)?);
     }
     Ok(Prepared {
-        program: c(program)?,
         argv: argv.iter().map(|a| c(a)).collect::<Result<_, _>>()?,
         envp,
         cwd: c(cwd)?,
@@ -119,10 +110,12 @@ const STAGES: &[&str] = &[
     "execve",
 ];
 
-/// Forks a child that will become `prep`'s program running as `id`, with
+/// Forks a child that will exec `program` (an open file, checked against
+/// the manifest) with `prep`'s argv and environment, running as `id`, with
 /// `stdio` (or /dev/null) as fds 0-2. The child does nothing until released.
 pub fn fork_paused(
     prep: &Prepared,
+    program: &File,
     id: &Identity,
     stdio: Option<[OwnedFd; 3]>,
 ) -> Result<Paused, ApiError> {
@@ -157,7 +150,7 @@ pub fn fork_paused(
         uid: id.uid,
         gid: id.gid,
         cwd: &prep.cwd,
-        program: &prep.program,
+        program: program.as_raw_fd(),
         argv: &argv,
         envp: &envp,
     };
@@ -263,7 +256,9 @@ struct ChildArgs<'a> {
     uid: u32,
     gid: u32,
     cwd: &'a CString,
-    program: &'a CString,
+    /// Close-on-exec, like every descriptor the daemon holds: fine for a
+    /// binary, which the kernel has open by then (scripts are refused).
+    program: RawFd,
     argv: &'a [*const libc::c_char],
     envp: &'a [*const libc::c_char],
 }
@@ -326,7 +321,8 @@ unsafe fn child_main(a: &ChildArgs) -> ! {
             u32::MAX,
             libc::CLOSE_RANGE_CLOEXEC,
         );
-        libc::execve(a.program.as_ptr(), a.argv.as_ptr(), a.envp.as_ptr());
+        // The very file that was hashed: a path could point elsewhere by now.
+        libc::fexecve(a.program, a.argv.as_ptr(), a.envp.as_ptr());
         fail(a, 7);
     }
 }
@@ -352,28 +348,22 @@ mod tests {
 
     #[test]
     fn prepare_validates() {
-        let ok = prepare("/bin/game", &s(&["game"]), &s(&["HOME=/h"]), "/").unwrap();
+        let ok = prepare(&s(&["game"]), &s(&["HOME=/h"]), "/").unwrap();
         assert_eq!(ok.argv.len(), 1);
-        for (program, argv, env, cwd) in [
-            ("game", s(&["game"]), vec![], "/"),
-            ("/bin/game", vec![], vec![], "/"),
-            ("/bin/game", s(&["game"]), vec![], "relative"),
-            ("/bin/game", s(&["ga\0me"]), vec![], "/"),
-            ("/bin/game", s(&["game"]), s(&["NOEQUALS"]), "/"),
+        for (argv, env, cwd) in [
+            (vec![], vec![], "/"),
+            (s(&["game"]), vec![], "relative"),
+            (s(&["ga\0me"]), vec![], "/"),
+            (s(&["game"]), s(&["NOEQUALS"]), "/"),
         ] {
-            let e = prepare(program, &argv, &env, cwd).unwrap_err();
-            assert_eq!(
-                e.code,
-                ErrorCode::BadRequest,
-                "{program} {argv:?} {env:?} {cwd}"
-            );
+            let e = prepare(&argv, &env, cwd).unwrap_err();
+            assert_eq!(e.code, ErrorCode::BadRequest, "{argv:?} {env:?} {cwd}");
         }
     }
 
     #[test]
     fn prepare_drops_loader_variables() {
         let p = prepare(
-            "/bin/game",
             &s(&["game"]),
             &s(&[
                 "LD_PRELOAD=/tmp/cheat.so",
@@ -392,7 +382,6 @@ mod tests {
     #[test]
     fn prepare_drops_wine_dll_variables() {
         let p = prepare(
-            "/bin/game",
             &s(&["game"]),
             &s(&[
                 "WINEDLLOVERRIDES=dxgi=n,b",
@@ -453,14 +442,9 @@ mod tests {
     fn unreleased_child_never_runs() {
         let marker =
             std::env::temp_dir().join(format!("fairplayd-unreleased-{}", std::process::id()));
-        let prep = prepare(
-            "/usr/bin/touch",
-            &s(&["touch", marker.to_str().unwrap()]),
-            &[],
-            "/",
-        )
-        .unwrap();
-        let paused = fork_paused(&prep, &me(), None).unwrap();
+        let prep = prepare(&s(&["touch", marker.to_str().unwrap()]), &[], "/").unwrap();
+        let touch = File::open("/usr/bin/touch").unwrap();
+        let paused = fork_paused(&prep, &touch, &me(), None).unwrap();
         let pid = paused.pid();
         drop(paused);
         assert!(!matches!(
@@ -474,8 +458,9 @@ mod tests {
     /// refused, which exercises the error pipe.
     #[test]
     fn released_child_execs_or_reports_why_not() {
-        let prep = prepare("/bin/true", &s(&["true"]), &[], "/").unwrap();
-        let paused = fork_paused(&prep, &me(), None).unwrap();
+        let prep = prepare(&s(&["true"]), &[], "/").unwrap();
+        let program = File::open("/bin/true").unwrap();
+        let paused = fork_paused(&prep, &program, &me(), None).unwrap();
         let pid = paused.pid();
         let result = paused.release().unwrap().wait_exec();
         let status = reap(pid);
@@ -494,13 +479,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_program_is_reported() {
+    fn exec_failure_is_reported() {
         // SAFETY: no preconditions.
         if unsafe { libc::geteuid() } != 0 {
             return; // can't get past setgroups as a normal user
         }
-        let prep = prepare("/nonexistent/game", &s(&["game"]), &[], "/").unwrap();
-        let paused = fork_paused(&prep, &me(), None).unwrap();
+        let prep = prepare(&s(&["game"]), &[], "/").unwrap();
+        // Not executable.
+        let program = File::open("/etc/hostname").unwrap();
+        let paused = fork_paused(&prep, &program, &me(), None).unwrap();
         let pid = paused.pid();
         let e = paused.release().unwrap().wait_exec().unwrap_err();
         reap(pid);

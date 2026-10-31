@@ -13,6 +13,15 @@ pub const MAP_EXEC_ALLOWED: &str = "EXEC_ALLOWED";
 /// Name of the map of filesystems with a blanket executable-mapping rule
 /// (kernel `s_dev` -> one of the `FS_*` kinds), milestone 8.
 pub const MAP_EXEC_TRUSTED_FS: &str = "EXEC_TRUSTED_FS";
+/// Name of the map from a reader's tgid to the protection domain it may
+/// read (milestone 9). Readers are in [`MAP_PROTECTED`] too.
+pub const MAP_READERS: &str = "READERS";
+/// Name of the map of files that make a protected process a reader when it
+/// execs them ([`ExecKey`] -> [`ExecAllow`]), milestone 9.
+pub const MAP_READER_FILES: &str = "READER_FILES";
+/// Entries [`MAP_READER_FILES`] holds: a few per session (the anti-cheat,
+/// `wineserver`).
+pub const READER_FILES_CAPACITY: u32 = 1024;
 /// Name of the map from protection domain to the number of processes started
 /// in it that could not be protected (PROTECTED was full).
 pub const MAP_UNFOLLOWED: &str = "UNFOLLOWED";
@@ -162,8 +171,9 @@ pub const ANY_DOMAIN: u32 = 0;
 /// overlays. fairplayd refuses a launch that would not fit.
 pub const EXEC_ALLOWED_CAPACITY: u32 = 32 * 1024;
 
-/// A file that one protection domain may map executable, identified the way
-/// the kernel sees it: `inode->i_sb->s_dev` and `inode->i_ino`.
+/// A file that one protection domain may map executable (or, in
+/// [`MAP_READER_FILES`], whose exec makes a reader), identified the way the
+/// kernel sees it: `inode->i_sb->s_dev` and `inode->i_ino`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExecKey {

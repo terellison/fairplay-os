@@ -15,9 +15,12 @@
 # Cast:
 #   launcher  you, plus the fairplay-launcher group (via setpriv; your
 #             account isn't changed). Starts the game and the anti-cheat.
+#   manifest  game.json, signed with a throwaway key (milestone 9): names
+#             cheatsim as the launch executable, and python3 and a copy of
+#             cheatsim (vendor/cheatsim) as anti_cheat readers.
 #   game      `cheatsim game`, launched protected; runs as you.
 #   vendor    a mock anti-cheat in Python, speaking raw JSON to the socket,
-#             launched into the game's protection domain. It asks
+#             joined to the game's session as its anti_cheat reader. It asks
 #             session_status about "my session", then subscribes to
 #             violations and prints each event.
 #   attacker  `cheatsim attack`, run as root on purpose.
@@ -92,6 +95,12 @@ mkdir -p "$T/bin"
 cp "$REPO"/target/release/{fairplayd,fairplayctl,cheatsim} "$T/bin/"
 CTL="$T/bin/fairplayctl"; CHEATSIM="$T/bin/cheatsim"
 export FAIRPLAYD_SOCKET="$SOCK"
+mkdir -p "$T/vendor" && cp "$CHEATSIM" "$T/vendor/cheatsim"
+"$CTL" manifest keygen --out "$T/vendor.key" >/dev/null &&
+  "$CTL" manifest new --key "$T/vendor.key" --name "M4 Test Game" --launch "$CHEATSIM" \
+    --anti-cheat "$(readlink -f "$(command -v python3)")" --anti-cheat "$T/vendor/cheatsim" \
+    --out "$T/game.json" >/dev/null || exit 2
+MANIFEST="$T/game.json"
 
 step "start fairplayd on $SOCK"
 if ! getent group "$GROUP" >/dev/null; then
@@ -108,15 +117,15 @@ for _ in $(seq 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
 indent <"$T/daemon.err"
 
 step "launch_protected: launchers only, never root by default"
-"$CTL" launch --no-stdio -- "$CHEATSIM" game >"$T/plain.out" 2>/dev/null
+"$CTL" launch --no-stdio --manifest "$MANIFEST" -- "$CHEATSIM" game >"$T/plain.out" 2>/dev/null
 check "a user outside $GROUP is refused (forbidden)" \
   jqt '.error.code=="forbidden"' "$T/plain.out"
-sudo FAIRPLAYD_SOCKET="$SOCK" "$CTL" launch --no-stdio -- "$CHEATSIM" game >"$T/root.out" 2>/dev/null
+sudo FAIRPLAYD_SOCKET="$SOCK" "$CTL" launch --no-stdio --manifest "$MANIFEST" -- "$CHEATSIM" game >"$T/root.out" 2>/dev/null
 check "root without --run-as is refused (bad_request)" \
   jqt '.error.code=="bad_request"' "$T/root.out"
 
 step "launch the game as the launcher"
-as_launcher "$CTL" launch -- "$CHEATSIM" game >"$T/game.out" 2>&1
+as_launcher "$CTL" launch --manifest "$MANIFEST" -- "$CHEATSIM" game >"$T/game.out" 2>&1
 wait_for "$T/game.out" '^pid=' || { bad "game started"; indent <"$T/game.out"; exit 1; }
 SESSION="$(grep '^{' "$T/game.out" | jq -r '.ok.launched.session')"
 GPID="$(grep '^{' "$T/game.out" | jq -r '.ok.launched.pid')"
@@ -131,7 +140,7 @@ check_not "the game doesn't keep the launcher group" \
   grep -qE "^Groups:.*\\b$LAUNCHER_GID\\b" "/proc/$GPID/status"
 check "the game has no_new_privs set" grep -q '^NoNewPrivs:[[:space:]]*1' "/proc/$GPID/status"
 
-step "mock vendor joins the game's protection domain and subscribes"
+step "mock vendor joins the game's session as its anti_cheat reader and subscribes"
 cat >"$T/vendor.py" <<'EOF'
 # A stand-in anti-cheat client: plain sockets and JSON, no fairplay code.
 import json, os, socket, sys
@@ -190,12 +199,16 @@ sudo -u nobody "$CTL" --socket "$SOCK" status "$SESSION" >"$T/nobody.out" 2>/dev
 check "another user can't see the session (not_found)" \
   jqt '.error.code=="not_found"' "$T/nobody.out"
 
-step "a member of the domain may read the game (the anti-cheat's privilege)"
+step "the anti_cheat reader may read the game (the anti-cheat's privilege)"
 sudo FAIRPLAYD_SOCKET="$SOCK" "$CTL" launch --run-as 0 --join "$SESSION" -- \
-  "$CHEATSIM" attack --pid "$GPID" --addr "$ADDR" >"$T/member.out" 2>&1
+  "$T/vendor/cheatsim" attack --pid "$GPID" --addr "$ADDR" >"$T/member.out" 2>&1
 wait_for "$T/member.out" 'paths leaked'
 grep -E 'LEAKED|BLOCKED|paths' "$T/member.out" | indent
-check "3/3 read from inside the domain" grep -q '^3/3 paths leaked' "$T/member.out"
+check "3/3 read by the manifest's anti_cheat reader" grep -q '^3/3 paths leaked' "$T/member.out"
+sudo FAIRPLAYD_SOCKET="$SOCK" "$CTL" launch --no-stdio --run-as 0 --join "$SESSION" -- \
+  "$CHEATSIM" attack --pid "$GPID" --addr "$ADDR" >"$T/unnamed.out" 2>/dev/null
+check "a program the manifest doesn't name can't join (forbidden)" \
+  jqt '.error.code=="forbidden"' "$T/unnamed.out"
 
 step "attest"
 "$CTL" attest --nonce 00ff11 >"$T/attest.out" 2>/dev/null

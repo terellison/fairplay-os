@@ -7,10 +7,13 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 clap.workspace = true
+ed25519-dalek = "2"
 nix = { workspace = true, features = ["socket", "uio"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 
 [[bin]]
 name = "fairplayctl"

@@ -28,7 +28,7 @@ use tokio::{
 use crate::{
     exec_allow, host, input, launch,
     state::{launch_identity, Peer, Subscription},
-    Shared,
+    verify, Shared,
 };
 
 /// Simultaneous connections; more are refused. Each costs one task.
@@ -123,6 +123,7 @@ fn launch_protected(
     fds: Vec<OwnedFd>,
 ) -> Result<Reply, ApiError> {
     let Request::LaunchProtected {
+        manifest,
         program,
         argv,
         env,
@@ -146,32 +147,72 @@ fn launch_protected(
             ))
         }
     };
-    let prep = launch::prepare(&program, &argv, &env, &cwd)?;
+    let prep = launch::prepare(&argv, &env, &cwd)?;
+    // Milestone 9: only what the manifest names, opened and hashed with the
+    // caller's file permissions. The program is exec'd from the descriptor
+    // that was hashed.
+    let plan = match (join, manifest) {
+        (None, Some(manifest)) => {
+            verify::as_caller(peer, move || verify::plan_launch(&manifest, &program))?
+        }
+        (Some(id), None) => {
+            let m = ctx.daemon.lock().unwrap().join_manifest(peer, id)?;
+            verify::as_caller(peer, move || verify::plan_join(m, &program))?
+        }
+        (None, None) => {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "launch_protected needs a signed game manifest",
+            ))
+        }
+        (Some(_), Some(_)) => {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "join uses the session's manifest; leave manifest out",
+            ))
+        }
+    };
+    let program = plan.program.path.to_string_lossy().into_owned();
     // The code the program may map (milestone 8), listed before taking the
-    // lock: a big install directory takes a while to walk.
+    // lock: a big install directory takes a while to walk. Plus the
+    // manifest's accepted runtime files and overlays.
     let dir = exec_allow::install_dir(&program, install_dir.as_deref())?;
-    let files = exec_allow::launch_files(
-        Path::new(&program),
+    let mut files = exec_allow::launch_files(
+        Some(&plan.program.file),
         &dir,
         &ctx.system_devs,
         exec_allow::Limits::DEFAULT,
     )?;
+    files.extend(exec_allow::ids_of(plan.exec.iter().map(|c| &c.file))?);
+    let reader_files = exec_allow::ids_of(plan.readers.iter().map(|c| &c.file))?;
 
     // Fork and register under the lock, so the reaper (which also takes it)
     // can't see the child before its session exists.
     let released = {
         let mut d = ctx.daemon.lock().unwrap();
         let mut ticket = d.begin_launch(peer, join)?;
-        ticket.block_input = block_virtual_input;
-        let allowed = d.allow_exec(&ticket, &files)?;
-        let paused = match launch::fork_paused(&prep, &identity, stdio) {
+        // The request, or for a new session its manifest, may ask.
+        ticket.block_input = block_virtual_input
+            || (!ticket.join && plan.manifest.verified.manifest.block_virtual_input);
+        let allowed = d
+            .allow_exec(&ticket, &files)
+            .and_then(|n| d.allow_readers(&ticket, &reader_files).map(|r| (n, r)));
+        let (allowed, readers) = match allowed {
+            Ok(n) => n,
+            Err(e) => {
+                d.abandon_launch(&ticket);
+                return Err(e);
+            }
+        };
+        let paused = match launch::fork_paused(&prep, &plan.program.file, &identity, stdio) {
             Ok(p) => p,
             Err(e) => {
                 d.abandon_launch(&ticket);
                 return Err(e);
             }
         };
-        if let Err(e) = d.register(ticket, paused.pid(), peer, identity.uid, argv) {
+        let manifest = (!ticket.join).then(|| plan.manifest.clone());
+        if let Err(e) = d.register(ticket, paused.pid(), peer, identity.uid, argv, manifest) {
             // `paused` drops here: the child is killed before it runs anything.
             d.abandon_launch(&ticket);
             return Err(ApiError::new(
@@ -180,12 +221,13 @@ fn launch_protected(
             ));
         }
         let pid = paused.pid();
+        let info = plan.manifest.info();
         eprintln!(
-            "fairplayd: session {}: pid {pid} ({program}) protected in domain {}, running as uid {}{}{}{}; {} code files from {} allowed ({allowed} new)",
+            "fairplayd: session {}: pid {pid} ({program}) protected in domain {}, running as uid {}{}{}{}; {} code files from {} allowed ({allowed} new); manifest {:?} sha256 {} signer {}; {} reader file(s) ({readers} new){}",
             ticket.session,
             ticket.domain,
             identity.uid,
-            if ticket.join { ", joined" } else { "" },
+            if ticket.join { ", joined as a reader" } else { "" },
             if ticket.block_input {
                 ", blocking virtual input"
             } else {
@@ -198,6 +240,15 @@ fn launch_protected(
             },
             files.len(),
             dir.display(),
+            info.name,
+            info.sha256,
+            info.signer_fingerprint,
+            reader_files.len(),
+            if plan.skipped.is_empty() {
+                String::new()
+            } else {
+                format!("; skipped manifest entries {:?}", plan.skipped)
+            },
         );
         (ticket.session, paused.release()?)
     };

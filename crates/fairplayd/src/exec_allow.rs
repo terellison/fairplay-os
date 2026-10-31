@@ -31,6 +31,7 @@ use anyhow::{bail, Context, Result};
 use fairplay_api::{ApiError, ErrorCode};
 use fairplay_common::{
     ExecAllow, ExecKey, EXEC_ALLOWED_CAPACITY, EXEC_CHECK_GENERATION, FS_ANON, FS_SYSTEM,
+    READER_FILES_CAPACITY,
 };
 
 use crate::state::ProtectedMap;
@@ -230,6 +231,20 @@ fn id_of(f: &File, st: &Stat) -> FileId {
     }
 }
 
+/// Identities of files already open (checked against a manifest), for the
+/// allowlist or READER_FILES.
+pub fn ids_of<'a>(files: impl IntoIterator<Item = &'a File>) -> Result<Vec<FileId>, ApiError> {
+    let internal = |e: anyhow::Error| ApiError::new(ErrorCode::Internal, format!("{e:#}"));
+    let mounts = Mounts::read().map_err(internal)?;
+    files
+        .into_iter()
+        .map(|f| {
+            let st = statx(f, &mounts).map_err(|e| internal(e.into()))?;
+            Ok(id_of(f, &st))
+        })
+        .collect()
+}
+
 /// Identity of an approved overlay (`--overlay`). Any regular file, with
 /// symlinks resolved now; no format check, the operator named it.
 pub fn overlay_file(path: &Path, mounts: &Mounts) -> Result<FileId> {
@@ -253,16 +268,66 @@ fn named_file(what: &str, path: &Path, mounts: &Mounts) -> Result<FileId> {
     Ok(id_of(&f, &st))
 }
 
-/// The EXEC_ALLOWED entries this daemon made, per domain, so they can be
-/// removed when the domain's last process exits and so the map never
-/// overflows: a launch that wouldn't fit is refused, never half-applied.
+/// Which kernel map an [`ExecEntries`] fills. Both are keyed by
+/// [`ExecKey`] with an [`ExecAllow`] value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Table {
+    /// EXEC_ALLOWED: files a domain may map executable (milestone 8).
+    #[default]
+    ExecAllowed,
+    /// READER_FILES: files whose exec makes a reader (milestone 9).
+    ReaderFiles,
+}
+
+impl Table {
+    fn capacity(self) -> usize {
+        match self {
+            Table::ExecAllowed => EXEC_ALLOWED_CAPACITY as usize,
+            Table::ReaderFiles => READER_FILES_CAPACITY as usize,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Table::ExecAllowed => "the executable allowlist",
+            Table::ReaderFiles => "the reader file list",
+        }
+    }
+
+    fn insert(self, map: &mut impl ProtectedMap, key: ExecKey, value: ExecAllow) -> Result<()> {
+        match self {
+            Table::ExecAllowed => map.allow_exec(key, value),
+            Table::ReaderFiles => map.allow_reader_file(key, value),
+        }
+    }
+
+    fn remove(self, map: &mut impl ProtectedMap, key: ExecKey) -> Result<()> {
+        match self {
+            Table::ExecAllowed => map.disallow_exec(key),
+            Table::ReaderFiles => map.disallow_reader_file(key),
+        }
+    }
+}
+
+/// The EXEC_ALLOWED (or READER_FILES) entries this daemon made, per domain,
+/// so they can be removed when the domain's last process exits and so the
+/// map never overflows: a launch that wouldn't fit is refused, never
+/// half-applied.
 #[derive(Debug, Default)]
 pub struct ExecEntries {
+    table: Table,
     by_domain: BTreeMap<u32, BTreeSet<ExecKey>>,
     used: usize,
 }
 
 impl ExecEntries {
+    pub fn new(table: Table) -> Self {
+        Self {
+            table,
+            ..Default::default()
+        }
+    }
+
     pub fn used(&self) -> usize {
         self.used
     }
@@ -287,11 +352,13 @@ impl ExecEntries {
         if new.is_empty() {
             return Ok(0);
         }
-        if self.used + new.len() > EXEC_ALLOWED_CAPACITY as usize {
+        let capacity = self.table.capacity();
+        if self.used + new.len() > capacity {
             return Err(ApiError::new(
                 ErrorCode::LimitReached,
                 format!(
-                    "the executable allowlist is full ({} of {EXEC_ALLOWED_CAPACITY} entries used, {} more needed)",
+                    "{} is full ({} of {capacity} entries used, {} more needed)",
+                    self.table.name(),
                     self.used,
                     new.len()
                 ),
@@ -302,13 +369,13 @@ impl ExecEntries {
         let mut added = vec![];
         for &key in &new {
             let (_, value) = by_key[&(key.dev, key.ino)].entry(domain);
-            if let Err(e) = map.allow_exec(key, value) {
+            if let Err(e) = self.table.insert(map, key, value) {
                 for &k in &added {
-                    let _ = map.disallow_exec(k);
+                    let _ = self.table.remove(map, k);
                 }
                 return Err(ApiError::new(
                     ErrorCode::Internal,
-                    format!("adding to the executable allowlist: {e:#}"),
+                    format!("adding to {}: {e:#}", self.table.name()),
                 ));
             }
             added.push(key);
@@ -321,8 +388,11 @@ impl ExecEntries {
     /// Removes everything `domain` was allowed.
     pub fn release(&mut self, map: &mut impl ProtectedMap, domain: u32) {
         for key in self.by_domain.remove(&domain).unwrap_or_default() {
-            if let Err(e) = map.disallow_exec(key) {
-                eprintln!("fairplayd: removing {key:?} from EXEC_ALLOWED: {e:#}");
+            if let Err(e) = self.table.remove(map, key) {
+                eprintln!(
+                    "fairplayd: removing {key:?} from {}: {e:#}",
+                    self.table.name()
+                );
             }
             self.used -= 1;
         }
@@ -406,11 +476,12 @@ fn pseudo_filesystem(dir: &Path) -> Option<&'static str> {
 }
 
 /// Everything a launch adds to its domain's allowlist: the program itself
-/// plus every code file under `dir`, minus files the system rule already
-/// allows. Fails (and the launch is refused) if the directory is too big;
-/// a partial allowlist would only fail later and less clearly.
+/// (the file it will exec, already open) plus every code file under `dir`,
+/// minus files the system rule already allows. Fails (and the launch is
+/// refused) if the directory is too big; a partial allowlist would only
+/// fail later and less clearly.
 pub fn launch_files(
-    program: &Path,
+    program: Option<&File>,
     dir: &Path,
     system_devs: &[u32],
     limits: Limits,
@@ -420,12 +491,11 @@ pub fn launch_files(
     let needs_entry =
         |st: &Stat| !(system_devs.contains(&st.dev) && st.uid == 0 && st.mode & 0o022 == 0);
     let mut out = BTreeSet::new();
-    // The program, whatever its format (it may be a script; harmless), and
-    // through symlinks, as execve will.
-    if let Some(f) = open_regular(program, true) {
-        if let Ok(st) = statx(&f, &mounts) {
+    // The program, whatever its format.
+    if let Some(f) = program {
+        if let Ok(st) = statx(f, &mounts) {
             if needs_entry(&st) {
-                out.insert(id_of(&f, &st));
+                out.insert(id_of(f, &st));
             }
         }
     }
@@ -590,7 +660,13 @@ mod tests {
         symlink(outside.0.join("cheat.so"), d.join("cheat.so")).unwrap();
         symlink(&outside.0, d.join("linked-dir")).unwrap();
 
-        let files = launch_files(&d.join("bin/game"), d, &[], Limits::DEFAULT).unwrap();
+        let files = launch_files(
+            Some(&File::open(d.join("bin/game")).unwrap()),
+            d,
+            &[],
+            Limits::DEFAULT,
+        )
+        .unwrap();
         let mut inos: Vec<u64> = files.iter().map(|f| f.ino).collect();
         inos.sort();
         let mut want = vec![
@@ -613,7 +689,13 @@ mod tests {
 
         // A program outside the directory is added too, whatever it is.
         std::fs::write(outside.0.join("run.sh"), b"#!/bin/sh\n").unwrap();
-        let files = launch_files(&outside.0.join("run.sh"), d, &[], Limits::DEFAULT).unwrap();
+        let files = launch_files(
+            Some(&File::open(outside.0.join("run.sh")).unwrap()),
+            d,
+            &[],
+            Limits::DEFAULT,
+        )
+        .unwrap();
         assert!(files
             .iter()
             .any(|f| f.ino == ino(&outside.0.join("run.sh"))));
@@ -632,9 +714,9 @@ mod tests {
             max_visited: usize::MAX,
             max_depth: MAX_DEPTH,
         };
-        let with = launch_files(&sh, dir, &[dev], limits).unwrap();
+        let with = launch_files(Some(&File::open(&sh).unwrap()), dir, &[dev], limits).unwrap();
         assert!(with.iter().all(|f| f.ino != ino(&sh)));
-        let without = launch_files(&sh, dir, &[], limits).unwrap();
+        let without = launch_files(Some(&File::open(&sh).unwrap()), dir, &[], limits).unwrap();
         assert!(without.iter().any(|f| f.ino == ino(&sh)));
     }
 
@@ -651,12 +733,7 @@ mod tests {
             max_visited: 10,
             max_depth: 2,
         };
-        assert_eq!(
-            launch_files(Path::new("/nonexistent"), d, &[], ok)
-                .unwrap()
-                .len(),
-            3
-        );
+        assert_eq!(launch_files(None, d, &[], ok).unwrap().len(), 3);
         for limits in [
             Limits { max_files: 2, ..ok },
             Limits {
@@ -665,7 +742,7 @@ mod tests {
             },
             Limits { max_depth: 1, ..ok },
         ] {
-            let e = launch_files(Path::new("/nonexistent"), d, &[], limits).unwrap_err();
+            let e = launch_files(None, d, &[], limits).unwrap_err();
             assert_eq!(e.code, ErrorCode::LimitReached, "{limits:?}: {}", e.message);
         }
     }

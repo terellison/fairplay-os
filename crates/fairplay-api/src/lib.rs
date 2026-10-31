@@ -10,13 +10,17 @@
 //! The daemon learns who is calling from the kernel (`SO_PEERCRED`), never
 //! from the request, so nothing in a request claims an identity.
 //!
+//! `launch_protected` starts only what a signed game manifest names
+//! (milestone 9, see [`manifest`]): a launch executable for a new session,
+//! or with `join`, one of the session manifest's `anti_cheat` readers.
+//!
 //! `launch_protected` may carry the caller's stdin, stdout and stderr as
 //! file descriptors (`SCM_RIGHTS`) on the same `sendmsg` as the request line;
 //! the game then writes to the caller's terminal. Without them it gets
 //! `/dev/null`.
 //!
 //! ```text
-//! -> {"op":"launch_protected","program":"/usr/bin/game","argv":["game"],"env":["HOME=/home/me"],"cwd":"/home/me"}
+//! -> {"op":"launch_protected","manifest":"/games/x/game.json","program":"/games/x/game","argv":["game"],"env":["HOME=/home/me"],"cwd":"/home/me"}
 //! <- {"ok":{"launched":{"session":1,"pid":4242}}}
 //! -> {"op":"session_status","session":1}
 //! <- {"ok":{"status":{"protected":true,"session":{...},"lockdown":"none","virtual_input_devices":[]}}}
@@ -32,6 +36,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub mod client;
+pub mod manifest;
 
 /// Where fairplayd listens unless told otherwise.
 pub const DEFAULT_SOCKET: &str = "/run/fairplayd.sock";
@@ -56,8 +61,17 @@ pub type SessionId = u64;
 pub enum Request {
     /// Start a program in a protection domain, protected from its first
     /// instruction. Launchers only: root, or members of the launcher group.
+    /// The program must be one the game manifest names, with the hash it
+    /// names (milestone 9).
     LaunchProtected {
+        /// Absolute path of a signed game manifest (its signature is
+        /// `<manifest>.sig`). Required for a new session; must be left out
+        /// with `join`, which uses the session's manifest.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest: Option<String>,
         /// Absolute path of the executable. The client resolves `PATH`.
+        /// Without `join`: one of the manifest's `launch` entries. With
+        /// `join`: one of its `anti_cheat` readers.
         program: String,
         /// Full argv, including argv[0].
         argv: Vec<String>,
@@ -73,8 +87,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_as: Option<u32>,
         /// Start the program inside this existing session's protection
-        /// domain instead of a new one: how the vendor's anti-cheat joins
-        /// the game it watches.
+        /// domain instead of a new one, as a reader: how the vendor's
+        /// anti-cheat joins the game it watches. Only an `anti_cheat` reader
+        /// the session's manifest names may join.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         join: Option<SessionId>,
         /// Absolute path of the directory the program's code comes from
@@ -219,6 +234,24 @@ pub struct SessionInfo {
     /// How many such processes (a lower bound).
     #[serde(default)]
     pub unprotected_children: u64,
+    /// The signed manifest the session was launched from (milestone 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<Box<ManifestInfo>>,
+}
+
+/// What `session_status` says about a session's manifest. The OS doesn't
+/// judge the signer; the vendor's server checks it is the vendor's key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestInfo {
+    pub name: String,
+    /// Hex SHA-256 of the manifest file's exact bytes.
+    pub sha256: String,
+    /// The signer's ed25519 public key, base64, as the manifest names it.
+    pub signer: String,
+    /// `ed25519:` + hex SHA-256 of the signer key's 32 bytes.
+    pub signer_fingerprint: String,
+    /// The manifest asks for virtual input devices to be blocked.
+    pub block_virtual_input: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,12 +455,13 @@ mod tests {
             Request::SessionStatus { session: None }
         );
         let launch = decode_request(
-            br#"{"op":"launch_protected","program":"/bin/game","argv":["game","-x"],"cwd":"/"}"#,
+            br#"{"op":"launch_protected","manifest":"/g/m.json","program":"/bin/game","argv":["game","-x"],"cwd":"/"}"#,
         )
         .unwrap();
         assert_eq!(
             launch,
             Request::LaunchProtected {
+                manifest: Some("/g/m.json".into()),
                 program: "/bin/game".into(),
                 argv: vec!["game".into(), "-x".into()],
                 env: vec![],
@@ -447,6 +481,7 @@ mod tests {
     fn requests_round_trip() {
         for r in [
             Request::LaunchProtected {
+                manifest: None,
                 program: "/bin/true".into(),
                 argv: vec!["true".into()],
                 env: vec!["A=b".into()],
@@ -536,6 +571,13 @@ mod tests {
                 violations: 3,
                 protection_degraded: true,
                 unprotected_children: 2,
+                manifest: Some(Box::new(ManifestInfo {
+                    name: "g".into(),
+                    sha256: "00".repeat(32),
+                    signer: "AAAA".into(),
+                    signer_fingerprint: "ed25519:00".into(),
+                    block_virtual_input: false,
+                })),
             }),
             lockdown: Some("none".into()),
             virtual_input_devices: vec![

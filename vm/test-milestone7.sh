@@ -109,6 +109,10 @@ cp "$REPO/target/release/cheatsim" "$T/tools/remapper"
 cp "$REPO/target/release/cheatsim" "$T/game/"
 CTL="$T/bin/fairplayctl"; CHEAT="$T/bin/cheatsim"; REMAP="$T/tools/remapper"
 export FAIRPLAYD_SOCKET="$SOCK"
+# Milestone 9: fairplayd launches only what a signed manifest names.
+"$CTL" manifest keygen --out "$T/vendor.key" >/dev/null &&
+  "$CTL" manifest new --key "$T/vendor.key" --name "M7 Test Game" --launch "$T/game/cheatsim" \
+    --out "$T/game/game.json" >/dev/null || exit 2
 
 step "input drivers"
 sudo modprobe uinput 2>/dev/null   # built in on Ubuntu; a module elsewhere
@@ -146,7 +150,7 @@ check "session_status still says who made it: cheatsim, not allowlisted" \
 sudo pkill -f "^$CHEAT clicker --name m7 idle"
 
 step "launch the game protected; subscribe to its violations"
-sudo "$CTL" --socket "$SOCK" launch --no-stdio --run-as "$ME_UID" -- "$T/game/cheatsim" game >"$T/game.out" 2>&1
+sudo "$CTL" --socket "$SOCK" launch --no-stdio --run-as "$ME_UID" --manifest "$T/game/game.json" -- "$T/game/cheatsim" game >"$T/game.out" 2>&1
 SESSION="$(jq -r '.ok.launched.session' "$T/game.out")"
 GPID="$(jq -r '.ok.launched.pid' "$T/game.out")"
 [ "$SESSION" != null ] || { bad "game launched"; indent <"$T/game.out"; exit 1; }
@@ -214,7 +218,7 @@ if [ "$HAVE_UHID" = 1 ]; then
   sudo "$CHEAT" uhid --name "m7 uhid late" --bogus-first --wait-stdin <"$T/uhidcmd" >"$T/late-uhid.out" 2>&1 &
   check "a uhid fd written to (bogus event) before blocking" wait_for "$T/late-uhid.out" "^BOGUS-WRITTEN"
 fi
-sudo "$CTL" --socket "$SOCK" launch --no-stdio --block-virtual-input --run-as "$ME_UID" -- "$T/game/cheatsim" game >"$T/game2.out" 2>&1
+sudo "$CTL" --socket "$SOCK" launch --no-stdio --block-virtual-input --run-as "$ME_UID" --manifest "$T/game/game.json" -- "$T/game/cheatsim" game >"$T/game2.out" 2>&1
 SESSION2="$(jq -r '.ok.launched.session' "$T/game2.out")"
 GPID2="$(jq -r '.ok.launched.pid' "$T/game2.out")"
 echo "      session=$SESSION2 pid=$GPID2"

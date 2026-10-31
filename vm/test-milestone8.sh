@@ -101,6 +101,12 @@ cp "$REPO/target/release/cheatsim" "$T/game/"
 CTL="$T/bin/fairplayctl"; GAME="$T/game/cheatsim"
 mklib "$T/game/lib_ok.so" 1 && mklib "$T/game/lib_swap.so" 2 && mklib "$T/overlay/overlay.so" 3 || exit 2
 export FAIRPLAYD_SOCKET="$SOCK"
+# Milestone 9: fairplayd launches only what a signed manifest names.
+"$CTL" manifest keygen --out "$T/vendor.key" >/dev/null &&
+  "$CTL" manifest new --key "$T/vendor.key" --name "M8 Test Game" \
+    --launch "$GAME" --launch "$(readlink -f "$(command -v python3)")" \
+    --out "$T/game.json" >/dev/null || exit 2
+MANIFEST="$T/game.json"
 
 step "start fairplayd on $SOCK with one approved overlay"
 if sudo "$BPFTOOL" map show name EXEC_ALLOWED 2>/dev/null | grep -q .; then
@@ -117,7 +123,7 @@ check "the overlay is on the allowlist for every domain (1 entry)" test "$(exec_
 step "launch the game protected; it reads library paths from a pipe"
 mkfifo "$T/cmd"
 exec 3<>"$T/cmd"   # held open read-write, so neither side blocks or sees EOF
-sudo "$CTL" --socket "$SOCK" launch --run-as "$ME_UID" -- "$GAME" game --dlopen-stdin <"$T/cmd" >"$T/game.out" 2>&1
+sudo "$CTL" --socket "$SOCK" launch --run-as "$ME_UID" --manifest "$MANIFEST" -- "$GAME" game --dlopen-stdin <"$T/cmd" >"$T/game.out" 2>&1
 wait_for "$T/game.out" '^pid=' || { bad "game started"; indent <"$T/game.out"; indent <"$T/daemon.err"; exit 1; }
 SESSION="$(grep '^{' "$T/game.out" | jq -r '.ok.launched.session')"
 GPID="$(grep '^{' "$T/game.out" | jq -r '.ok.launched.pid')"
@@ -201,7 +207,7 @@ os.ftruncate(fd, 4096)
 mmap.mmap(fd, 4096, prot=rwx)
 print("JIT-OK", flush=True)
 EOF
-sudo "$CTL" --socket "$SOCK" launch --run-as "$ME_UID" -- "$(command -v python3)" -I "$T/jit.py" >"$T/jit.out" 2>&1
+sudo "$CTL" --socket "$SOCK" launch --run-as "$ME_UID" --manifest "$MANIFEST" -- "$(command -v python3)" -I "$T/jit.py" >"$T/jit.out" 2>&1
 wait_for "$T/jit.out" 'JIT-OK\|Error'
 indent <"$T/jit.out"
 check "anonymous RWX memory and an executable memfd map fine" grep -q '^JIT-OK' "$T/jit.out"
@@ -215,7 +221,7 @@ check "LOADED (marker=66): only protected processes are restricted" \
   grep -q "^LOADED $T/drop/cheat.so marker=66$" "$T/plain.out"
 
 step "install_dir must be a real directory"
-sudo "$CTL" --socket "$SOCK" launch --run-as "$ME_UID" --install-dir /proc -- "$GAME" game >"$T/proc.out" 2>/dev/null
+sudo "$CTL" --socket "$SOCK" launch --run-as "$ME_UID" --manifest "$MANIFEST" --install-dir /proc -- "$GAME" game >"$T/proc.out" 2>/dev/null
 check "--install-dir /proc is refused (bad_request), nothing launched" \
   jqt '.error.code=="bad_request"' "$T/proc.out"
 
