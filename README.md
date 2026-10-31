@@ -101,7 +101,7 @@ one JSON object per line:
 
 | Call | Who may call it | What it does |
 | --- | --- | --- |
-| `launch_protected` | root, or the `fairplay-launcher` group | Starts a program protected from its first instruction, as the launcher (never as root by default). `join` starts it inside an existing session's protection domain: that's how the vendor's anti-cheat gets in. |
+| `launch_protected` | root, or the `fairplay-launcher` group | Starts a program protected from its first instruction, as the launcher (never as root by default). Since milestone 9, only a program a signed game manifest names. `join` starts the manifest's anti-cheat inside an existing session, as a reader: that's how the vendor's anti-cheat gets in. |
 | `session_status` | the session's launcher or user, its own processes, root | Protected or not, the game's state and exit code, members, violation count, kernel lockdown mode, virtual input devices present |
 | `violations` | same | A stream: one event per denied attempt (process, its executable, the hook), pushed as it happens |
 | `attest` | anyone | `unavailable` until milestone 10 (no TPM in the VM); echoes the nonce |
@@ -114,9 +114,10 @@ The exit test, inside the VM, as your normal user:
 It builds everything, starts its own `fairplayd`, launches `cheatsim game`
 through the socket as you (with the launcher group added via `setpriv`; your
 account isn't changed), launches a mock anti-cheat written in Python into the
-game's domain, attacks the game as root (0/3 leak), and checks that the mock
-vendor's stream got exactly one event per attempt. It also checks the
-authorization rules, that a domain member *can* read the game, `attest`,
+game's session as its anti-cheat reader, attacks the game as root (0/3
+leak), and checks that the mock vendor's stream got exactly one event per
+attempt. It also checks the authorization rules, that the manifest's
+anti-cheat reader *can* read the game (and an unnamed program can't join), `attest`,
 and that the game's PID leaves the kernel map when it exits. It cleans up
 after itself.
 
@@ -126,8 +127,11 @@ By hand:
     # log out and back in for the group to apply, then:
     sudo ./target/release/fairplayd \
       --obj crates/fairplay-ebpf/target/bpfel-unknown-none/release/fairplay
-    # another terminal:
-    ./target/release/fairplayctl launch -- ./target/release/cheatsim game
+    # another terminal: a signed manifest naming the game (milestone 9)
+    ./target/release/fairplayctl manifest keygen --out /tmp/test.key
+    ./target/release/fairplayctl manifest new --key /tmp/test.key --name Test \
+      --launch "$PWD/target/release/cheatsim" --out /tmp/game.json
+    ./target/release/fairplayctl launch --manifest /tmp/game.json -- ./target/release/cheatsim game
     ./target/release/fairplayctl violations 1      # streams; leave it running
     # a third terminal (pid and addr as printed by the game):
     sudo ./target/release/cheatsim attack --pid <pid> --addr <addr>
@@ -336,6 +340,121 @@ forks children that exec `/usr/bin/true` (works) and a copy of it dropped in
 unprotected game, that JIT-style anonymous and memfd code still works in a
 protected process, and that allowlist entries are removed when the game
 exits.
+
+## Milestone 9, part A: game manifest, protected members vs readers
+
+**The bypass this closes.** Until now every process in a protection domain
+could read every other, and the launcher picked what `launch_protected`
+started. On a player's PC the launcher is the player, so
+`launch_protected(python3 wrapper.py)`, where the wrapper starts the real
+game as its child, could read the game. The executable-mapping allowlist
+doesn't help: `python3` is a system file, and a script is data.
+
+**Protected members vs readers** (kernel, `crates/fairplay-ebpf/src/readers.rs`):
+
+- `PROTECTED` (tgid -> domain) is unchanged: the game and everything it
+  starts, followed from fork to exit.
+- A new `READERS` map (tgid -> domain). `ptrace_access_check` lets a caller
+  at a protected process only if the caller *is* that process or
+  `READERS[caller]` is its domain. Being a member of the same domain no
+  longer counts: protected members can't read each other (parent, child or
+  sibling).
+- A process becomes a reader only by **exec'ing** a file in `READER_FILES`
+  ((domain, dev, inode) -> generation, the same identity as milestone 8's
+  `EXEC_ALLOWED`), checked in a `sched_process_exec` tracing program. The
+  exec of any other file ends reader status, and it is never inherited on
+  fork: a reader's child is a plain member. `READERS` entries go at exit,
+  with the `PROTECTED` ones (before the PID can be reused). This is how
+  Proton's `wineserver`, which wine starts, becomes a reader.
+- Readers are in `PROTECTED` too. fairplayd's self-protection (milestone 6)
+  is unchanged.
+
+**The game manifest** (`crates/fairplay-api/src/manifest.rs`, v0): JSON plus
+a detached signature, `<manifest>.sig` (base64 ed25519 over the file's exact
+bytes).
+
+    {
+      "name": "Example Game",
+      "signer": "<ed25519 public key, base64>",
+      "launch":  [{"path": "bin/game", "sha256": "<hex>"}],
+      "readers": [{"role": "anti_cheat", "path": "/opt/vendor/ac", "sha256": "<hex>"},
+                  {"role": "runtime_helper", "path": "proton/files/bin/wineserver", "sha256": "<hex>"}],
+      "proton":  [{"path": "proton/files/lib/wine/x86_64-unix/ntdll.so", "sha256": "<hex>"}],
+      "overlays": [{"path": "/usr/lib/mangohud/libMangoHud.so", "sha256": "<hex>"}],
+      "block_virtual_input": false
+    }
+
+Relative paths are relative to the manifest's directory. `fairplayd` checks
+the signature against the manifest's **own** `signer` key and keeps no list
+of trusted publishers: the OS stays neutral, records the manifest's hash and
+the signer's fingerprint in the session, and the vendor's server checks the
+signer (via attestation, milestone 10). A cheater can sign a manifest of
+their own; `session_status` will show their key, not the vendor's.
+
+**What `launch_protected` does now:**
+
+1. `manifest` (an absolute path) is required for a new session. fairplayd
+   verifies the signature, then requires `program` to be one of the
+   manifest's `launch` entries (paths compared after resolving symlinks).
+2. It opens the program, hashes it **through that open descriptor**, and the
+   child execs **that descriptor** (`fexecve`), so the path can't be swapped
+   between the check and the exec. Scripts are refused: their interpreter
+   would read them again by path.
+3. The manifest's `runtime_helper` readers are hashed the same way and go
+   into `READER_FILES`; its `proton` and `overlays` files go on the
+   session's executable-mapping allowlist. Entries that are missing or don't
+   match are skipped and logged (a manifest may list several Proton builds).
+4. All of this opens files with the **caller's** file permissions (a
+   per-thread `setfsuid`), so a launcher can't make fairplayd read or hash a
+   file it couldn't read itself.
+5. `join` now means "start one of the session manifest's `anti_cheat`
+   readers in this session". It is hashed and exec'd the same way, its file
+   is added to `READER_FILES`, and its exec makes it a reader. Anything the
+   manifest doesn't name gets `forbidden`. The old "the launcher may join
+   anything" path is gone.
+6. `session_status` reports `manifest`: its name, `sha256`, `signer`,
+   `signer_fingerprint` (`ed25519:` + SHA-256 of the key) and
+   `block_virtual_input` (recorded; enforcing it is milestone 7's option).
+
+Signature, tamper and hash failures are `forbidden`, with nothing launched.
+`fairplayd --protect <pid> --allow <pid>` (milestone 3) still works;
+`--allow` now makes a reader.
+
+**Tools for vendors and tests** (no daemon needed):
+
+    fairplayctl manifest keygen --out vendor.key       # prints the public key and fingerprint
+    fairplayctl manifest new --key vendor.key --name "Game" --launch bin/game \
+      --anti-cheat /opt/vendor/ac --runtime-helper proton/wineserver --out game.json
+    fairplayctl manifest sign --key vendor.key game.json   # after editing by hand
+    fairplayctl manifest verify game.json                  # signature and every file's hash
+    fairplayctl launch --manifest game.json -- bin/game
+    fairplayctl launch --join 1 -- /opt/vendor/ac
+
+**Remaining window.** The hashed file is the file exec'd, but whoever can
+write to it can still rewrite it **in place** between the hash and the
+exec, or later: a runtime helper is exec'd by the game long after launch,
+and is matched by inode. fs-verity (the kernel checks each page against a
+hash fixed when the file was sealed) is the later fix, for this and for
+milestone 8's allowlist.
+
+Part B, sandboxing the anti-cheat with Landlock, is next.
+
+The exit test, inside the VM, as your normal user:
+
+    flock /run/lock/fairplay-vm-tests ./vm/test-milestone9.sh
+
+As root on purpose (so every block is the LSM's): (a) a cheater-signed
+manifest launches `python3 wrapper.py`, which starts `cheatsim game` as its
+child and reads it itself and from a sibling: 0/3 leaked, 4 `DENIED` lines
+(unprotected, the same wrapper leaks); (b) the game's child can't read its
+parent or a sibling; (c) the vendor's signed mock anti-cheat, joined as
+`anti_cheat`, reads the game 3/3; (d) a helper the game execs from the
+manifest's `runtime_helper` file reads it 3/3, and the same binary at an
+unnamed path doesn't; (e) an unnamed binary (or a runtime helper) can't
+join; (f) a tampered manifest, one signed by another key, and an exe whose
+hash changed are each refused, with no session created; (g)
+`session_status` shows the signer's fingerprint and the manifest's hash.
+The milestone 4, 5, 6 and 8 tests now launch from manifests too.
 
 ## Known gaps on arm64 QEMU
 

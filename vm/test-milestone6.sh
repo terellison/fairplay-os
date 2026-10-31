@@ -169,7 +169,9 @@ grep "^DENIED .*comm=cheatsim .*target=$FPD " "$T/daemon.out" | indent
 
 step "fairplayd still works while it protects itself"
 check "the socket API answers root" sh -c "sudo '$CTL' --socket '$SOCK' list | grep -q '\"ok\"'"
-sudo "$CTL" --socket "$SOCK" launch --run-as "$(id -u)" --install-dir "$T/bin" -- "$CHEATSIM" game >"$T/game.out" 2>&1
+"$CTL" manifest keygen --out "$T/vendor.key" >/dev/null
+"$CTL" manifest new --key "$T/vendor.key" --name "M6 Test Game" --launch "$CHEATSIM" --out "$T/game.json" >/dev/null
+sudo "$CTL" --socket "$SOCK" launch --run-as "$(id -u)" --manifest "$T/game.json" --install-dir "$T/bin" -- "$CHEATSIM" game >"$T/game.out" 2>&1
 wait_until grep -q '^pid=' "$T/game.out" || { bad "a protected game started"; indent <"$T/game.out"; }
 GPID="$(sed -n 's/^pid=\([0-9]*\) .*/\1/p' "$T/game.out")"
 ADDR="$(sed -n 's/^pid=[0-9]* addr=//p' "$T/game.out")"

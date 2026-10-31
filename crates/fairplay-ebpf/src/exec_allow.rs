@@ -87,18 +87,54 @@ fn allowed(file: *const file, domain: u32) -> Result<bool, i64> {
         }
         let ino: u64 = bpf_probe_read_kernel(inode_ino(inode))?;
         let generation: u32 = bpf_probe_read_kernel(inode_generation(inode))?;
-        for d in [domain, ANY_DOMAIN] {
-            let key = ExecKey {
-                domain: d,
-                dev,
-                ino,
-            };
-            if let Some(v) = EXEC_ALLOWED.get(&key) {
-                if v.flags & EXEC_CHECK_GENERATION == 0 || v.generation == generation {
-                    return Ok(true);
-                }
+        let id = FileIdentity {
+            dev,
+            ino,
+            generation,
+        };
+        Ok(id.listed(&EXEC_ALLOWED, domain) || id.listed(&EXEC_ALLOWED, ANY_DOMAIN))
+    }
+}
+
+/// A file as fairplayd's maps key it: superblock device, inode number, and
+/// inode generation.
+pub struct FileIdentity {
+    pub dev: u32,
+    pub ino: u64,
+    pub generation: u32,
+}
+
+impl FileIdentity {
+    /// `file`'s identity. `Ok(None)` if it has no inode.
+    #[inline(always)]
+    pub fn of(file: *const file) -> Result<Option<Self>, i64> {
+        unsafe {
+            let inode: *const inode = bpf_probe_read_kernel(file_inode(file))?;
+            if inode.is_null() {
+                return Ok(None);
             }
+            let sb: *const super_block = bpf_probe_read_kernel(inode_sb(inode))?;
+            Ok(Some(Self {
+                dev: bpf_probe_read_kernel(sb_dev(sb))?,
+                ino: bpf_probe_read_kernel(inode_ino(inode))?,
+                generation: bpf_probe_read_kernel(inode_generation(inode))?,
+            }))
         }
-        Ok(false)
+    }
+
+    /// Is this file in `map` for `domain`, with a matching generation where
+    /// fairplayd recorded one? (EXEC_ALLOWED and READER_FILES share the
+    /// layout.)
+    #[inline(always)]
+    pub fn listed(&self, map: &HashMap<ExecKey, ExecAllow>, domain: u32) -> bool {
+        let key = ExecKey {
+            domain,
+            dev: self.dev,
+            ino: self.ino,
+        };
+        match unsafe { map.get(&key) } {
+            Some(v) => v.flags & EXEC_CHECK_GENERATION == 0 || v.generation == self.generation,
+            None => false,
+        }
     }
 }

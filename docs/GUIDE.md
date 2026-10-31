@@ -31,7 +31,7 @@ the parts that need a real gaming PC come later.
 | 6 | fairplayd protects itself from root | Done (opt-in: `--self-protect`) | `./vm/test-milestone6.sh` |
 | 7 | Report fake input devices and who made them | Not started | |
 | 8 | Only approved code may load into the game | Done | `./vm/test-milestone8.sh` |
-| 9 | Vendor anti-cheat: signed and sandboxed | Not started | |
+| 9 | Vendor anti-cheat: signed and sandboxed | Part A done; sandbox next | `./vm/test-milestone9.sh` |
 | 10 | Attestation | Blocked: the VM has no TPM | |
 | 11 | Player-mode system image | Needs an x86 PC | |
 | 12 | A Windows game under **Proton**, protected | Needs an x86 PC | |
@@ -211,12 +211,14 @@ machine can connect to. Each request and each answer is one line of
   unprotected: it **forks** a child, the child waits on a pipe, `fairplayd`
   puts the child's PID in the `PROTECTED` list, and only then lets the child
   switch to the launcher's user and start the game. The game never runs as
-  root unless root explicitly asks for that. Variables like `LD_PRELOAD`,
+  root unless root explicitly asks for that. (Since milestone 9, only a
+  program a signed game manifest names; see below.) Variables like `LD_PRELOAD`,
   which tell Linux to load extra code into a program, are dropped (the
   design doc's "clean launch environment"), and the game gets
   **no_new_privs**, so it can't gain privileges later. With `join`, the
-  launcher starts a second program *inside* the game's protection domain:
-  that's how the vendor's anti-cheat gets permission to inspect the game.
+  launcher starts a second program *inside* the game's session: that's how
+  the vendor's anti-cheat gets permission to inspect the game (since
+  milestone 9, only the anti-cheat the manifest names, as a *reader*).
 - **`session_status`**: is it protected? Plus the game's state (running, or
   its exit code), who's in its domain, how many attempts were blocked, the
   kernel's **lockdown** mode, and whether any virtual input devices (fake
@@ -396,6 +398,58 @@ one swapped after launch (blocked) and an approved overlay (loads), to make
 a dropped file executable with `mprotect` (blocked), and to start
 `/usr/bin/true` (works) and a dropped copy of it (killed). The same dropped
 library loads fine in an unprotected game.
+
+### Signed manifests and readers (milestone 9, part A)
+
+Up to milestone 8, every process in a game's protection domain could read
+every other one, and the launcher chose what to start. On a player's PC the
+launcher is the player. So a player could launch a tiny Python **wrapper**
+that starts the real game as its child: the wrapper was in the domain, so it
+could read the game freely. Milestone 8 didn't help, since Python is a
+normal system program and a script isn't code the kernel maps.
+
+Two changes close that:
+
+- **Members vs readers.** The game and everything it starts are still
+  *protected members*: nobody outside can read them. But members can no
+  longer read each other either, not parent, child or sibling. Only
+  **readers** may: the vendor's anti-cheat, and helpers the game's manifest
+  names (Proton's `wineserver`, which does Windows' "read another process"
+  calls for the game). The kernel decides who is a reader at the moment a
+  process starts a program (**exec**): if the file it starts is one of the
+  manifest's reader files (matched by inode, as in milestone 8), it becomes
+  a reader; if it starts anything else, it stops being one. Being *started
+  by* a reader doesn't make you one.
+- **The game manifest.** Each game ships a small JSON file, signed by its
+  publisher or anti-cheat vendor with an **ed25519** key, that lists what
+  may be launched (by **SHA-256** hash), which programs are readers, and
+  which Proton files and overlays are accepted. The signature is a
+  **detached signature**: a separate `game.json.sig` file. `fairplayd`
+  launches only what the manifest names, and only if the file's hash
+  matches. It hashes the file through the same open handle it then starts
+  (**fexecve**), so the file can't be swapped in between.
+
+**The OS doesn't pick publishers.** `fairplayd` checks that the manifest is
+signed by the key written inside it, and that's all. Anyone can sign a
+manifest, including a cheater. But `session_status` reports the signer's
+**fingerprint**, and the game's server only lets players into ranked play
+if its own vendor's key signed the manifest. So the OS stays neutral and the
+decision stays with the server, as the design doc wants.
+
+**Known weakness.** If the player can write to the game's files, they can
+still rewrite one *in place* after `fairplayd` checked it. **fs-verity**,
+where the kernel itself checks every page of a file against a sealed hash,
+is the later fix (for milestone 8's allowlist too).
+
+**Milestone 9's test** (`vm/test-milestone9.sh`) launches the wrapper attack
+from a cheater-signed manifest (blocked, and `session_status` shows the
+cheater's key), has the game's child try to read its parent and a sibling
+(blocked), joins a signed mock anti-cheat (it can read the game), has the
+game start a named helper (can read) and the same program copied to an
+unnamed path (can't), and checks that unnamed programs can't join and that a
+tampered manifest, a wrong signature and a changed program are all refused
+with nothing started. Part B, locking the anti-cheat into a **Landlock**
+sandbox so it sees the game but not your files, comes next.
 
 ### Lessons learned writing BPF programs
 
@@ -606,9 +660,16 @@ deliberate change to both files.
   can the PID be reused.
 - **no_new_privs**: a per-process flag that stops it, and anything it starts,
   from gaining privileges (e.g. through setuid programs).
-- **Protection domain**: the set of processes allowed to read each other: a
-  game, every process it starts, and its anti-cheat. Each launch gets its
-  own.
+- **Protection domain**: a game, every process it starts, and its
+  anti-cheat, protected together. Each launch gets its own. Since milestone
+  9 its members can't read each other; only its *readers* can.
+- **Reader**: a process allowed to read a protected game's memory: the
+  vendor's anti-cheat, or a helper the game's manifest names (like
+  `wineserver`). A process becomes one only by starting a file the manifest
+  names.
+- **Game manifest**: a signed JSON file shipped with a game that lists what
+  may be launched, which programs are readers, and which runtime files and
+  overlays are accepted, each by hash.
 - **Protection degraded**: `session_status`'s way of saying some process the
   game started couldn't be added to its domain (the kernel's list was
   full), so it runs unprotected.
@@ -638,6 +699,27 @@ deliberate change to both files.
   account.
 
 **Trust and attestation**
+
+- **Hash / SHA-256**: a short fingerprint computed from a file's contents.
+  Change one byte and the fingerprint changes completely. SHA-256 is the
+  standard one; its fingerprints are 64 hex digits.
+- **ed25519**: a modern digital-signature scheme. A *private key* signs; the
+  matching *public key* (32 bytes, safe to publish) lets anyone check the
+  signature. The game manifest is signed with one.
+- **Detached signature**: a signature kept in its own file (`game.json.sig`)
+  instead of inside the file it signs, so the signed file stays exactly as
+  written. Change any byte of `game.json`, even a space, and the signature
+  no longer matches.
+- **Key fingerprint**: a hash of a public key, an easy way to compare keys
+  (`ed25519:` followed by hex).
+- **fexecve**: starting a program from a file that is already open (by its
+  file descriptor) instead of by its name. What `fairplayd` checked is
+  exactly what runs, even if someone renames another file into its place.
+- **setfsuid**: switching the user that file permission checks use, for one
+  thread only. `fairplayd` uses it to open a launcher's files with the
+  launcher's own permissions.
+- **fs-verity**: a kernel feature that seals a file with a hash and checks
+  every page against it as it's read, so even an in-place rewrite is caught.
 
 - **TPM** (Trusted Platform Module): a tamper-resistant chip (or chip-like
   firmware) that records measurements and signs statements about them.

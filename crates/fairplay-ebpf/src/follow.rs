@@ -12,9 +12,11 @@
 //!   PROTECTED before it runs a single instruction. Its PID is visible in
 //!   /proc a moment earlier (from the end of `copy_process`);
 //!   `domain::task_domain` covers that gap by treating a not-yet-registered
-//!   child of a protected process as protected.
+//!   child of a protected process as protected. A reader's child is a
+//!   protected member only: reader status is never inherited (`readers`).
 //! - **exit**: `sched_process_exit` fires in `do_exit` for each exiting
-//!   thread. When the last thread of a process exits, its entry goes. That
+//!   thread. When the last thread of a process exits, its entries go
+//!   (PROTECTED, and READERS if it was a reader). That
 //!   is before the process is reaped, so before its PID can be reused: an
 //!   unrelated process that gets the PID later never inherits the domain.
 
@@ -24,7 +26,7 @@ use aya_ebpf::{
 use core::ptr::addr_of;
 
 use crate::{
-    maps::{PROTECTED, UNFOLLOWED},
+    maps::{PROTECTED, READERS, UNFOLLOWED},
     vmlinux::{signal_struct, task_struct},
 };
 
@@ -83,8 +85,9 @@ pub fn unfollow_exit(ctx: BtfTracePointContext) -> i32 {
 
 fn try_unfollow_exit(task: *const task_struct) -> Result<(), i64> {
     let tgid = unsafe { bpf_probe_read_kernel(addr_of!((*task).tgid))? } as u32;
-    // Most exits on the machine are not protected processes.
-    if unsafe { PROTECTED.get(&tgid) }.is_none() {
+    // Most exits on the machine are not protected processes. (Readers are
+    // always in PROTECTED too.)
+    if unsafe { PROTECTED.get(&tgid) }.is_none() && unsafe { READERS.get(&tgid) }.is_none() {
         return Ok(());
     }
     // do_exit decrements signal->live before this tracepoint, so it reads 0
@@ -96,6 +99,7 @@ fn try_unfollow_exit(task: *const task_struct) -> Result<(), i64> {
     };
     if live == 0 {
         let _ = PROTECTED.remove(&tgid);
+        let _ = READERS.remove(&tgid);
     }
     Ok(())
 }

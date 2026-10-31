@@ -1,11 +1,13 @@
-//! fairplayd (milestones 3, 4, 5, 6 and 8).
+//! fairplayd (milestones 3, 4, 5, 6, 8 and 9).
 //!
 //! Loads the BPF LSM program, owns the PROTECTED map, and serves the design
 //! doc's vendor-facing API on a Unix socket (see the `fairplay-api` crate):
 //! `launch_protected`, `session_status`, `attest`, and a `violations` stream.
 //! Every denied attempt is also printed as a `DENIED` line, as in milestone 3.
 //! It also keeps the executable-mapping allowlist (milestone 8): which files
-//! a protected process may map as code (see `exec_allow`).
+//! a protected process may map as code (see `exec_allow`). It launches only
+//! what a signed game manifest names, and only the manifest's readers may
+//! read a protected process (milestone 9, see `verify`).
 //!
 //!     sudo fairplayd --obj fairplay.o                    # socket API only
 //!     sudo fairplayd --obj fairplay.o --protect <pid>    # milestone 3 style
@@ -24,6 +26,7 @@ mod launch;
 mod self_protect;
 mod server;
 mod state;
+mod verify;
 
 use std::{
     path::PathBuf,
@@ -40,7 +43,7 @@ use clap::Parser;
 use fairplay_api::{ProcessState, ViolationEvent, DEFAULT_LAUNCHER_GROUP, DEFAULT_SOCKET};
 use fairplay_common::{
     ExecAllow, ExecKey, Violation, FS_SYSTEM, MAP_EXEC_ALLOWED, MAP_EXEC_TRUSTED_FS, MAP_PROTECTED,
-    MAP_UNFOLLOWED, MAP_VIOLATIONS,
+    MAP_READERS, MAP_READER_FILES, MAP_UNFOLLOWED, MAP_VIOLATIONS,
 };
 use tokio::{io::unix::AsyncFd, sync::broadcast};
 
@@ -62,7 +65,8 @@ struct Args {
     /// as a session). Processes it starts from now on join its domain.
     #[arg(long)]
     protect: Vec<u32>,
-    /// Process allowed into the --protect processes' domain.
+    /// Process allowed to read the --protect processes (a reader of their
+    /// domain; it is protected too).
     #[arg(long)]
     allow: Vec<u32>,
     /// An approved overlay (absolute path of a library): every protected
@@ -82,11 +86,21 @@ struct Args {
     self_protect_for: Option<u64>,
 }
 
-/// The kernel's PROTECTED map, UNFOLLOWED beside it, and EXEC_ALLOWED.
+/// The kernel's PROTECTED map, UNFOLLOWED beside it, EXEC_ALLOWED, READERS
+/// and READER_FILES.
 pub struct BpfMap {
     protected: HashMap<MapData, u32, u32>,
     unfollowed: HashMap<MapData, u32, u64>,
     exec: HashMap<MapData, ExecKey, ExecAllow>,
+    readers: HashMap<MapData, u32, u32>,
+    reader_files: HashMap<MapData, ExecKey, ExecAllow>,
+}
+
+fn ignore_missing(r: Result<(), MapError>) -> Result<()> {
+    match r {
+        Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 impl ProtectedMap for BpfMap {
@@ -94,19 +108,28 @@ impl ProtectedMap for BpfMap {
         Ok(self.protected.insert(pid, domain, 0)?)
     }
     fn remove(&mut self, pid: u32) -> Result<()> {
-        match self.protected.remove(&pid) {
-            Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        ignore_missing(self.protected.remove(&pid))
+    }
+    fn contains(&self, pid: u32) -> bool {
+        self.protected.get(&pid, 0).is_ok()
+    }
+    fn add_reader(&mut self, pid: u32, domain: u32) -> Result<()> {
+        Ok(self.readers.insert(pid, domain, 0)?)
+    }
+    fn remove_reader(&mut self, pid: u32) -> Result<()> {
+        ignore_missing(self.readers.remove(&pid))
     }
     fn allow_exec(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
         Ok(self.exec.insert(key, value, 0)?)
     }
     fn disallow_exec(&mut self, key: ExecKey) -> Result<()> {
-        match self.exec.remove(&key) {
-            Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        ignore_missing(self.exec.remove(&key))
+    }
+    fn allow_reader_file(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
+        Ok(self.reader_files.insert(key, value, 0)?)
+    }
+    fn disallow_reader_file(&mut self, key: ExecKey) -> Result<()> {
+        ignore_missing(self.reader_files.remove(&key))
     }
     fn unfollowed(&self, domain: u32) -> u64 {
         self.unfollowed.get(&domain, 0).unwrap_or(0)
@@ -133,13 +156,16 @@ const LSM_PROGRAMS: &[(&str, &str)] = &[
     ("bpf_prog", "bpf_prog"),
 ];
 
-/// Tracing programs that keep PROTECTED in step with the processes in it,
-/// as (program name, tracepoint), from `crates/fairplay-ebpf/src/follow.rs`:
-/// every process a protected process starts joins its domain, and each
-/// leaves the map when it exits. Attached and kept like the LSM programs.
+/// Tracing programs that keep PROTECTED and READERS in step with the
+/// processes in them, as (program name, tracepoint), from
+/// `crates/fairplay-ebpf/src/follow.rs` and `readers.rs`: every process a
+/// protected process starts joins its domain, a process that execs a
+/// manifest-named reader file becomes a reader, and each leaves the maps
+/// when it exits. Attached and kept like the LSM programs.
 const TRACING_PROGRAMS: &[(&str, &str)] = &[
     ("follow_fork", "sched_process_fork"),
     ("unfollow_exit", "sched_process_exit"),
+    ("reader_exec", "sched_process_exec"),
 ];
 
 fn main() -> Result<()> {
@@ -191,6 +217,11 @@ fn main() -> Result<()> {
             ebpf.take_map(MAP_EXEC_ALLOWED)
                 .context("EXEC_ALLOWED map")?,
         )?,
+        readers: HashMap::try_from(ebpf.take_map(MAP_READERS).context("READERS map")?)?,
+        reader_files: HashMap::try_from(
+            ebpf.take_map(MAP_READER_FILES)
+                .context("READER_FILES map")?,
+        )?,
     };
     let mut daemon = Daemon::new(map);
     let mounts = exec_allow::Mounts::read()?;
@@ -211,9 +242,14 @@ fn main() -> Result<()> {
     for &pid in args.protect.iter().chain(&args.allow) {
         daemon.map_mut().insert(pid, CLI_DOMAIN)?;
     }
+    // Milestone 9: being in the domain no longer lets a process read it;
+    // --allow names readers.
+    for &pid in &args.allow {
+        daemon.map_mut().add_reader(pid, CLI_DOMAIN)?;
+    }
     if !args.protect.is_empty() {
         eprintln!(
-            "fairplayd: protecting {:?}, domain members {:?} (from the command line)",
+            "fairplayd: protecting {:?}, readers {:?} (from the command line)",
             args.protect, args.allow
         );
     }
@@ -330,8 +366,10 @@ async fn read_violations(
             // denied): reading its /proc/<pid>/exe is itself a ptrace
             // access check, which the kernel would deny and log as a
             // violation by fairplayd. The kernel's `exe` names it anyway.
+            // Since milestone 9 the caller is often a protected process
+            // fairplayd didn't launch (a child of the game), so ask the map.
             let caller_protected =
-                v.caller == v.target || daemon.lock().unwrap().session_of_pid(v.caller).is_some();
+                v.caller == v.target || daemon.lock().unwrap().is_protected(v.caller);
             let exe_path = (!caller_protected)
                 .then(|| std::fs::read_link(format!("/proc/{}/exe", v.caller)).ok())
                 .flatten()

@@ -12,6 +12,14 @@ use aya_ebpf::{
 #[map]
 pub static PROTECTED: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 
+/// tgid of a reader -> the protection domain whose members it may read
+/// (milestone 9). Every reader is in PROTECTED too, with the same domain.
+/// A process becomes a reader only by exec'ing a file in READER_FILES (see
+/// `readers`), or from fairplayd's command line (`--allow`). Not inherited
+/// on fork; dropped on exec of anything else and at exit.
+#[map]
+pub static READERS: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+
 /// Denied attempts, read by fairplayd and streamed to vendors.
 #[map]
 pub static VIOLATIONS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);

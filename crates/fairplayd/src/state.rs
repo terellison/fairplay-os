@@ -5,6 +5,7 @@
 
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,15 +15,28 @@ use fairplay_api::{
 };
 use fairplay_common::{ExecAllow, ExecKey, Hook, Violation};
 
-use crate::exec_allow::{ExecEntries, FileId};
+use crate::{
+    exec_allow::{ExecEntries, FileId, Table},
+    verify::SessionManifest,
+};
 
-/// The kernel's PROTECTED map (tgid -> protection domain), with UNFOLLOWED
-/// and EXEC_ALLOWED (files a domain may map executable), or a fake in tests.
-/// The kernel also adds the processes a protected process starts, and
-/// removes each when it exits; fairplayd only manages the ones it launched.
+/// The kernel's PROTECTED map (tgid -> protection domain), with UNFOLLOWED,
+/// EXEC_ALLOWED (files a domain may map executable), READERS and
+/// READER_FILES (milestone 9), or a fake in tests. The kernel also adds the
+/// processes a protected process starts, and removes each when it exits;
+/// fairplayd only manages the ones it launched.
 pub trait ProtectedMap {
     fn insert(&mut self, pid: u32, domain: u32) -> Result<()>;
     fn remove(&mut self, pid: u32) -> Result<()>;
+    /// Is `pid` in PROTECTED (launched by us or not)?
+    fn contains(&self, pid: u32) -> bool;
+    /// Makes `pid` a reader of `domain` (it must be in PROTECTED too). Only
+    /// for `--allow`: launched readers become readers in the kernel, by
+    /// exec'ing a file in READER_FILES.
+    fn add_reader(&mut self, pid: u32, domain: u32) -> Result<()>;
+    fn remove_reader(&mut self, pid: u32) -> Result<()>;
+    fn allow_reader_file(&mut self, key: ExecKey, value: ExecAllow) -> Result<()>;
+    fn disallow_reader_file(&mut self, key: ExecKey) -> Result<()>;
     /// How many processes started in `domain` the kernel could not add
     /// (the UNFOLLOWED map). Nonzero means protection is degraded.
     fn unfollowed(&self, domain: u32) -> u64;
@@ -160,6 +174,8 @@ struct Session {
     members: Vec<Proc>,
     started_at: u64,
     violations: u64,
+    /// The manifest the game was launched from (milestone 9).
+    manifest: Option<Arc<SessionManifest>>,
 }
 
 impl Session {
@@ -183,6 +199,7 @@ impl Session {
             violations: self.violations,
             protection_degraded: unfollowed > 0,
             unprotected_children: unfollowed,
+            manifest: self.manifest.as_ref().map(|m| Box::new(m.info())),
         }
     }
 }
@@ -220,6 +237,8 @@ pub struct Daemon<M> {
     next_domain: u32,
     /// What this daemon put in EXEC_ALLOWED, per domain (milestone 8).
     exec: ExecEntries,
+    /// What this daemon put in READER_FILES, per domain (milestone 9).
+    readers: ExecEntries,
 }
 
 impl<M: ProtectedMap> Daemon<M> {
@@ -229,7 +248,8 @@ impl<M: ProtectedMap> Daemon<M> {
             sessions: BTreeMap::new(),
             next_session: 1,
             next_domain: CLI_DOMAIN + 1,
-            exec: ExecEntries::default(),
+            exec: ExecEntries::new(Table::ExecAllowed),
+            readers: ExecEntries::new(Table::ReaderFiles),
         }
     }
 
@@ -252,12 +272,57 @@ impl<M: ProtectedMap> Daemon<M> {
         self.exec.allow(&mut self.map, t.domain, files)
     }
 
-    /// Undoes [`Daemon::allow_exec`] for a launch that started a session but
-    /// failed before registering it.
+    /// Lets a process of the launch's domain become a reader by exec'ing one
+    /// of these files (manifest-named readers whose hashes checked out).
+    /// Refuses (and adds nothing) if the map can't take them all.
+    pub fn allow_readers(&mut self, t: &Ticket, files: &[FileId]) -> Result<usize, ApiError> {
+        self.readers.allow(&mut self.map, t.domain, files)
+    }
+
+    /// Undoes [`Daemon::allow_exec`] and [`Daemon::allow_readers`] for a
+    /// launch that started a session but failed before registering it.
     pub fn abandon_launch(&mut self, t: &Ticket) {
         if !t.join {
             self.exec.release(&mut self.map, t.domain);
+            self.readers.release(&mut self.map, t.domain);
         }
+    }
+
+    /// Entries in READER_FILES that this daemon made (for tests and logs).
+    pub fn reader_entries(&self) -> usize {
+        self.readers.used()
+    }
+
+    /// The manifest of a running session `peer` may join: its launcher's or
+    /// root's. The same checks as [`Daemon::begin_launch`] with `join`.
+    pub fn join_manifest(
+        &self,
+        peer: &Peer,
+        id: SessionId,
+    ) -> Result<Arc<SessionManifest>, ApiError> {
+        let s = self.joinable(peer, id)?;
+        s.manifest.clone().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::BadRequest,
+                format!("session {id} has no manifest"),
+            )
+        })
+    }
+
+    /// Only the session's launcher (or root) may add to its domain, and
+    /// only while its game runs.
+    fn joinable(&self, peer: &Peer, id: SessionId) -> Result<&Session, ApiError> {
+        let s = match self.sessions.get(&id) {
+            Some(s) if peer.is_root() || s.launcher_uid == peer.uid => s,
+            _ => return Err(not_found(id)),
+        };
+        if !s.game.running() {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                format!("session {id} has ended"),
+            ));
+        }
+        Ok(s)
     }
 
     /// Entries in EXEC_ALLOWED that this daemon made (for tests and logs).
@@ -299,18 +364,8 @@ impl<M: ProtectedMap> Daemon<M> {
             ));
         }
         if let Some(id) = join {
-            // Only the session's launcher (or root) may add to its domain:
-            // being in the domain means being able to read the game.
-            let s = match self.sessions.get(&id) {
-                Some(s) if peer.is_root() || s.launcher_uid == peer.uid => s,
-                _ => return Err(not_found(id)),
-            };
-            if !s.game.running() {
-                return Err(ApiError::new(
-                    ErrorCode::BadRequest,
-                    format!("session {id} has ended"),
-                ));
-            }
+            // A joined program is a reader: it can read the game.
+            let s = self.joinable(peer, id)?;
             return Ok(Ticket {
                 session: id,
                 domain: s.domain,
@@ -329,7 +384,7 @@ impl<M: ProtectedMap> Daemon<M> {
 
     /// Puts a freshly forked (not yet released) child into PROTECTED and
     /// records it. The caller must not let the child exec unless this
-    /// succeeds.
+    /// succeeds. `manifest` is the new session's (ignored for a join).
     pub fn register(
         &mut self,
         t: Ticket,
@@ -337,6 +392,7 @@ impl<M: ProtectedMap> Daemon<M> {
         launcher: &Peer,
         runs_as: u32,
         argv: Vec<String>,
+        manifest: Option<Arc<SessionManifest>>,
     ) -> Result<()> {
         let proc = Proc {
             pid,
@@ -362,6 +418,7 @@ impl<M: ProtectedMap> Daemon<M> {
                     members: vec![],
                     started_at: now(),
                     violations: 0,
+                    manifest,
                 },
             );
         }
@@ -380,12 +437,17 @@ impl<M: ProtectedMap> Daemon<M> {
         if let Err(e) = self.map.remove(pid) {
             eprintln!("fairplayd: removing pid {pid} from PROTECTED: {e:#}");
         }
+        // The kernel already dropped it at exit; this is belt and braces.
+        if let Err(e) = self.map.remove_reader(pid) {
+            eprintln!("fairplayd: removing pid {pid} from READERS: {e:#}");
+        }
         p.state = state;
         // The domain's last process is gone: its files are no longer
         // allowed (domains aren't reused while the daemon runs, but the map
         // is finite).
         if !s.procs().any(Proc::running) {
             self.exec.release(&mut self.map, s.domain);
+            self.readers.release(&mut self.map, s.domain);
         }
         self.prune_ended();
         Some(id)
@@ -406,6 +468,11 @@ impl<M: ProtectedMap> Daemon<M> {
                 self.map.forget_domain(s.domain);
             }
         }
+    }
+
+    /// Is `pid` protected right now, whoever started it?
+    pub fn is_protected(&self, pid: u32) -> bool {
+        self.map.contains(pid)
     }
 
     /// The session a running protected process belongs to.
@@ -554,6 +621,8 @@ mod tests {
         exec: HashMap<ExecKey, ExecAllow>,
         /// Fail exec inserts once this many entries exist.
         exec_fail_at: Option<usize>,
+        readers: HashMap<u32, u32>,
+        reader_files: HashMap<ExecKey, ExecAllow>,
     }
 
     impl ProtectedMap for FakeMap {
@@ -565,6 +634,9 @@ mod tests {
         fn remove(&mut self, pid: u32) -> Result<()> {
             self.entries.remove(&pid);
             Ok(())
+        }
+        fn contains(&self, pid: u32) -> bool {
+            self.entries.contains_key(&pid)
         }
         fn unfollowed(&self, domain: u32) -> u64 {
             self.unfollowed.get(&domain).copied().unwrap_or(0)
@@ -584,6 +656,22 @@ mod tests {
             self.exec.remove(&key);
             Ok(())
         }
+        fn add_reader(&mut self, pid: u32, domain: u32) -> Result<()> {
+            self.readers.insert(pid, domain);
+            Ok(())
+        }
+        fn remove_reader(&mut self, pid: u32) -> Result<()> {
+            self.readers.remove(&pid);
+            Ok(())
+        }
+        fn allow_reader_file(&mut self, key: ExecKey, value: ExecAllow) -> Result<()> {
+            self.reader_files.insert(key, value);
+            Ok(())
+        }
+        fn disallow_reader_file(&mut self, key: ExecKey) -> Result<()> {
+            self.reader_files.remove(&key);
+            Ok(())
+        }
     }
 
     fn file(ino: u64) -> FileId {
@@ -600,7 +688,7 @@ mod tests {
         let alice = launcher(1000);
         let t = d.begin_launch(&alice, None).unwrap();
         assert_eq!(d.allow_exec(&t, &[file(1), file(2), file(2)]).unwrap(), 2);
-        d.register(t, 4242, &alice, 1000, vec!["game".into()])
+        d.register(t, 4242, &alice, 1000, vec!["game".into()], None)
             .unwrap();
         let k = |ino| ExecKey {
             domain: t.domain,
@@ -624,7 +712,7 @@ mod tests {
         // The anti-cheat joins with its own files; repeats aren't counted.
         let j = d.begin_launch(&alice, Some(t.session)).unwrap();
         assert_eq!(d.allow_exec(&j, &[file(2), file(3)]).unwrap(), 1);
-        d.register(j, 4243, &alice, 1000, vec!["ac".into()])
+        d.register(j, 4243, &alice, 1000, vec!["ac".into()], None)
             .unwrap();
         assert_eq!(d.exec_entries(), 3);
         // Entries stay while any process of the session runs.
@@ -695,7 +783,7 @@ mod tests {
 
     fn launch(d: &mut Daemon<FakeMap>, peer: &Peer, pid: u32) -> Ticket {
         let t = d.begin_launch(peer, None).unwrap();
-        d.register(t, pid, peer, peer.uid, vec!["game".into()])
+        d.register(t, pid, peer, peer.uid, vec!["game".into()], None)
             .unwrap();
         t
     }
@@ -813,7 +901,7 @@ mod tests {
         });
         let alice = launcher(1000);
         let t = d.begin_launch(&alice, None).unwrap();
-        assert!(d.register(t, 9, &alice, 1000, vec![]).is_err());
+        assert!(d.register(t, 9, &alice, 1000, vec![], None).is_err());
         let e = d.status(&alice, Some(t.session)).unwrap_err();
         assert_eq!(e.code, ErrorCode::NotFound);
     }
@@ -825,7 +913,8 @@ mod tests {
         let t = launch(&mut d, &alice, 50);
         let j = d.begin_launch(&alice, Some(t.session)).unwrap();
         assert_eq!((j.session, j.domain, j.join), (t.session, t.domain, true));
-        d.register(j, 51, &alice, 1000, vec!["ac".into()]).unwrap();
+        d.register(j, 51, &alice, 1000, vec!["ac".into()], None)
+            .unwrap();
         assert_eq!(d.map.entries.get(&51), Some(&t.domain));
 
         // The anti-cheat, asking about "my session", finds the game's.
@@ -1110,5 +1199,99 @@ mod tests {
         assert_eq!(hook_name(Hook::FileMprotect as u32), "file_mprotect");
         // Process hooks have no file.
         assert_eq!(d.record_violation(&denied(1, 4242), None).file, None);
+    }
+
+    fn test_manifest() -> Arc<SessionManifest> {
+        use ed25519_dalek::SigningKey;
+        use fairplay_api::manifest::{encode_public, sign, Verified};
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "name": "Game",
+            "signer": encode_public(&key.verifying_key()),
+            "launch": [{"path": "game", "sha256": "00".repeat(32)}],
+            "block_virtual_input": true,
+        }))
+        .unwrap();
+        Arc::new(SessionManifest {
+            verified: Verified::check(&bytes, sign(&key, &bytes).as_bytes()).unwrap(),
+            base: "/games/x".into(),
+        })
+    }
+
+    #[test]
+    fn reader_files_follow_the_session() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        let m = test_manifest();
+        let t = d.begin_launch(&alice, None).unwrap();
+        // The runtime helper, at launch.
+        assert_eq!(d.allow_readers(&t, &[file(5)]).unwrap(), 1);
+        d.register(t, 80, &alice, 1000, vec!["game".into()], Some(m.clone()))
+            .unwrap();
+        assert!(d.map.reader_files.contains_key(&ExecKey {
+            domain: t.domain,
+            dev: 7,
+            ino: 5
+        }));
+        // The anti-cheat, at join: the session's own manifest.
+        assert_eq!(d.join_manifest(&alice, t.session).unwrap(), m);
+        let j = d.begin_launch(&alice, Some(t.session)).unwrap();
+        d.allow_readers(&j, &[file(6)]).unwrap();
+        d.register(j, 81, &alice, 1000, vec!["ac".into()], None)
+            .unwrap();
+        assert_eq!(d.reader_entries(), 2);
+        // The kernel made 81 a reader when it exec'd; its exit clears it.
+        d.map.add_reader(81, t.domain).unwrap();
+        d.child_exited(81, EXITED_0);
+        assert!(d.map.readers.is_empty());
+        assert_eq!(d.map.reader_files.len(), 2, "the game still runs");
+        d.child_exited(80, EXITED_0);
+        assert!(d.map.reader_files.is_empty());
+        assert_eq!(d.reader_entries(), 0);
+        // An ended session can't be joined.
+        let e = d.join_manifest(&alice, t.session).unwrap_err();
+        assert_eq!(e.code, ErrorCode::BadRequest);
+    }
+
+    #[test]
+    fn only_the_launcher_gets_the_manifest_to_join() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        let t = d.begin_launch(&alice, None).unwrap();
+        d.register(t, 90, &alice, 1000, vec![], Some(test_manifest()))
+            .unwrap();
+        for peer in [launcher(1001), user(1001)] {
+            let e = d.join_manifest(&peer, t.session).unwrap_err();
+            assert_eq!(e.code, ErrorCode::NotFound);
+        }
+        assert!(d.join_manifest(&user(0), t.session).is_ok());
+    }
+
+    #[test]
+    fn status_reports_the_manifest_and_signer() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        let m = test_manifest();
+        let t = d.begin_launch(&alice, None).unwrap();
+        d.register(t, 95, &alice, 1000, vec![], Some(m.clone()))
+            .unwrap();
+        let info = d.status(&alice, Some(t.session)).unwrap().1.unwrap();
+        let mi = info.manifest.unwrap();
+        assert_eq!(mi.name, "Game");
+        assert_eq!(mi.sha256, m.verified.sha256);
+        assert_eq!(mi.signer_fingerprint, m.verified.signer_fingerprint);
+        assert!(mi.signer_fingerprint.starts_with("ed25519:"));
+        assert!(mi.block_virtual_input);
+    }
+
+    #[test]
+    fn a_failed_launch_gives_reader_files_back() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        let t = d.begin_launch(&alice, None).unwrap();
+        d.allow_readers(&t, &[file(1)]).unwrap();
+        d.abandon_launch(&t);
+        assert!(d.map.reader_files.is_empty());
+        assert_eq!(d.reader_entries(), 0);
     }
 }

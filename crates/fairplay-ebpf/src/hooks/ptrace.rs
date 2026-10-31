@@ -1,7 +1,8 @@
 //! `ptrace_access_check` guards every way one process reads or writes
 //! another's memory: ptrace attach, process_vm_readv/writev, and
 //! /proc/<pid>/mem (and `pidfd_getfd`). If the target is protected (see
-//! `task_domain`) and the caller is not in the same protection domain, the
+//! `task_domain`) and the caller is neither the target itself nor one of its
+//! domain's readers (milestone 9, see `readers`), the
 //! access is denied and logged.
 //!
 //! While fairplayd protects itself (milestone 6, see `self_protect`), it is
