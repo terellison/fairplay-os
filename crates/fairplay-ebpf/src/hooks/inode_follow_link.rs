@@ -17,7 +17,7 @@ use fairplay_common::Hook;
 
 use crate::{
     domain::{
-        dentry_name, dentry_parent, name_is, on_procfs, record_in, sandboxed, sandboxed_in,
+        dentry_name, name_is, on_procfs, parent, parse_pid, record_in, sandboxed, sandboxed_in,
         short_name, Name, EPERM,
     },
     vmlinux::dentry,
@@ -35,28 +35,6 @@ pub fn inode_follow_link(ctx: LsmContext) -> i32 {
         Ok(true) => -EPERM,
         _ => 0,
     }
-}
-
-fn parent(d: *const dentry) -> Result<*const dentry, i64> {
-    unsafe { bpf_probe_read_kernel(dentry_parent(d)) }.map(|p| p as *const dentry)
-}
-
-/// A decimal pid, or `None` if the name isn't one.
-fn parse_pid(name: &[u8; 16]) -> Option<u32> {
-    let mut pid: u32 = 0;
-    let mut i = 0;
-    while i < 10 {
-        let c = name[i];
-        if c == 0 {
-            break;
-        }
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        pid = pid.checked_mul(10)?.checked_add((c - b'0') as u32)?;
-        i += 1;
-    }
-    (i > 0 && name[i] == 0).then_some(pid)
 }
 
 fn should_deny(link: *const dentry) -> Result<bool, i64> {

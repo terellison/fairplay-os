@@ -56,6 +56,10 @@ pub const FORK_DENIED_RECORDS_PER_SEC: u32 = 8;
 /// Name of the one-entry array holding fairplayd's own tgid while it
 /// protects itself, 0 otherwise (milestone 6).
 pub const MAP_SELF_PROTECT: &str = "SELF_PROTECT";
+/// Name of the set of fairplayd's thread ids other than its main thread
+/// (tid -> 1), while it protects itself: `/proc/<tid>/` is the same
+/// process as `/proc/<fairplayd>/` (milestone 6, issue #27).
+pub const MAP_SELF_THREADS: &str = "SELF_THREADS";
 /// Name of the set of fairplayd's own BPF objects ([`self_object_key`] ->
 /// 1) that no other process may open while it protects itself.
 pub const MAP_SELF_OBJECTS: &str = "SELF_OBJECTS";
@@ -163,6 +167,27 @@ pub enum Hook {
     /// `socket_connect` / `socket_sendmsg`: an abstract Unix socket
     /// address (X11's `@/tmp/.X11-unix/X0`). Target 0; `file` the name.
     UnixAbstract = 26,
+    // Milestone 6 follow-ups (issue #27): starving or limiting fairplayd
+    // instead of killing it. Target is fairplayd's pid.
+    /// `task_setrlimit`: changing one of fairplayd's resource limits
+    /// (`prlimit`; `RLIMIT_CPU` would have the kernel kill it). `mode` is
+    /// the `RLIMIT_*` number.
+    TaskSetrlimit = 30,
+    /// `task_setnice`: renicing fairplayd. `mode` is the nice value asked
+    /// for, as a two's-complement `u32`.
+    TaskSetnice = 31,
+    /// `task_setscheduler`: changing fairplayd's scheduling policy or
+    /// priority (`sched_setscheduler`, `sched_setattr`), its CPU affinity
+    /// (`sched_setaffinity`), its timer slack, or moving it into a cpuset
+    /// cgroup. `mode` is 0.
+    TaskSetscheduler = 32,
+    /// `task_setioprio`: changing fairplayd's I/O priority. `mode` is the
+    /// `ioprio` value (class << 13 | level).
+    TaskSetioprio = 33,
+    /// `file_open`: opening one of fairplayd's `/proc/<pid>/` tuning
+    /// files (`oom_score_adj`, `oom_adj`, `autogroup`) for writing. `mode`
+    /// is the file's `FMODE_*` bits, `file` its name.
+    ProcTuneWrite = 34,
     // Issue #27 (milestone 6 follow-ups), part 2: 35 to 39.
     /// `perf_event_open`: a CPU-wide perf event (`pid == -1`, or a cgroup
     /// event) while a process is protected. One sampling every process on
@@ -221,7 +246,8 @@ pub struct Violation {
     /// The ptrace access mode bits the caller asked for, or for
     /// [`Hook::MmapFile`] and [`Hook::FileMprotect`] the `PROT_*` bits. For
     /// [`Hook::TaskKill`] the signal, for [`Hook::BpfMap`] the `FMODE_*`
-    /// bits asked for, and for [`Hook::Bpf`] the `bpf(2)` command. For the
+    /// bits asked for, and for [`Hook::Bpf`] the `bpf(2)` command. For
+    /// hooks 30-34, see each [`Hook`] variant. For the
     /// input hooks, the device node's kernel `dev_t` (`major << 20 | minor`).
     pub mode: u32,
     /// [`VIOLATION_REPORTED`], [`VIOLATION_ALLOWLISTED`]; 0 for a denial.
