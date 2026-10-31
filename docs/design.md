@@ -373,49 +373,48 @@ Every milestone ends with a test that a skeptic can run.
 
 The VM (arm64, under QEMU on a Mac) covers the kernel mechanisms. It can't
 cover Proton (games are x86), NVIDIA drivers, Secure Boot with shim, or a real
-TPM. Milestones 6, 11, and 12 need an x86 PC with a firmware TPM, which most
+TPM. Milestones 10, 11, and 12 need an x86 PC with a firmware TPM, which most
 PCs sold for Windows 11 have.
 
 ### Milestones
 
-Numbers are names, not order: milestones 1 to 4 are done, and the rest are
-listed in the order we plan to do them. VM-testable work comes first.
+Milestones 1 to 4 are done. VM-testable work comes first.
 
-- **1. VM baseline.** A 6.x kernel with `CONFIG_BPF_LSM` and `bpf` in the `lsm=`
-  boot list, OVMF with Secure Boot, swtpm as the TPM, and a btrfs workspace
-  volume. Exit: a hello-world LSM program loads and logs.
-- **2. assetguard v0.** Snapshot, sync, and digest-verify against a test depot.
-  Exit: truncate a synced file mid-sync, and the run detects it and rolls back.
-- **3. Protected process v0.** Exit: cheatsim fails on `ptrace`,
-  `process_vm_readv`, and `/proc/<pid>/mem` against a protected test game, and
-  succeeds against an unprotected one.
-- **4. API and violations.** `fairplayd` serves the four calls. Exit: a mock
-  vendor client sees each cheatsim attempt in the violation stream.
-- **8. Domain follows the game.** Every process a protected game starts joins its
-  domain; the launch environment also drops Wine's DLL variables. Exit:
-  cheatsim leaks 0/3 against a grandchild of the protected game.
-- **9. fairplayd protects itself.** Exit: as root, cheatsim cannot kill or trace
-  `fairplayd`, or read or write its maps or detach its programs, and each
-  attempt prints a DENIED line.
-- **5. Input.** Report virtual input devices and the executable that created
-  each. Exit: a uinput clicker started mid-match shows up in `session_status`
-  and the violation stream with its executable; an allowlisted remapper
-  doesn't.
-- **7. Executable-mapping allowlist.** Deny executable mappings into the game
-  from files outside its install, system library paths, and approved
-  overlays. Exit: cheatsim's injected library fails to map, and an approved
-  overlay loads.
-- **10. Vendor anti-cheat: verified and sandboxed.** Exit: an unsigned binary
-  cannot join a game's domain; a signed mock vendor can read the game's
-  memory but not the user's home directory.
-- **6. Attestation v0.** Exit: the verifier accepts a quote from a clean
-  player-mode boot and rejects one from developer mode or a different kernel.
-- **11. Player-mode image.** A signed, read-only image with lockdown on, Wayland
-  only, and atomic rollback. Exit: a reboot into player mode attests as
-  player mode, and a failed update rolls back on its own.
-- **12. Proton end to end.** Exit: on x86 hardware, a Windows test game runs
-  under Proton in a protection domain (wineserver included), and cheatsim
-  leaks 0/3 against it.
+1. **VM baseline.** A 6.x kernel with `CONFIG_BPF_LSM` and `bpf` in the `lsm=`
+   boot list, OVMF with Secure Boot, swtpm as the TPM, and a btrfs workspace
+   volume. Exit: a hello-world LSM program loads and logs.
+2. **assetguard v0.** Snapshot, sync, and digest-verify against a test depot.
+   Exit: truncate a synced file mid-sync, and the run detects it and rolls back.
+3. **Protected process v0.** Exit: cheatsim fails on `ptrace`,
+   `process_vm_readv`, and `/proc/<pid>/mem` against a protected test game, and
+   succeeds against an unprotected one.
+4. **API and violations.** `fairplayd` serves the four calls. Exit: a mock
+   vendor client sees each cheatsim attempt in the violation stream.
+5. **Domain follows the game.** Every process a protected game starts joins its
+   domain; the launch environment also drops Wine's DLL variables. Exit:
+   cheatsim leaks 0/3 against a grandchild of the protected game.
+6. **fairplayd protects itself.** Exit: as root, cheatsim cannot kill or trace
+   `fairplayd`, or read or write its maps or detach its programs, and each
+   attempt prints a DENIED line.
+7. **Input.** Report virtual input devices and the executable that created
+   each. Exit: a uinput clicker started mid-match shows up in `session_status`
+   and the violation stream with its executable; an allowlisted remapper
+   doesn't.
+8. **Executable-mapping allowlist.** Deny executable mappings into the game
+   from files outside its install, system library paths, and approved
+   overlays. Exit: cheatsim's injected library fails to map, and an approved
+   overlay loads.
+9. **Vendor anti-cheat: verified and sandboxed.** Exit: an unsigned binary
+   cannot join a game's domain; a signed mock vendor can read the game's
+   memory but not the user's home directory.
+10. **Attestation v0.** Exit: the verifier accepts a quote from a clean
+    player-mode boot and rejects one from developer mode or a different kernel.
+11. **Player-mode image.** A signed, read-only image with lockdown on, Wayland
+    only, and atomic rollback. Exit: a reboot into player mode attests as
+    player mode, and a failed update rolls back on its own.
+12. **Proton end to end.** Exit: on x86 hardware, a Windows test game runs
+    under Proton in a protection domain (wineserver included), and cheatsim
+    leaks 0/3 against it.
 
 ## Risks and open questions
 
@@ -425,7 +424,7 @@ The biggest technical risk is that player mode is only as strong as lockdown,
 our self-protection hooks, and attestation; a kernel exploit beats all three.
 
 - **Vendor adoption.** Easy Anti-Cheat and BattlEye already have user-space
-  Proton modes, so they are the first to show the milestone 4 and 10 demos to.
+  Proton modes, so they are the first to show the milestone 4 and 9 demos to.
   Who do we approach first, and what would make a kernel-only vendor switch?
 - **Kernel exploits.** Root in player mode can still attack the kernel itself.
   Lockdown, a small attack surface, and fast updates help; attestation can

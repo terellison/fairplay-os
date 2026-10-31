@@ -92,7 +92,7 @@ pub enum Request {
     },
     /// The caller's sessions (every session, for root).
     ListSessions {},
-    /// Evidence of what booted, for a server-chosen nonce (hex). Milestone 6;
+    /// Evidence of what booted, for a server-chosen nonce (hex). Milestone 10;
     /// answers `unavailable` until there is a TPM.
     Attest { nonce: String },
 }
@@ -133,7 +133,7 @@ pub struct StatusReport {
     /// `None` if the kernel doesn't report one.
     pub lockdown: Option<String>,
     /// Names of virtual input devices that exist right now (e.g. ones made
-    /// through `/dev/uinput`). Reported, not blocked; blocking is milestone 5.
+    /// through `/dev/uinput`). Reported, not blocked (milestone 7).
     pub virtual_input_devices: Vec<String>,
 }
 

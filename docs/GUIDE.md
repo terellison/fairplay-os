@@ -27,17 +27,16 @@ the parts that need a real gaming PC come later.
 | 2 | assetguard vs a real Perforce server | Done | `./vm/test-milestone2.sh` |
 | 3 | Protected process | Done | `cheatsim` + `fairplayd` (README) |
 | 4 | fairplayd socket API | Done | `./vm/test-milestone4.sh` |
-| 8 | Protection follows the game's child processes | Next | |
-| 9 | fairplayd protects itself from root | Not started | |
-| 5 | Report fake input devices and who made them | Not started | |
-| 7 | Only approved code may load into the game | Not started | |
-| 10 | Vendor anti-cheat: signed and sandboxed | Not started | |
-| 6 | Attestation | Blocked: the VM has no TPM | |
+| 5 | Protection follows the game's child processes | Next | |
+| 6 | fairplayd protects itself from root | Not started | |
+| 7 | Report fake input devices and who made them | Not started | |
+| 8 | Only approved code may load into the game | Not started | |
+| 9 | Vendor anti-cheat: signed and sandboxed | Not started | |
+| 10 | Attestation | Blocked: the VM has no TPM | |
 | 11 | Player-mode system image | Needs an x86 PC | |
 | 12 | A Windows game under **Proton**, protected | Needs an x86 PC | |
 
-The numbers are names; the table is in the order we plan to do them. The
-[design doc](design.md#milestones) has each one's exit test.
+The [design doc](design.md#milestones) has each one's exit test.
 
 ## Player mode and developer mode
 
@@ -81,7 +80,7 @@ flowchart TB
   maps -- "denials" --> fpd
   ac -. "same protection domain:<br/>allowed in" .-> game
   lsm -- "blocks outsiders from<br/>reading game memory" --> game
-  fpd -. "attestation (m6)" .-> policy
+  fpd -. "attestation (m10)" .-> policy
   ag -- "snapshot / roll back" --> btrfs
 ```
 
@@ -193,7 +192,7 @@ read another's memory:
   was our program that did it.
 - **`lsm-hello`**: milestone 1's smoke test. It logs every file `cat` opens,
   which proves the whole BPF LSM toolchain works end to end.
-- **`fairplay-attest`**: milestone 6, outline only. The plan: the **TPM** chip
+- **`fairplay-attest`**: milestone 10, outline only. The plan: the **TPM** chip
   records what booted (**measured boot**) and **IMA** records which programs
   ran. On request, the TPM signs those records (a **quote**) and the game
   company's server checks them: was it a known kernel, was `fairplayd` running,
@@ -227,7 +226,7 @@ machine can connect to. Each request and each answer is one line of
 - **`violations`**: a live **stream**. The caller subscribes once, and every
   denied attempt is pushed to it as it happens: which process, which
   executable, which hook. Vendors get detection signal without a driver.
-- **`attest`**: will return the TPM's signed report (milestone 6). The VM has
+- **`attest`**: will return the TPM's signed report (milestone 10). The VM has
   no TPM, so for now it answers `unavailable`, honestly, and echoes the
   nonce it was given.
 
@@ -302,9 +301,9 @@ mini.
 **Known gaps:**
 
 - **No TPM.** QEMU's virtual TPM device crashes under HVF on this Mac, so the
-  VM boots with `TPM=off`. That blocks milestone 6.
+  VM boots with `TPM=off`. That blocks milestone 10.
 - **No Secure Boot.** Homebrew's ARM firmware has no Secure Boot keys, so
-  milestone 6 will test "reject a different kernel" instead of "reject Secure
+  milestone 10 will test "reject a different kernel" instead of "reject Secure
   Boot off".
 
 ## Why the BPF crates build separately
@@ -336,8 +335,8 @@ Every pull request (and every push to `master`) runs
 | Shell scripts | `shellcheck` on everything in `vm/` |
 
 **What it can't prove:** GitHub's machines don't boot with BPF LSM turned on,
-so CI can't *load* our BPF programs. Milestones 1, 3 and 4 (and later 5)
-are still tested on the VM, as in the README. If a PR touches
+so CI can't *load* our BPF programs. Milestones 1, 3 and 4 (and the later
+BPF milestones) are still tested on the VM, as in the README. If a PR touches
 `crates/*-ebpf` or `fairplayd`, run those before merging.
 
 Tool versions are pinned in both CI and `vm/provision-guest.sh`. This

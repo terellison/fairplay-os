@@ -1,4 +1,4 @@
-//! Attestation (milestone 6). API shape only for now.
+//! Attestation (milestone 10). API shape only for now.
 //!
 //! The client answers a server nonce with a TPM quote over the boot PCRs plus
 //! the IMA event log. The verifier, which runs on the vendor's server, checks
@@ -37,11 +37,11 @@ pub enum Error {
     Other(String),
 }
 
-/// Collect evidence on the client. Implemented in milestone 6.
+/// Collect evidence on the client. Implemented in milestone 10.
 pub fn collect(_nonce: &[u8]) -> Result<Evidence, Error> {
     #[cfg(feature = "tpm")]
     {
-        // TODO(m6): tss_esapi Context on /dev/tpmrm0, load or create the AK,
+        // TODO(m10): tss_esapi Context on /dev/tpmrm0, load or create the AK,
         // Quote(QUOTED_PCRS, nonce), read the IMA log.
         Err(Error::Other("not implemented yet".into()))
     }
@@ -49,9 +49,9 @@ pub fn collect(_nonce: &[u8]) -> Result<Evidence, Error> {
     Err(Error::NoTpm)
 }
 
-/// Verify evidence on the server. Implemented in milestone 6.
+/// Verify evidence on the server. Implemented in milestone 10.
 pub fn verify(_evidence: &Evidence, _expected_nonce: &[u8]) -> Verdict {
-    // TODO(m6): check signature against the enrolled AK, nonce freshness,
+    // TODO(m10): check signature against the enrolled AK, nonce freshness,
     // replay IMA log into PCR 10, parse the event log for Secure Boot state.
     Verdict::default()
 }

@@ -20,7 +20,7 @@ each piece does, how they fit, and a glossary.
 | `crates/fairplay-ebpf` | 3 | LSM program on `ptrace_access_check`; builds on the VM |
 | `crates/fairplayd` | 3-4 | Loads the program, owns the PROTECTED map, serves the socket API, streams violations |
 | `crates/cheatsim` | 3 | Attacker: ptrace, process_vm_readv, /proc/pid/mem |
-| `crates/fairplay-attest` | 6 | API shape only |
+| `crates/fairplay-attest` | 10 | API shape only |
 | `vm/` | 1-4 | VM creation, provisioning, the milestone-1 check, the milestone-2 and milestone-4 tests |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
@@ -104,7 +104,7 @@ one JSON object per line:
 | `launch_protected` | root, or the `fairplay-launcher` group | Starts a program protected from its first instruction, as the launcher (never as root by default). `join` starts it inside an existing session's protection domain: that's how the vendor's anti-cheat gets in. |
 | `session_status` | the session's launcher or user, its own processes, root | Protected or not, the game's state and exit code, members, violation count, kernel lockdown mode, virtual input devices present |
 | `violations` | same | A stream: one event per denied attempt (process, its executable, the hook), pushed as it happens |
-| `attest` | anyone | `unavailable` until milestone 6 (no TPM in the VM); echoes the nonce |
+| `attest` | anyone | `unavailable` until milestone 10 (no TPM in the VM); echoes the nonce |
 | `list_sessions` | anyone (sees their own) | For humans |
 
 The exit test, inside the VM, as your normal user:
@@ -138,7 +138,7 @@ By hand:
 
 - **Secure Boot.** Homebrew's arm64 UEFI firmware has no Secure Boot keys
   enrolled. Measured boot still works: firmware measures the bootloader and
-  kernel into TPM PCRs, so attestation can prove *what* booted. The milestone 6
+  kernel into TPM PCRs, so attestation can prove *what* booted. The milestone 10
   test "reject a quote after disabling Secure Boot" needs x86 hardware or
   enrolled keys, so test "reject a quote after booting a different kernel"
   instead.
