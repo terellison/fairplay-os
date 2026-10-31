@@ -17,11 +17,11 @@ each piece does, how they fit, and a glossary.
 | `crates/fairplay-api` | 4 | The socket protocol (JSON types), a client, and `fairplayctl` |
 | `crates/lsm-hello-ebpf` | 1 | Smoke-test LSM program: logs every `file_open` by `cat` |
 | `crates/lsm-hello` | 1 | Loads it and prints its log |
-| `crates/fairplay-ebpf` | 3 | LSM program on `ptrace_access_check`; builds on the VM |
-| `crates/fairplayd` | 3-4 | Loads the program, owns the PROTECTED map, serves the socket API, streams violations |
-| `crates/cheatsim` | 3 | Attacker: ptrace, process_vm_readv, /proc/pid/mem |
+| `crates/fairplay-ebpf` | 3, 5 | LSM program on `ptrace_access_check`, plus fork/exit tracing programs that make the domain follow the game; builds on the VM |
+| `crates/fairplayd` | 3-5 | Loads the programs, owns the PROTECTED map, serves the socket API, streams violations |
+| `crates/cheatsim` | 3, 5 | Attacker: ptrace, process_vm_readv, /proc/pid/mem; `game --depth N` hides the secret in a descendant |
 | `crates/fairplay-attest` | 10 | API shape only |
-| `vm/` | 1-4 | VM creation, provisioning, the milestone-1 check, the milestone-2 and milestone-4 tests |
+| `vm/` | 1-5 | VM creation, provisioning, the milestone-1 check, the milestone-2, 4 and 5 tests |
 
 ## Milestone 1: the VM (Apple Silicon Mac)
 
@@ -134,6 +134,47 @@ By hand:
     ./target/release/fairplayctl status 1
     ./target/release/fairplayctl attest
 
+## Milestone 5: the domain follows the game
+
+A Proton game is a chain of processes (proton, wine, `game.exe`, plus
+`wineserver`), and `fairplayd` only launches the first. So the kernel keeps
+the protection domain in step with the process tree, from
+`crates/fairplay-ebpf/src/follow.rs`:
+
+- **At fork** (`tp_btf/sched_process_fork`): a new process whose parent is in
+  `PROTECTED` is added with the parent's domain. This runs in the parent's
+  fork call, before the child is first scheduled, so the child never runs
+  unprotected. A child is visible in `/proc` a moment before that; for that
+  gap, `ptrace_access_check` treats a not-yet-registered child of a protected
+  process as protected too. New threads add nothing (the process is already
+  in).
+- **At exit** (`tp_btf/sched_process_exit`): when the last thread of a
+  protected process exits, its entry is removed. That happens before the
+  process is reaped, so before its PID can be handed to anything else.
+- **Map full**: if `PROTECTED` (1024 entries) can't take a child, the child
+  runs unprotected, and the kernel counts it per domain in `UNFOLLOWED`.
+  `session_status` then reports `protection_degraded: true` and
+  `unprotected_children`. Its direct parent still shields it from reads (the
+  rule above), but its own children aren't followed.
+
+Denied attempts on any process in the domain are filed under the game's
+session. The launch environment now also drops Wine's DLL variables,
+`WINEDLLOVERRIDES` and `WINEDLLPATH`, next to `LD_*`.
+
+The exit test, inside the VM, as your normal user:
+
+    flock /run/lock/fairplay-vm-tests ./vm/test-milestone5.sh
+
+It launches `cheatsim game --depth 2` (the game forks a child, which forks a
+grandchild that holds the secret) with `WINEDLLOVERRIDES`, `WINEDLLPATH` and
+`LD_PRELOAD` set. It checks that the child and grandchild are in `PROTECTED`
+with the game's domain, that a root attack on the grandchild leaks 0/3 with 3
+`DENIED` lines, that none of those variables reach the grandchild (read from
+inside the domain), and that the grandchild's entry is gone while it is
+still an unreaped zombie. As controls, the same game started without
+`fairplayd` leaks 3/3, and with `PROTECTED` filled up a new child is reported
+as `protection_degraded`.
+
 ## Known gaps on arm64 QEMU
 
 - **Secure Boot.** Homebrew's arm64 UEFI firmware has no Secure Boot keys
@@ -149,7 +190,7 @@ By hand:
 
 CI (`.github/workflows/ci.yml`) runs on every PR: fmt, clippy, unit tests,
 both eBPF builds, the full milestone 2 test, and shellcheck. It can't load BPF
-programs, so milestones 1, 3 and 4 still need a run on the VM; see
+programs, so milestones 1, 3, 4 and 5 still need a run on the VM; see
 [docs/GUIDE.md](docs/GUIDE.md#what-ci-checks).
 
 User-space crates build and test anywhere Linux runs: `cargo test --workspace`.
