@@ -207,8 +207,13 @@ sudo FAIRPLAYD_SOCKET="$SOCK" XDG_DATA_HOME="$T/xdg-root" "$CTL" launch --run-as
   "$T/vendor/cheatsim" attack --pid "$GPID" --addr "$ADDR" >"$T/member.out" 2>&1
 wait_for "$T/member.out" 'paths leaked'
 grep -E 'LEAKED|BLOCKED|paths' "$T/member.out" | indent
-check "the manifest's anti_cheat reader reads the game (process_vm_readv, /proc/<pid>/mem; ptrace is off in its sandbox)" \
-  sh -c "grep -q '^LEAKED  process_vm_readv' '$T/member.out' && grep -q '^LEAKED  /proc/<pid>/mem' '$T/member.out'"
+# The game runs as you and this anti-cheat as root, which keeps only
+# CAP_SYS_PTRACE in its sandbox: not CAP_DAC_OVERRIDE, which opening your
+# game's mode-0600 /proc/<pid>/mem as another user would take.
+check "the manifest's anti_cheat reader reads the game (process_vm_readv; ptrace is off in its sandbox)" \
+  grep -q '^LEAKED  process_vm_readv' "$T/member.out"
+check "a root anti-cheat can't open another user's /proc/<pid>/mem (no CAP_DAC_OVERRIDE in the sandbox)" \
+  grep -q '^BLOCKED /proc/<pid>/mem: open: Permission denied' "$T/member.out"
 sudo FAIRPLAYD_SOCKET="$SOCK" XDG_DATA_HOME="$T/xdg-root" "$CTL" launch --no-stdio --run-as 0 --join "$SESSION" -- \
   "$CHEATSIM" attack --pid "$GPID" --addr "$ADDR" >"$T/unnamed.out" 2>/dev/null
 check "a program the manifest doesn't name can't join (forbidden)" \

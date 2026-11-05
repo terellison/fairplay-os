@@ -22,6 +22,9 @@
 #             Proton game (proton -> wine -> game.exe), only the first
 #             process is launched by fairplayd.
 #   attacker  `cheatsim attack`, run as root on purpose.
+#   bomb      `cheatsim forkbomb`, launched protected (issue #21): forks from
+#             4 processes at once until refused. fairplayd runs with a
+#             member cap of $CAP.
 #   manifest  game.json, signed with a throwaway key (milestone 9): names
 #             cheatsim and /bin/sh as launch executables, and cat as an
 #             anti_cheat reader (it reads the grandchild's environment).
@@ -31,7 +34,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SOCK="${M5_SOCKET:-/run/fairplayd-m5test.sock}"
 GROUP=fairplay-launcher
 OBJ="$REPO/crates/fairplay-ebpf/target/bpfel-unknown-none/release/fairplay"
-MAP_MAX=1024 # PROTECTED's max_entries (crates/fairplay-ebpf/src/maps.rs)
+CAP=64 # fairplayd --member-cap
 
 [ "$(id -u)" -ne 0 ] || { echo "run as your normal user (it uses sudo where needed)" >&2; exit 2; }
 for t in bpftool jq setpriv; do
@@ -60,6 +63,8 @@ cleanup() {
       jq -r '.ok.sessions[]? | (.game, .members[]) | select(.state=="running") | .pid' 2>/dev/null |
       while read -r p; do sudo kill "$p" 2>/dev/null; done
   fi
+  # The fork bomb's processes die with their parent; in case one didn't.
+  pkill -KILL -f "^$T/bin/cheatsim forkbomb" 2>/dev/null
   # Filler entries from the map-full step, if it stopped halfway.
   [ -n "$MAP_ID" ] && [ -s "$T/unfill.batch" ] && sudo "$BPFTOOL" batch file "$T/unfill.batch" >/dev/null 2>&1
   if [ -n "$DAEMON_PID" ]; then
@@ -71,6 +76,7 @@ cleanup() {
   rm -rf "$T"
 }
 trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
 
 # A u32 as the four little-endian bytes bpftool takes.
 le32() { printf '0x%02x 0x%02x 0x%02x 0x%02x' $(($1 & 255)) $((($1 >> 8) & 255)) $((($1 >> 16) & 255)) $((($1 >> 24) & 255)); }
@@ -82,7 +88,12 @@ domain_of() {
   jq -r '.value | map(ltrimstr("0x")) | reverse | join("")' <<<"$v" | { read -r hex && echo $((16#$hex)); }
 }
 in_protected() { domain_of "$1" >/dev/null; }
-map_count() { sudo "$BPFTOOL" -j map dump id "$MAP_ID" | jq length; }
+map_count() { sudo "$BPFTOOL" -j map dump id "${1:-$MAP_ID}" | jq length; }
+# How many PROTECTED entries are in domain <d>.
+in_domain() {
+  sudo "$BPFTOOL" -j map dump id "$MAP_ID" |
+    jq --arg d "$(printf '%08x' "$1")" '[.[] | .value | map(ltrimstr("0x")) | reverse | join("") | select(.==$d)] | length'
+}
 proc_field() { awk -v f="$2:" '$1==f {print $2}' "/proc/$1/status" 2>/dev/null; }
 is_zombie() { [ "$(proc_field "$1" State)" = Z ]; }
 denied() { grep -c "^DENIED .*target=$1 " "$T/daemon.out"; }
@@ -122,7 +133,7 @@ if ! getent group "$GROUP" >/dev/null; then
   sudo groupadd --system "$GROUP" && CREATED_GROUP=1
 fi
 LAUNCHER_GID="$(getent group "$GROUP" | cut -d: -f3)"
-sudo "$T/bin/fairplayd" --obj "$OBJ" --socket "$SOCK" >"$T/daemon.out" 2>"$T/daemon.err" &
+sudo "$T/bin/fairplayd" --obj "$OBJ" --socket "$SOCK" --member-cap "$CAP" >"$T/daemon.out" 2>"$T/daemon.err" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ -S "$SOCK" ] || { echo "fairplayd did not start:"; indent <"$T/daemon.err"; exit 2; }
@@ -130,12 +141,22 @@ indent <"$T/daemon.err"
 FPD="$(pgrep -P "$DAEMON_PID" -x fairplayd)"
 # Our daemon's own map, from the map fds it holds: another fairplayd may be
 # loaded too.
-MAP_ID=""
-for id in $(sudo sh -c "cat /proc/$FPD/fdinfo/*" 2>/dev/null | awk '$1=="map_id:" {print $2}' | sort -un); do
-  if sudo "$BPFTOOL" -j map show id "$id" | jqt '.name=="PROTECTED"'; then MAP_ID="$id"; fi
-done
-[ -n "$MAP_ID" ] || { echo "no PROTECTED map held by fairplayd pid $FPD" >&2; exit 2; }
-echo "      fairplayd pid $FPD, PROTECTED is map id $MAP_ID"
+own_map() {
+  local id
+  for id in $(sudo sh -c "cat /proc/$FPD/fdinfo/*" 2>/dev/null | awk '$1=="map_id:" {print $2}' | sort -un); do
+    if sudo "$BPFTOOL" -j map show id "$id" | jqt --arg n "$1" '.name==$n'; then echo "$id"; return 0; fi
+  done
+  return 1
+}
+MAP_ID="$(own_map PROTECTED)" || { echo "no PROTECTED map held by fairplayd pid $FPD" >&2; exit 2; }
+COUNTED_ID="$(own_map COUNTED)" || { echo "no COUNTED map held by fairplayd" >&2; exit 2; }
+PENDING_ID="$(own_map PENDING)" || { echo "no PENDING map held by fairplayd" >&2; exit 2; }
+MAP_MAX="$(sudo "$BPFTOOL" -j map show id "$MAP_ID" | jq .max_entries)"
+echo "      fairplayd pid $FPD, PROTECTED is map id $MAP_ID ($MAP_MAX entries)"
+check "member-cap programs attached (task_alloc, task_free)" \
+  sh -c "sudo '$BPFTOOL' prog show name task_alloc | grep -q lsm &&
+         sudo '$BPFTOOL' prog show name task_free | grep -q lsm"
+check "PROTECTED fits the default cap for 32 domains (>= 32 * 1024 entries)" test "$MAP_MAX" -ge 32768
 check "fork and exit tracing programs attached" \
   sh -c "sudo '$BPFTOOL' prog show name follow_fork | grep -q tracing &&
          sudo '$BPFTOOL' prog show name unfollow_exit | grep -q tracing"
@@ -219,6 +240,63 @@ sudo "$CHEATSIM" attack --pid "$PGC" --addr "$PADDR" | tee "$T/plain-attack.out"
 check "3/3 paths leaked" grep -q '^3/3 paths leaked' "$T/plain-attack.out"
 kill "$PLAIN"; wait "$PLAIN" 2>/dev/null; KILL_PIDS=()
 
+step "a fork bomb stops at the member cap ($CAP), and other sessions don't notice"
+# Four processes fork at once, each until refused, then keep trying for 2s:
+# the cap must hold under the race, every process it let through must be in
+# PROTECTED, and the refusals must not flood the violation stream.
+as_launcher "$CTL" launch --manifest "$MANIFEST" -- "$CHEATSIM" forkbomb --workers 4 --keep-trying 2 >"$T/bomb.out" 2>&1
+BSESSION="$(grep '^{' "$T/bomb.out" | jq -r '.ok.launched.session')"
+BGAME="$(grep '^{' "$T/bomb.out" | jq -r '.ok.launched.pid')"
+wait_for "$T/bomb.out" '^FORKBOMB ' || { bad "fork bomb finished forking"; indent <"$T/bomb.out"; }
+grep '^FORKBOMB ' "$T/bomb.out" | indent
+BDOM="$(domain_of "$BGAME")"
+REFUSED="$(sed -n 's/^FORKBOMB .* refused=\([0-9]*\)$/\1/p' "$T/bomb.out")"
+check "it forked exactly $CAP processes, then every fork got EAGAIN" \
+  grep -q "^FORKBOMB forked=$CAP errno=EAGAIN refused=[0-9]*$" "$T/bomb.out"
+check "all $CAP, and the bomb itself, are in its domain ($BDOM)" test "$(in_domain "$BDOM")" -eq $((CAP + 1))
+sleep 1 # let fairplayd drain the ring buffer
+"$CTL" status "$BSESSION" >"$T/bomb-status.json"
+jq -c '.ok.status.session | {member_cap, forked_members, forks_denied, violations, protection_degraded}' "$T/bomb-status.json" | indent
+check "session_status: member_cap $CAP, forked_members $CAP, forks_denied = the bomb's $REFUSED refusals, not degraded" \
+  jqt --argjson c "$CAP" --argjson r "${REFUSED:-0}" \
+    '.ok.status.session | .member_cap==$c and .forked_members==$c and .forks_denied==$r and $r>=4 and (.protection_degraded|not)' "$T/bomb-status.json"
+grep "^DENIED .* hook=task_alloc " "$T/daemon.out" | head -3 | indent
+BDENIED="$(grep -c "^DENIED .* hook=task_alloc " "$T/daemon.out")"
+# Each line's mode is how many refusals it stands for.
+BMODES=0
+while read -r m; do BMODES=$((BMODES + m)); done < <(sed -n 's/^DENIED .* hook=task_alloc mode=\(0x[0-9a-f]*\).*/\1/p' "$T/daemon.out")
+echo "      $BDENIED DENIED lines standing for $BMODES of $REFUSED refusals"
+check "one DENIED line per refusal, rate-limited: 1 to 40 lines for ~3s of refusals" \
+  test "$BDENIED" -ge 1 -a "$BDENIED" -le 40
+check "the lines' counts add up to no more than the refusals" test "$BMODES" -ge "$BDENIED" -a "$BMODES" -le "${REFUSED:-0}"
+check "each is a violation of the bomb's session" \
+  jqt --argjson n "$BDENIED" '.ok.status.session.violations == $n' "$T/bomb-status.json"
+as_launcher "$CTL" launch --manifest "$MANIFEST" -- "$CHEATSIM" game --depth 2 >"$T/second.out" 2>&1
+wait_for "$T/second.out" '^pid=' || { bad "second game started"; indent <"$T/second.out"; }
+SSESSION="$(grep '^{' "$T/second.out" | jq -r '.ok.launched.session')"
+SGAME="$(grep '^{' "$T/second.out" | jq -r '.ok.launched.pid')"
+SGC="$(sed -n 's/^pid=\([0-9]*\) .*/\1/p' "$T/second.out")"
+SADDR="$(sed -n 's/^pid=[0-9]* addr=//p' "$T/second.out")"
+check "a second session still launches, and its grandchild joins its domain" \
+  test -n "$SGC" -a "$(domain_of "$SGC")" = "$(domain_of "$SGAME")"
+sudo "$CHEATSIM" attack --pid "$SGC" --addr "$SADDR" | tee "$T/second-attack.out" | indent
+check "the second session's grandchild is protected: 0/3 leaked" grep -q '^0/3 paths leaked' "$T/second-attack.out"
+"$CTL" status "$SSESSION" >"$T/second-status.json"
+check "the second session: 2 forked members, none denied, not degraded" \
+  jqt '.ok.status | .protected and .session.forked_members==2 and .session.forks_denied==0 and (.session.protection_degraded|not)' "$T/second-status.json"
+kill "$BGAME"
+wait_until test "$(in_domain "$BDOM")" -eq 0
+check "killing the bomb takes all its processes out of PROTECTED" test "$(in_domain "$BDOM")" -eq 0
+check "and leaves none running" not pgrep -f "^$CHEATSIM forkbomb"
+check "its forked_members goes back to 0" \
+  sh -c "'$CTL' status '$BSESSION' | jq -e '.ok.status.session.forked_members==0' >/dev/null"
+kill "$SGAME"
+wait_until not in_protected "$SGAME"
+wait_until test "$(map_count "$COUNTED_ID")" -eq 0
+check "no counted member or fork in flight is left (COUNTED, PENDING empty)" \
+  test "$(map_count "$COUNTED_ID")" -eq 0 -a "$(map_count "$PENDING_ID")" -eq 0
+check "PROTECTED is empty again" test "$(map_count)" -eq 0
+
 step "PROTECTED full: the child runs unprotected and the session says so"
 # A protected shell that waits on a FIFO (no forks while waiting), then
 # becomes a game that forks once. Fill the map while it waits. The game's
@@ -246,6 +324,8 @@ check "the game's child ($FCHILD) could not be added" not in_protected "$FCHILD"
 jq -c '.ok.status | {protected, degraded: .session.protection_degraded, unprotected: .session.unprotected_children}' "$T/full-status.json" | indent
 check "session_status: still protected, but protection_degraded with >= 1 unprotected child" \
   jqt '.ok.status | .protected and .session.protection_degraded and .session.unprotected_children >= 1' "$T/full-status.json"
+check "the child that didn't fit isn't counted as a member (forked_members 0)" \
+  jqt '.ok.status.session.forked_members == 0' "$T/full-status.json"
 check "the other session isn't marked degraded" \
   sh -c "'$CTL' status '$SESSION' | jq -e '.ok.status.session.protection_degraded | not' >/dev/null"
 # The kernel still treats a child of a protected process as protected
@@ -265,7 +345,7 @@ sudo kill "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""
 check "socket removed" test ! -e "$SOCK"
 any_loaded() {
   local n
-  for n in follow_fork unfollow_exit ptrace_access_check; do
+  for n in follow_fork unfollow_exit ptrace_access_check task_alloc task_free; do
     sudo "$BPFTOOL" prog show name "$n" 2>/dev/null | grep -q . && return 0
   done
   return 1

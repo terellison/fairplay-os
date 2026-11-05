@@ -48,7 +48,13 @@ fn other(what: &str) -> impl Fn(tss_esapi::Error) -> Error + '_ {
 }
 
 /// Collect evidence for `nonce` (at most 64 bytes) from the TPM `opts` names.
+/// [`Error::NoTpm`] if that is a device TCTI whose device doesn't exist.
 pub fn collect_with(nonce: &[u8], opts: &CollectOptions) -> Result<Evidence, Error> {
+    if let Some(dev) = device_path(&opts.tcti) {
+        if !std::path::Path::new(dev).exists() {
+            return Err(Error::NoTpm);
+        }
+    }
     let tcti = TctiNameConf::from_str(&opts.tcti).map_err(other("bad TCTI"))?;
     let mut ctx = Context::new(tcti).map_err(other("opening TPM"))?;
     let qualifying = Data::try_from(nonce.to_vec())
@@ -85,6 +91,14 @@ pub fn collect_with(nonce: &[u8], opts: &CollectOptions) -> Result<Evidence, Err
         ima_log,
         ak_public: ak_public(&ak.out_public)?,
     })
+}
+
+/// The device a `device:` TCTI names (libtss2's default is /dev/tpm0).
+fn device_path(tcti: &str) -> Option<&str> {
+    match tcti {
+        "device" | "device:" => Some("/dev/tpm0"),
+        _ => tcti.strip_prefix("device:"),
+    }
 }
 
 type Quoted = (Vec<u8>, Vec<u8>, BTreeMap<u8, PcrValue>);
@@ -200,4 +214,17 @@ fn ak_public(public: &Public) -> Result<AkPublic, Error> {
         sec1.extend_from_slice(coord);
     }
     Ok(AkPublic(sec1))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn device_tctis() {
+        use super::device_path;
+        assert_eq!(device_path("device:/dev/tpmrm0"), Some("/dev/tpmrm0"));
+        assert_eq!(device_path("device"), Some("/dev/tpm0"));
+        assert_eq!(device_path("device:"), Some("/dev/tpm0"));
+        assert_eq!(device_path("swtpm:host=127.0.0.1,port=2321"), None);
+        assert_eq!(device_path("mssim"), None);
+    }
 }

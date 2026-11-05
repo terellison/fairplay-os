@@ -10,13 +10,20 @@
 //! `collect` needs the `tpm` feature (libtss2). `verify` is pure Rust so a
 //! server can run it without a TPM stack.
 //!
-//! Not done yet: trusting the AK (EK certificate chain and enrollment),
-//! measuring the player/developer mode, per-vendor keys or ECDAA for privacy,
-//! and the wire encoding of [`Evidence`] for the socket API.
+//! The boot mode (player or developer) is read from [`MODE_PCR`]; see
+//! [`MeasuredMode`]. Which PCR that is, and what the boot extends into it,
+//! is provisional until the design doc pins it down.
+//!
+//! The socket API's encoding of [`Evidence`] lives in `fairplay-api`.
+//!
+//! Not done yet: trusting the AK (EK certificate chain and enrollment), and
+//! per-vendor keys or ECDAA for privacy.
 
 use std::collections::BTreeMap;
 
 mod ima;
+#[cfg(feature = "tpm")]
+mod swtpm;
 #[cfg(feature = "tpm")]
 mod tpm;
 mod wire;
@@ -24,9 +31,21 @@ mod wire;
 #[cfg(feature = "tpm")]
 pub use tpm::{collect_with, CollectOptions};
 
-/// PCRs we quote, all in the SHA-256 bank. 0-7: firmware and boot chain
-/// (7 holds Secure Boot state where the firmware supports it). 10: IMA.
-pub const QUOTED_PCRS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 10];
+/// PCRs we quote, all in the SHA-256 bank, in ascending order. 0-7:
+/// firmware and boot chain (7 holds Secure Boot state where the firmware
+/// supports it). 10: IMA. [`MODE_PCR`]: the boot mode.
+pub const QUOTED_PCRS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, IMA_PCR, MODE_PCR];
+
+/// The PCR the boot extends, once, with [`mode_event`] for the mode it
+/// booted in.
+///
+/// PROVISIONAL: the design doc says the quote covers "the mode" but not
+/// which PCR or what is extended. 13 is a placeholder (on Linux it is only
+/// used by systemd-stub for system extension images, which the player image
+/// won't load). The boot component that picks the mode must extend it
+/// before running anything it didn't verify, in both modes, so a developer
+/// boot can never reach the player value later.
+pub const MODE_PCR: u8 = 13;
 
 /// The PCR IMA extends by default.
 pub const IMA_PCR: u8 = 10;
@@ -82,6 +101,83 @@ pub struct Verdict {
     pub kernel_lockdown: Option<bool>,
     pub fairplayd_hash_ok: bool,
     pub lsm_program_hash_ok: bool,
+    /// The boot mode, from the quoted [`MODE_PCR`].
+    pub mode: MeasuredMode,
+}
+
+/// The modes the OS boots in (design doc, "Modes").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Player,
+    Developer,
+}
+
+impl Mode {
+    fn tag(self) -> &'static [u8] {
+        match self {
+            Mode::Player => b"player",
+            Mode::Developer => b"developer",
+        }
+    }
+}
+
+/// What the quoted [`MODE_PCR`] says about the boot mode.
+///
+/// This is only as good as the boot chain that extended it: a server should
+/// trust `Player` only together with PCR values (0-7) of a boot chain it
+/// knows extends the mode PCR correctly. Anything but `Player` must not be
+/// treated as player mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MeasuredMode {
+    /// The PCR is still all zeros: nothing measured a mode (a boot chain
+    /// that predates this, or this VM).
+    #[default]
+    Unmeasured,
+    /// Extended exactly once, with [`mode_event`]`(Player)`.
+    Player,
+    /// Extended exactly once, with [`mode_event`]`(Developer)`.
+    Developer,
+    /// Anything else: extended more than once (e.g. by root after boot), or
+    /// with an event this verifier doesn't know.
+    Unrecognized,
+}
+
+/// The SHA-256 digest the boot extends into [`MODE_PCR`] for `mode`:
+/// `SHA-256("fairplay-os/mode/v1:" || "player" | "developer")`.
+/// PROVISIONAL, like [`MODE_PCR`].
+pub fn mode_event(mode: Mode) -> PcrValue {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"fairplay-os/mode/v1:");
+    h.update(mode.tag());
+    h.finalize().into()
+}
+
+/// The value [`MODE_PCR`] has after a boot in `mode`: one extend of
+/// [`mode_event`] from the reset value (zeros).
+pub fn mode_pcr_value(mode: Mode) -> PcrValue {
+    pcr_extend(&[0; 32], &mode_event(mode))
+}
+
+/// What a SHA-256 PCR holds after extending `old` with `digest`.
+pub fn pcr_extend(old: &PcrValue, digest: &PcrValue) -> PcrValue {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(old);
+    h.update(digest);
+    h.finalize().into()
+}
+
+fn measured_mode(pcr: &PcrValue) -> MeasuredMode {
+    if *pcr == [0; 32] {
+        MeasuredMode::Unmeasured
+    } else if *pcr == mode_pcr_value(Mode::Player) {
+        MeasuredMode::Player
+    } else if *pcr == mode_pcr_value(Mode::Developer) {
+        MeasuredMode::Developer
+    } else {
+        MeasuredMode::Unrecognized
+    }
 }
 
 #[derive(Debug)]
@@ -169,9 +265,6 @@ impl std::error::Error for Rejection {}
 pub fn collect(nonce: &[u8]) -> Result<Evidence, Error> {
     #[cfg(feature = "tpm")]
     {
-        if !std::path::Path::new("/dev/tpmrm0").exists() {
-            return Err(Error::NoTpm);
-        }
         collect_with(nonce, &CollectOptions::default())
     }
     #[cfg(not(feature = "tpm"))]
@@ -245,23 +338,50 @@ pub fn verify(
         ima_log_verified = true;
     }
 
+    let mode = measured_mode(&pcrs[&MODE_PCR]);
     Ok(Verdict {
         quote_valid: true,
         pcrs,
         ima_log_verified,
+        mode,
         ..Verdict::default()
     })
 }
 
-/// Test helpers: build IMA log entries and compute what they extend.
+/// Test helpers: build IMA log entries and compute what they extend, and
+/// (with the `tpm` feature) run a software TPM.
 #[doc(hidden)]
 pub mod testing {
     pub use crate::ima::{ima_ng_entry, sha256_extend_value};
+    #[cfg(feature = "tpm")]
+    pub use crate::swtpm::Swtpm;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_pcrs_ascending() {
+        // verify hashes the values in this order, as the TPM does.
+        assert!(QUOTED_PCRS.windows(2).all(|w| w[0] < w[1]));
+        assert!(QUOTED_PCRS.contains(&MODE_PCR));
+    }
+
+    #[test]
+    fn mode_values() {
+        let player = mode_pcr_value(Mode::Player);
+        let developer = mode_pcr_value(Mode::Developer);
+        assert_ne!(player, developer);
+        assert_eq!(measured_mode(&[0; 32]), MeasuredMode::Unmeasured);
+        assert_eq!(measured_mode(&player), MeasuredMode::Player);
+        assert_eq!(measured_mode(&developer), MeasuredMode::Developer);
+        // Root extending "player" again after a developer boot gets nowhere.
+        let upgraded = pcr_extend(&developer, &mode_event(Mode::Player));
+        assert_eq!(measured_mode(&upgraded), MeasuredMode::Unrecognized);
+        let twice = pcr_extend(&player, &mode_event(Mode::Player));
+        assert_eq!(measured_mode(&twice), MeasuredMode::Unrecognized);
+    }
 
     #[test]
     fn empty_nonce_rejected_first() {

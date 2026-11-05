@@ -14,9 +14,13 @@
 //!     fairplayctl manifest sign --key vendor.key game.json
 //!     fairplayctl manifest verify game.json
 //!
+//!     fairplayctl attest --nonce 00ff > reply.json
+//!     fairplayctl verify-evidence --nonce 00ff --ak <base64> reply.json  # the server's side
+//!
 //! Prints the daemon's JSON lines as they arrive. Exits 0 for `ok`, 1 for
-//! `error`, 2 if it couldn't talk to the daemon at all. `manifest` commands
-//! print one JSON line and exit 0, or 1 if verification fails.
+//! `error`, 2 if it couldn't talk to the daemon at all. `manifest` and
+//! `verify-evidence` print one JSON line and exit 0, or 1 if verification
+//! fails.
 
 use std::{
     io::{Read, Write},
@@ -89,7 +93,8 @@ enum Cmd {
     },
     /// List your sessions (all sessions, as root).
     List,
-    /// Ask for attestation evidence (milestone 10; unavailable for now).
+    /// Ask for attestation evidence (milestone 10): a TPM quote and the IMA
+    /// log, or `unavailable` without a TPM.
     Attest {
         /// Server-chosen nonce, hex. Random if omitted.
         #[arg(long)]
@@ -98,6 +103,23 @@ enum Cmd {
     /// Make, sign and check game manifests (no daemon needed).
     #[command(subcommand)]
     Manifest(ManifestCmd),
+    /// Check an `attest` reply the way a vendor's server would (no daemon
+    /// needed). Prints the verdict; exits 1 if the evidence is rejected.
+    VerifyEvidence {
+        /// The nonce the server sent, hex.
+        #[arg(long)]
+        nonce: String,
+        /// The attestation key the server enrolled for this machine
+        /// (base64 SEC1 P-256 point, as in the evidence's `ak_public`).
+        #[arg(long, required_unless_present = "trust_reported_ak")]
+        ak: Option<String>,
+        /// Trust whatever AK the evidence names. Proves nothing about
+        /// which TPM made the quote; for tests until AK enrollment exists.
+        #[arg(long, conflicts_with = "ak")]
+        trust_reported_ak: bool,
+        /// The reply line `fairplayctl attest` printed [default: stdin].
+        reply: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -168,6 +190,15 @@ fn run() -> Result<Option<fairplay_api::ApiError>> {
     if let Cmd::Manifest(cmd) = args.cmd {
         return manifest_cmd(cmd);
     }
+    if let Cmd::VerifyEvidence {
+        nonce,
+        ak,
+        trust_reported_ak: _,
+        reply,
+    } = args.cmd
+    {
+        return verify_evidence(&nonce, ak.as_deref(), reply.as_deref());
+    }
     let socket = args.socket.unwrap_or_else(default_socket);
     let mut fds = vec![];
     let mut stream_count = None;
@@ -206,7 +237,7 @@ fn run() -> Result<Option<fairplay_api::ApiError>> {
                 None => random_nonce()?,
             },
         },
-        Cmd::Manifest(_) => unreachable!("handled above"),
+        Cmd::Manifest(_) | Cmd::VerifyEvidence { .. } => unreachable!("handled above"),
     };
     let mut client = Client::connect(&socket)?;
     let resp = client.call_with_fds(&req, &fds)?;
@@ -460,6 +491,59 @@ fn write_private(path: &Path, text: String) -> Result<()> {
         .with_context(|| format!("creating {}", path.display()))?;
     f.write_all(text.as_bytes())?;
     Ok(())
+}
+
+/// `verify-evidence`. `ak: None` trusts the evidence's own AK.
+fn verify_evidence(
+    nonce: &str,
+    ak: Option<&str>,
+    reply: Option<&Path>,
+) -> Result<Option<fairplay_api::ApiError>> {
+    use base64::Engine;
+    use fairplay_api::{ApiError, ErrorCode, Reply};
+    let text = match reply {
+        Some(p) => std::fs::read(p).with_context(|| format!("reading {}", p.display()))?,
+        None => {
+            let mut b = vec![];
+            std::io::stdin().read_to_end(&mut b)?;
+            b
+        }
+    };
+    let wire = match serde_json::from_slice::<Response>(&text).context("parsing the reply")? {
+        Response::Ok(Reply::Evidence(w)) => w,
+        Response::Error(e) => bail!("the reply is an error, not evidence: {e}"),
+        other => bail!("the reply is not evidence: {other:?}"),
+    };
+    let evidence = wire.decode()?;
+    let nonce = fairplay_api::parse_nonce(nonce).context("--nonce must be 1-64 bytes of hex")?;
+    let ak = match ak {
+        Some(b) => fairplay_attest::AkPublic(
+            base64::engine::general_purpose::STANDARD
+                .decode(b)
+                .context("--ak is not base64")?,
+        ),
+        None => evidence.ak_public.clone(),
+    };
+    match fairplay_attest::verify(&evidence, &nonce, &ak) {
+        Ok(v) => {
+            print_json(&serde_json::json!({
+                "verified": true,
+                "mode": format!("{:?}", v.mode).to_lowercase(),
+                "ima_log_verified": v.ima_log_verified,
+                "pcrs": v.pcrs.iter()
+                    .map(|(n, val)| (n.to_string(), fairplay_api::attest::to_hex(val).into()))
+                    .collect::<serde_json::Map<_, _>>(),
+            }))?;
+            Ok(None)
+        }
+        Err(r) => {
+            print_json(&serde_json::json!({ "verified": false, "rejection": r.to_string() }))?;
+            Ok(Some(ApiError::new(
+                ErrorCode::Forbidden,
+                format!("evidence rejected: {r}"),
+            )))
+        }
+    }
 }
 
 fn print_json(v: &serde_json::Value) -> Result<()> {

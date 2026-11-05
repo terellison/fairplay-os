@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn bitmap_for_quoted_pcrs() {
-        assert_eq!(pcr_bitmap(crate::QUOTED_PCRS), vec![0xff, 0x04, 0x00]);
+        assert_eq!(pcr_bitmap(crate::QUOTED_PCRS), vec![0xff, 0x24, 0x00]);
     }
 
     #[test]

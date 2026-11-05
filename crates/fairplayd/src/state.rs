@@ -15,7 +15,9 @@ use fairplay_api::{
     ApiError, ErrorCode, Outcome, ProcessInfo, ProcessState, Reply, SandboxInfo, SessionId,
     SessionInfo, ViolationEvent,
 };
-use fairplay_common::{ExecAllow, ExecKey, Hook, Violation};
+use fairplay_common::{
+    ExecAllow, ExecKey, Hook, Members, Violation, DEFAULT_MEMBER_CAP, MEMBER_BUDGET,
+};
 
 use crate::{
     exec_allow::{ExecEntries, FileId, Table},
@@ -47,7 +49,16 @@ pub trait ProtectedMap {
     /// How many processes started in `domain` the kernel could not add
     /// (the UNFOLLOWED map). Nonzero means protection is degraded.
     fn unfollowed(&self, domain: u32) -> u64;
-    /// Drops `domain`'s UNFOLLOWED count, once nothing will ask for it.
+    /// Creates `domain`'s MEMBERS entry, zeroed (issue #21). Only before
+    /// the domain has a process: after that the kernel counts in it, and a
+    /// write from here would race its atomic adds. Without one, the
+    /// kernel refuses every fork in the domain.
+    fn start_domain(&mut self, domain: u32) -> Result<()>;
+    /// `domain`'s MEMBERS entry: its forked members, and forks refused at
+    /// the cap. Zero if there is none.
+    fn members(&self, domain: u32) -> Members;
+    /// Drops `domain`'s UNFOLLOWED and MEMBERS entries, once nothing will
+    /// ask for them.
     fn forget_domain(&mut self, domain: u32);
     /// The domains that have a process in PROTECTED right now, launched by
     /// us or started by one of those.
@@ -57,6 +68,8 @@ pub trait ProtectedMap {
     /// INPUT_BLOCK: deny virtual input from executables not on the input
     /// allowlist (milestone 7).
     fn set_input_block(&mut self, on: bool) -> Result<()>;
+    /// PERF_GUARD: deny CPU-wide perf events (issue #27).
+    fn set_perf_guard(&mut self, on: bool) -> Result<()>;
 }
 
 /// Who is on the other end of a connection, as the kernel reported it
@@ -85,12 +98,16 @@ pub struct Identity {
 
 /// Domain for processes given on fairplayd's command line (milestone 3).
 pub const CLI_DOMAIN: u32 = 1;
-/// Running protected processes one launcher may have. Keeps one user from
-/// filling the PROTECTED map (1024 entries) and locking everyone else out.
+/// Running protected processes one launcher may have launched. Keeps one
+/// user from using up the sessions and locking everyone else out.
 pub const MAX_RUNNING_PER_LAUNCHER: usize = 16;
-/// Running protected processes in total; leaves room in the map for
-/// command-line PIDs.
+/// Running protected processes in total that fairplayd launched; the
+/// PROTECTED map has room for these beside the forked members
+/// (`fairplay_common::PROTECTED_CAPACITY`).
 pub const MAX_RUNNING: usize = 512;
+/// The largest `--member-cap`: room for one session beside the command
+/// line's domain.
+pub const MAX_MEMBER_CAP: u32 = MEMBER_BUDGET / 2;
 /// Ended sessions kept for status queries; the oldest are forgotten first.
 pub const MAX_ENDED_KEPT: usize = 256;
 
@@ -211,8 +228,15 @@ impl Session {
         self.procs().any(Proc::running)
     }
 
-    /// `unfollowed`: the domain's count from [`ProtectedMap::unfollowed`].
-    fn info(&self, id: SessionId, unfollowed: u64) -> SessionInfo {
+    /// `unfollowed` and `members`: the domain's counts from the map;
+    /// `member_cap`: the daemon's.
+    fn info(
+        &self,
+        id: SessionId,
+        unfollowed: u64,
+        members: Members,
+        member_cap: u32,
+    ) -> SessionInfo {
         SessionInfo {
             session: id,
             launcher_uid: self.launcher_uid,
@@ -223,6 +247,9 @@ impl Session {
             violations: self.violations,
             protection_degraded: unfollowed > 0,
             unprotected_children: unfollowed,
+            member_cap,
+            forked_members: members.live,
+            forks_denied: members.denied,
             manifest: self.manifest.as_ref().map(|m| Box::new(m.info())),
         }
     }
@@ -271,12 +298,20 @@ pub struct Daemon<M> {
     input: InputLog,
     /// What INPUT_BLOCK is set to.
     input_block: bool,
+    /// What PERF_GUARD is set to: on while anything is protected.
+    perf_guard: bool,
+    /// Something fairplayd doesn't track as a session is protected for the
+    /// daemon's whole life (`--protect`, or fairplayd itself with
+    /// `--self-protect`): PERF_GUARD stays on.
+    always_guarded: bool,
     /// Domains whose launched processes have all exited, but which may
     /// still have members: processes they started, which the kernel keeps
     /// in the domain (milestone 5) and which may outlive them. Their
     /// EXEC_ALLOWED and READER_FILES entries stay until
     /// [`Daemon::release_drained`] finds the domain empty.
     draining: BTreeSet<u32>,
+    /// Forked members a domain may have (MEMBER_CAP, issue #21).
+    member_cap: u32,
 }
 
 impl<M: ProtectedMap> Daemon<M> {
@@ -290,12 +325,31 @@ impl<M: ProtectedMap> Daemon<M> {
             readers: ExecEntries::new(Table::ReaderFiles),
             input: InputLog::default(),
             input_block: false,
+            perf_guard: false,
+            always_guarded: false,
             draining: BTreeSet::new(),
+            member_cap: DEFAULT_MEMBER_CAP,
         }
     }
 
     pub fn map_mut(&mut self) -> &mut M {
         &mut self.map
+    }
+
+    /// Says what the kernel's MEMBER_CAP is ([`MAX_MEMBER_CAP`] at most),
+    /// for `session_status` and for how many sessions may run at once.
+    pub fn set_member_cap(&mut self, cap: u32) {
+        self.member_cap = cap.clamp(1, MAX_MEMBER_CAP);
+    }
+
+    pub fn member_cap(&self) -> u32 {
+        self.member_cap
+    }
+
+    /// Sessions that may run at once, so that their caps, and the command
+    /// line's domain's, together fit in PROTECTED.
+    pub fn max_sessions(&self) -> usize {
+        (MEMBER_BUDGET / self.member_cap) as usize - 1
     }
 
     /// Lets every protected process map these files executable (approved
@@ -443,6 +497,24 @@ impl<M: ProtectedMap> Daemon<M> {
                 ),
             ));
         }
+        // Each running session may fork up to the cap into PROTECTED (issue
+        // #21); only so many caps fit. A session whose launched processes
+        // ended still takes its place while forked members of it live on.
+        let sessions = self
+            .sessions
+            .values()
+            .filter(|s| s.running() || self.map.members(s.domain).live > 0)
+            .count();
+        if join.is_none() && sessions >= self.max_sessions() {
+            return Err(ApiError::new(
+                ErrorCode::LimitReached,
+                format!(
+                    "at most {} protected sessions at once (member cap {})",
+                    self.max_sessions(),
+                    self.member_cap
+                ),
+            ));
+        }
         if let Some(id) = join {
             // A joined program is a reader: it can read the game.
             let s = self.joinable(peer, id)?;
@@ -493,8 +565,28 @@ impl<M: ProtectedMap> Daemon<M> {
             self.input_block = true;
             log_input_block(true);
         }
-        if let Err(e) = self.map.insert(pid, t.domain) {
+        // So is the CPU-wide perf guard.
+        if !self.perf_guard {
+            if let Err(e) = self.map.set_perf_guard(true) {
+                self.sync_input_block();
+                return Err(e.context("turning on the CPU-wide perf guard"));
+            }
+            self.perf_guard = true;
+        }
+        // A new domain's member count starts before its first process.
+        let started = if t.join {
+            Ok(())
+        } else {
+            self.map
+                .start_domain(t.domain)
+                .map_err(|e| e.context("starting the domain's member count"))
+        };
+        if let Err(e) = started.and_then(|()| self.map.insert(pid, t.domain)) {
+            if !t.join {
+                self.map.forget_domain(t.domain);
+            }
             self.sync_input_block();
+            self.sync_perf_guard();
             return Err(e);
         }
         if t.join {
@@ -549,6 +641,7 @@ impl<M: ProtectedMap> Daemon<M> {
             self.release_drained();
         }
         self.sync_input_block();
+        self.sync_perf_guard();
         self.prune_ended();
         Some(id)
     }
@@ -577,6 +670,37 @@ impl<M: ProtectedMap> Daemon<M> {
             self.readers.release(&mut self.map, domain);
             eprintln!("fairplayd: domain {domain} has no processes left; its allowlist entries are released");
         }
+        self.sync_perf_guard();
+    }
+
+    /// `--protect` put processes in PROTECTED, or fairplayd is about to
+    /// protect itself: keep PERF_GUARD on for good.
+    pub fn guard_perf_for_good(&mut self) -> Result<()> {
+        self.always_guarded = true;
+        self.map.set_perf_guard(true)?;
+        self.perf_guard = true;
+        Ok(())
+    }
+
+    /// Sets PERF_GUARD to whether anything may be protected: a session
+    /// running, a domain still draining (its launched processes are gone,
+    /// what they started may not be), `--protect` or `--self-protect`.
+    fn sync_perf_guard(&mut self) {
+        let want = self.always_guarded
+            || !self.draining.is_empty()
+            || self.sessions.values().any(Session::running);
+        if want == self.perf_guard {
+            return;
+        }
+        match self.map.set_perf_guard(want) {
+            Ok(()) => self.perf_guard = want,
+            Err(e) => eprintln!("fairplayd: setting PERF_GUARD: {e:#}"),
+        }
+    }
+
+    /// Whether the kernel is denying CPU-wide perf events.
+    pub fn perf_guarded(&self) -> bool {
+        self.perf_guard
     }
 
     /// Sets INPUT_BLOCK to whether any running session asked for blocking.
@@ -630,6 +754,36 @@ impl<M: ProtectedMap> Daemon<M> {
         events
     }
 
+    /// A denial that concerns every game on the machine (a CPU-wide perf
+    /// event): one event per running session.
+    pub fn record_machine_wide(
+        &mut self,
+        v: &Violation,
+        exe_path: Option<String>,
+    ) -> Vec<ViolationEvent> {
+        let at = now();
+        self.sessions
+            .iter_mut()
+            .filter(|(_, s)| s.running())
+            .map(|(&id, s)| {
+                s.violations += 1;
+                ViolationEvent {
+                    session: Some(id),
+                    caller: v.caller,
+                    comm: c_str(&v.comm),
+                    exe: c_str(&v.exe),
+                    exe_path: exe_path.clone(),
+                    target: v.target,
+                    hook: hook_name(v.hook).into(),
+                    outcome: Outcome::Denied,
+                    mode: v.mode,
+                    file: Some(c_str(&v.file)).filter(|f| !f.is_empty()),
+                    seen_at: at,
+                }
+            })
+            .collect()
+    }
+
     pub fn input_log(&self) -> &InputLog {
         &self.input
     }
@@ -649,6 +803,15 @@ impl<M: ProtectedMap> Daemon<M> {
                 self.map.forget_domain(s.domain);
             }
         }
+    }
+
+    fn info(&self, id: SessionId, s: &Session) -> SessionInfo {
+        s.info(
+            id,
+            self.map.unfollowed(s.domain),
+            self.map.members(s.domain),
+            self.member_cap,
+        )
     }
 
     /// Is `pid` protected right now, whoever started it?
@@ -726,10 +889,7 @@ impl<M: ProtectedMap> Daemon<M> {
             return Ok((false, None));
         };
         let s = self.visible(peer, id)?;
-        Ok((
-            s.game.running(),
-            Some(s.info(id, self.map.unfollowed(s.domain))),
-        ))
+        Ok((s.game.running(), Some(self.info(id, s))))
     }
 
     pub fn subscribe(&self, peer: &Peer, id: Option<SessionId>) -> Result<Subscription, ApiError> {
@@ -749,7 +909,7 @@ impl<M: ProtectedMap> Daemon<M> {
                 .keys()
                 .filter_map(|&id| {
                     let s = self.visible(peer, id).ok()?;
-                    Some(s.info(id, self.map.unfollowed(s.domain)))
+                    Some(self.info(id, s))
                 })
                 .collect(),
         )
@@ -780,6 +940,14 @@ pub fn hook_name(hook: u32) -> &'static str {
         x if x == Hook::ProcMemWrite as u32 => "proc_mem_write",
         x if x == Hook::ProcLink as u32 => "proc_link",
         x if x == Hook::UnixAbstract as u32 => "unix_abstract",
+        x if x == Hook::TaskSetrlimit as u32 => "task_setrlimit",
+        x if x == Hook::TaskSetnice as u32 => "task_setnice",
+        x if x == Hook::TaskSetscheduler as u32 => "task_setscheduler",
+        x if x == Hook::TaskSetioprio as u32 => "task_setioprio",
+        x if x == Hook::ProcTuneWrite as u32 => "proc_tune_write",
+        x if x == Hook::PerfCpu as u32 => "perf_event_open",
+        x if x == Hook::PerfTarget as u32 => "perf_event_alloc",
+        x if x == Hook::TaskAlloc as u32 => "task_alloc",
         x => match crate::input::Mechanism::of_hook(x) {
             Some(m) => input_hook_name(m),
             None => "unknown",
@@ -830,6 +998,7 @@ mod tests {
         entries: HashMap<u32, u32>,
         fail_insert: bool,
         unfollowed: HashMap<u32, u64>,
+        members: HashMap<u32, Members>,
         exec: HashMap<ExecKey, ExecAllow>,
         /// Fail exec inserts once this many entries exist.
         exec_fail_at: Option<usize>,
@@ -838,6 +1007,8 @@ mod tests {
         sandboxed: HashMap<u32, u32>,
         input_block: bool,
         fail_input_block: bool,
+        perf_guard: bool,
+        fail_perf_guard: bool,
     }
 
     impl ProtectedMap for FakeMap {
@@ -856,8 +1027,16 @@ mod tests {
         fn unfollowed(&self, domain: u32) -> u64 {
             self.unfollowed.get(&domain).copied().unwrap_or(0)
         }
+        fn start_domain(&mut self, domain: u32) -> Result<()> {
+            self.members.insert(domain, Members::default());
+            Ok(())
+        }
+        fn members(&self, domain: u32) -> Members {
+            self.members.get(&domain).copied().unwrap_or_default()
+        }
         fn forget_domain(&mut self, domain: u32) {
             self.unfollowed.remove(&domain);
+            self.members.remove(&domain);
         }
         fn live_domains(&self) -> Result<BTreeSet<u32>> {
             Ok(self.entries.values().copied().collect())
@@ -901,6 +1080,11 @@ mod tests {
         fn set_input_block(&mut self, on: bool) -> Result<()> {
             anyhow::ensure!(!self.fail_input_block, "map update failed");
             self.input_block = on;
+            Ok(())
+        }
+        fn set_perf_guard(&mut self, on: bool) -> Result<()> {
+            anyhow::ensure!(!self.fail_perf_guard, "map update failed");
+            self.perf_guard = on;
             Ok(())
         }
     }
@@ -1400,6 +1584,66 @@ mod tests {
     }
 
     #[test]
+    fn each_session_gets_a_member_count_reported_in_status() {
+        let mut d = Daemon::new(FakeMap::default());
+        d.set_member_cap(64);
+        let alice = launcher(1000);
+        let a = launch(&mut d, &alice, 70);
+        assert_eq!(d.map.members.get(&a.domain), Some(&Members::default()));
+        // The kernel forked 10 into it and refused 3 at the cap.
+        d.map.members.insert(
+            a.domain,
+            Members {
+                live: 10,
+                denied: 3,
+                ..Default::default()
+            },
+        );
+        let i = d.status(&alice, Some(a.session)).unwrap().1.unwrap();
+        assert_eq!(
+            (i.member_cap, i.forked_members, i.forks_denied),
+            (64, 10, 3)
+        );
+        // A join doesn't reset the count.
+        let j = d.begin_launch(&alice, Some(a.session)).unwrap();
+        d.register(j, 71, &alice, 1000, vec![], None).unwrap();
+        assert_eq!(d.map.members[&a.domain].live, 10);
+    }
+
+    #[test]
+    fn failed_insert_drops_the_member_count() {
+        let mut d = Daemon::new(FakeMap {
+            fail_insert: true,
+            ..Default::default()
+        });
+        let alice = launcher(1000);
+        let t = d.begin_launch(&alice, None).unwrap();
+        assert!(d.register(t, 9, &alice, 1000, vec![], None).is_err());
+        assert!(d.map.members.is_empty());
+    }
+
+    #[test]
+    fn sessions_are_limited_so_their_caps_fit() {
+        let mut d = Daemon::new(FakeMap::default());
+        let root = user(0);
+        // The default: 32 caps fit, one is the command line's.
+        assert_eq!(d.max_sessions(), 31);
+        d.set_member_cap(MAX_MEMBER_CAP);
+        assert_eq!(d.max_sessions(), 1);
+        let a = launch(&mut d, &root, 70);
+        let e = d.begin_launch(&root, None).unwrap_err();
+        assert_eq!(e.code, ErrorCode::LimitReached);
+        // Joining the running session is still fine.
+        assert!(d.begin_launch(&root, Some(a.session)).is_ok());
+        // The game exited, but processes it forked live on: still taken.
+        d.map.members.get_mut(&a.domain).unwrap().live = 4;
+        d.child_exited(70, EXITED_0);
+        assert!(d.begin_launch(&root, None).is_err());
+        d.map.members.get_mut(&a.domain).unwrap().live = 0;
+        assert!(d.begin_launch(&root, None).is_ok());
+    }
+
+    #[test]
     fn per_launcher_limit() {
         let mut d = Daemon::new(FakeMap::default());
         let alice = launcher(1000);
@@ -1440,6 +1684,14 @@ mod tests {
         assert_eq!(c_str(b"0123456789abcdef"), "0123456789abcdef");
         assert_eq!(hook_name(Hook::TaskKill as u32), "task_kill");
         assert_eq!(hook_name(Hook::Bpf as u32), "bpf");
+        assert_eq!(hook_name(Hook::TaskSetrlimit as u32), "task_setrlimit");
+        assert_eq!(hook_name(Hook::TaskSetnice as u32), "task_setnice");
+        assert_eq!(
+            hook_name(Hook::TaskSetscheduler as u32),
+            "task_setscheduler"
+        );
+        assert_eq!(hook_name(Hook::TaskSetioprio as u32), "task_setioprio");
+        assert_eq!(hook_name(Hook::ProcTuneWrite as u32), "proc_tune_write");
         assert_eq!(hook_name(Hook::UinputCreate as u32), "uinput_create");
         assert_eq!(hook_name(Hook::UhidCreate as u32), "uhid_create");
         assert_eq!(hook_name(Hook::EvdevWrite as u32), "evdev_write");
@@ -1553,6 +1805,64 @@ mod tests {
         assert!(d.map.input_block, "the game still runs");
         d.child_exited(4245, EXITED_0);
         assert!(!d.map.input_block);
+    }
+
+    #[test]
+    fn perf_guard_lasts_while_anything_is_protected() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        assert!(!d.map.perf_guard);
+        launch(&mut d, &alice, 4242);
+        assert!(d.map.perf_guard && d.perf_guarded());
+        launch(&mut d, &alice, 4243);
+        d.child_exited(4242, EXITED_0);
+        assert!(d.map.perf_guard, "another session runs");
+        // The game left a child behind: still in PROTECTED, so the domain
+        // drains and the guard stays.
+        let domain = d.map.entries[&4243];
+        d.map.entries.insert(5000, domain);
+        d.child_exited(4243, EXITED_0);
+        assert!(d.map.perf_guard, "a process it started is still protected");
+        d.map.entries.remove(&5000);
+        d.release_drained();
+        assert!(!d.map.perf_guard && !d.perf_guarded());
+        // --protect and --self-protect keep it on for good.
+        d.guard_perf_for_good().unwrap();
+        launch(&mut d, &alice, 4244);
+        d.child_exited(4244, EXITED_0);
+        d.release_drained();
+        assert!(d.map.perf_guard);
+    }
+
+    #[test]
+    fn perf_guard_that_cannot_be_set_fails_the_launch() {
+        let mut d = Daemon::new(FakeMap {
+            fail_perf_guard: true,
+            ..Default::default()
+        });
+        let alice = launcher(1000);
+        let t = d.begin_launch(&alice, None).unwrap();
+        assert!(d.register(t, 4242, &alice, 1000, vec![], None).is_err());
+        assert!(d.map.entries.is_empty(), "nothing protected, nothing runs");
+    }
+
+    #[test]
+    fn machine_wide_denials_reach_every_running_session() {
+        let mut d = Daemon::new(FakeMap::default());
+        let alice = launcher(1000);
+        launch(&mut d, &alice, 4242);
+        launch(&mut d, &alice, 4243);
+        launch(&mut d, &alice, 4244);
+        d.child_exited(4244, EXITED_0);
+        let mut v = denied(77, 0);
+        v.hook = Hook::PerfCpu as u32;
+        let evs = d.record_machine_wide(&v, None);
+        assert_eq!(evs.len(), 2, "the ended session hears nothing");
+        assert!(evs
+            .iter()
+            .all(|e| e.hook == "perf_event_open" && e.target == 0));
+        let s = d.session_of_pid(4242).unwrap();
+        assert_eq!(d.status(&alice, Some(s)).unwrap().1.unwrap().violations, 1);
     }
 
     #[test]

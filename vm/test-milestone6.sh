@@ -3,8 +3,10 @@
 # (SC2024: output from sudo commands is meant to land in files we own.)
 # Milestone 6 exit test: fairplayd protects itself from root. With
 # --self-protect, root cannot kill or stop fairplayd, trace it or read its
-# memory, read or write its BPF maps, detach its programs, or load a BPF
-# program of its own, and every attempt prints a DENIED line. Without it
+# memory, read or write its BPF maps, detach its programs, load a BPF
+# program of its own, or change its limits, nice value, scheduling, CPU
+# affinity, I/O priority or OOM score, and every attempt prints a DENIED
+# line. Without it
 # (developer mode) root kills it as before. Run inside the VM, as your normal
 # user (not root), from the repo root, under the shared VM lock:
 #   flock /run/lock/fairplay-vm-tests ./vm/test-milestone6.sh
@@ -35,11 +37,13 @@ check_not() { local label="$1"; shift; if "$@"; then bad "$label"; else ok "$lab
 step() { echo; echo "== $1"; }
 indent() { sed 's/^/      /'; }
 not() { ! "$@"; }
+BG_PIDS="" # helper processes (some run as root) for cleanup to stop
 
 T="$(mktemp -d /tmp/fairplay-m6.XXXXXX)"
 chmod 755 "$T"
-DAEMON_PID=""; FPD=""
+DAEMON_PID=""; FPD=""; OTHER=""
 cleanup() {
+  [ -n "$OTHER" ] && kill "$OTHER" 2>/dev/null
   if [ -n "$DAEMON_PID" ]; then
     # Works on an unprotected fairplayd. A self-protected one refuses (and
     # says so with a DENIED line), so wait for its own deadline.
@@ -49,6 +53,7 @@ cleanup() {
     echo "cleanup: waiting for fairplayd (pid ${FPD:-?}) to exit"
     wait "$DAEMON_PID" 2>/dev/null
   fi
+  for p in $BG_PIDS; do sudo kill "$p" 2>/dev/null; done
   sudo rm -f "$SOCK"
   rm -rf "$T"
 }
@@ -101,13 +106,57 @@ start_daemon() {
   indent <"$T/daemon.err"
 }
 
+# Issue #27: perf events sample registers and the user stack. Root's
+# CAP_PERFMON skips the kernel's ptrace check for them, so fairplayd denies
+# CPU-wide ones while anything is protected and per-process ones on the
+# game (and on itself while it protects itself); per-process ones on
+# anything unprotected still work.
+count() { grep -c "$1" "$T/daemon.out"; }
+count_more_than() { [ "$(count "$1")" -gt "$2" ]; }
+# perf_attempt <label> <expect: opened|blocked> [--pid N]: cheatsim perf as root.
+perf_attempt() {
+  local label="$1" want="$2" got; shift 2
+  if sudo "$CHEATSIM" perf "$@" >"$T/perf.out" 2>&1; then got=opened; else got=blocked; fi
+  check "$label: $want ($(cat "$T/perf.out"))" test "$got" = "$want"
+}
+cpu_perf_opens() { sudo "$CHEATSIM" perf >/dev/null 2>&1; }
+PERF_DENIED='^DENIED .* target=0 hook=perf_event_open mode=0x[0-9a-f]*$'
+# cpu_perf_denied <label>: CPU-wide perf as root is refused, with one DENIED line.
+cpu_perf_denied() {
+  local before; before="$(count "$PERF_DENIED")"
+  perf_attempt "$1" blocked
+  wait_until count_more_than "$PERF_DENIED" "$before"
+  check "$1: one DENIED line (hook=perf_event_open)" test "$(count "$PERF_DENIED")" -eq $((before + 1))
+}
+
+"$CTL" manifest keygen --out "$T/vendor.key" >/dev/null
+"$CTL" manifest new --key "$T/vendor.key" --name "M6 Test Game" --launch "$CHEATSIM" --out "$T/game.json" >/dev/null
+# launch_game: launch `cheatsim game` as a protected session; sets GPID.
+launch_game() {
+  sudo "$CTL" --socket "$SOCK" launch --run-as "$(id -u)" --manifest "$T/game.json" --install-dir "$T/bin" -- "$CHEATSIM" game >"$T/game.out" 2>&1
+  wait_until grep -q '^pid=' "$T/game.out" || { bad "a protected game started"; indent <"$T/game.out"; }
+  GPID="$(sed -n 's/^pid=\([0-9]*\) .*/\1/p' "$T/game.out")"
+  BG_PIDS="$BG_PIDS $GPID"
+}
+
 step "developer mode: no --self-protect, root can kill fairplayd"
 start_daemon
 check_not "no self-protection" grep -q 'self-protection on' "$T/daemon.err"
+perf_attempt "with nothing protected, CPU-wide perf_event_open" opened
+perf_attempt "without --self-protect, per-process perf on fairplayd" opened --pid "$FPD"
+launch_game
+cpu_perf_denied "during a session, CPU-wide perf_event_open"
+sudo kill "$GPID"
+wait_until grep -q "pid $GPID exited" "$T/daemon.err"
+# PERF_GUARD goes off once the game's domain is empty.
+wait_until cpu_perf_opens
+perf_attempt "once the session is over, CPU-wide perf_event_open" opened
+check "root renices it and changes its limits" sh -c \
+  "sudo renice -n 1 -p $FPD >/dev/null && sudo prlimit --pid $FPD --nofile=4096:4096"
 sudo kill -9 "$FPD"
 wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""
 check "kill -9 as root ends it" not alive "$FPD"
-check "no DENIED line" test "$(grep -c '^DENIED' "$T/daemon.out")" -eq 0
+check "no DENIED line about fairplayd" test "$(grep -c "^DENIED .* target=$FPD " "$T/daemon.out")" -eq 0
 FPD=""
 
 step "player mode: fairplayd --self-protect-for $PROTECT_SECS"
@@ -167,22 +216,108 @@ check "3 DENIED lines from bpf (PROG_LOAD 0x5, LINK_DETACH 0x22, PROG_DETACH 0x9
 check "1 DENIED line from bpf_prog (PROG_GET_FD_BY_ID)" test "$(denied bpf_prog)" -eq $((before_prog + 1))
 grep "^DENIED .*comm=cheatsim .*target=$FPD " "$T/daemon.out" | indent
 
+step "limits, priorities and the OOM score, as root"
+# Starving or limiting it instead of killing it (issue #27).
+tunables() {
+  echo "nice=$(awk '{print $19}' "/proc/$FPD/stat")" \
+       "sched=$(sudo chrt -p "$FPD" | head -n1 | sed 's/.*: //')" \
+       "cpus=$(sudo taskset -cp "$FPD" | sed 's/.*: //')" \
+       "io=$(sudo ionice -p "$FPD")" \
+       "cpu_limit=$(awk '/^Max cpu time/ {print $4"/"$5}' "/proc/$FPD/limits")" \
+       "oom=$(cat "/proc/$FPD/oom_score_adj")"
+}
+BEFORE="$(tunables)"
+echo "      $BEFORE"
+check "fairplayd set its own oom_score_adj to -1000" grep -q 'oom=-1000$' <<<"$BEFORE"
+expect_denied "prlimit --cpu=1 (SIGXCPU, then SIGKILL)" task_setrlimit 0x0 \
+  prlimit --pid "$FPD" --cpu=1:1
+expect_denied "prlimit --nofile=4" task_setrlimit 0x7 prlimit --pid "$FPD" --nofile=4:4
+expect_denied "renice -n 19" task_setnice 0x13 renice -n 19 -p "$FPD"
+expect_denied "chrt --idle (SCHED_IDLE)" task_setscheduler 0x0 chrt -i -p 0 "$FPD"
+expect_denied "taskset to one CPU" task_setscheduler 0x0 taskset -p 1 "$FPD"
+expect_denied "ionice -c 3 (idle I/O class)" task_setioprio 0x6007 ionice -c 3 -p "$FPD"
+TID=""
+for d in "/proc/$FPD/task/"*; do [ "${d##*/}" != "$FPD" ] && { TID="${d##*/}"; break; }; done
+[ -n "$TID" ] || bad "fairplayd has a second thread"
+for f in "/proc/$FPD/oom_score_adj" "/proc/$FPD/oom_adj" "/proc/$FPD/autogroup" \
+         "/proc/$FPD/task/$TID/oom_score_adj" "/proc/$TID/oom_score_adj"; do
+  expect_denied "write $f" proc_tune_write "" sh -c "echo 15 > $f"
+done
+check "the DENIED lines name the files" sh -c "
+  grep -q 'hook=proc_tune_write .* file=oom_score_adj\$' '$T/daemon.out' &&
+  grep -q 'hook=proc_tune_write .* file=oom_adj\$' '$T/daemon.out' &&
+  grep -q 'hook=proc_tune_write .* file=autogroup\$' '$T/daemon.out'"
+AFTER="$(tunables)"
+check "nothing changed ($AFTER)" test "$AFTER" = "$BEFORE"
+# Only fairplayd is fenced: root still tunes any other process.
+sleep 60 & OTHER=$!
+check "root still renices, limits, reschedules and re-scores other processes" sh -c "
+  sudo renice -n 5 -p $OTHER >/dev/null && sudo prlimit --pid $OTHER --cpu=100:100 &&
+  sudo chrt -b -p 0 $OTHER && sudo taskset -p 1 $OTHER >/dev/null && sudo ionice -c 3 -p $OTHER &&
+  echo 500 | sudo tee /proc/$OTHER/oom_score_adj >/dev/null"
+kill "$OTHER"; wait "$OTHER" 2>/dev/null; OTHER=""
+
 step "fairplayd still works while it protects itself"
 check "the socket API answers root" sh -c "sudo '$CTL' --socket '$SOCK' list | grep -q '\"ok\"'"
-"$CTL" manifest keygen --out "$T/vendor.key" >/dev/null
-"$CTL" manifest new --key "$T/vendor.key" --name "M6 Test Game" --launch "$CHEATSIM" --out "$T/game.json" >/dev/null
-sudo "$CTL" --socket "$SOCK" launch --run-as "$(id -u)" --manifest "$T/game.json" --install-dir "$T/bin" -- "$CHEATSIM" game >"$T/game.out" 2>&1
-wait_until grep -q '^pid=' "$T/game.out" || { bad "a protected game started"; indent <"$T/game.out"; }
-GPID="$(sed -n 's/^pid=\([0-9]*\) .*/\1/p' "$T/game.out")"
+launch_game
 ADDR="$(sed -n 's/^pid=[0-9]* addr=//p' "$T/game.out")"
 sudo "$CHEATSIM" attack --pid "$GPID" --addr "$ADDR" >"$T/attack.out" 2>&1
 check "a game it launched is still protected: 0/3 leaked" grep -q '^0/3 paths leaked' "$T/attack.out"
+
+cpu_perf_denied "during a session, CPU-wide perf_event_open"
+grep 'hook=perf_event_open' "$T/daemon.out" | tail -n 1 | indent
+sleep 30 & BG_PIDS="$BG_PIDS $!"
+perf_attempt "per-process perf on an unprotected process" opened --pid "$!"
+GAME_PERF="^DENIED .* target=$GPID hook=perf_event_alloc mode=0x[0-9a-f]*$"
+before="$(count "$GAME_PERF")"
+perf_attempt "per-process perf on the game" blocked --pid "$GPID"
+wait_until count_more_than "$GAME_PERF" "$before"
+check "one DENIED line (hook=perf_event_alloc, target the game)" \
+  test "$(count "$GAME_PERF")" -eq $((before + 1))
+grep "$GAME_PERF" "$T/daemon.out" | indent
+FPD_PERF="^DENIED .* target=$FPD hook=perf_event_alloc mode=0x[0-9a-f]*$"
+before="$(count "$FPD_PERF")"
+perf_attempt "per-process perf on fairplayd itself" blocked --pid "$FPD"
+wait_until count_more_than "$FPD_PERF" "$before"
+check "one DENIED line (hook=perf_event_alloc, target fairplayd)" \
+  test "$(count "$FPD_PERF")" -eq $((before + 1))
+
+# Issue #27: clients check who serves the socket (SO_PEERCRED).
+FAKE='import os, socket, sys
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o666); s.listen()
+while True:
+    c, _ = s.accept()
+    try: c.sendall(b"{\"ok\":{\"sessions\":[]}}\n")
+    except OSError: pass
+    c.close()'
+timeout 60 python3 -c "$FAKE" "$T/fake-user.sock" & BG_PIDS="$BG_PIDS $!"
+sudo timeout 60 python3 -c "$FAKE" "$T/fake-root.sock" & BG_PIDS="$BG_PIDS $!"
+wait_until test -S "$T/fake-user.sock"; wait_until test -S "$T/fake-root.sock"
+# refuses <label> <message> <env...>: fairplayctl list must fail, saying <message>.
+refuses() {
+  local label="$1" msg="$2"; shift 2
+  if env "$@" "$CTL" list >"$T/fake.out" 2>&1; then
+    bad "$label"
+  else
+    check "$label" grep -q "$msg" "$T/fake.out"
+  fi
+  indent <"$T/fake.out"
+}
+refuses "a client refuses a socket served by a non-root process" "not by root" \
+  FAIRPLAYD_SOCKET="$T/fake-user.sock"
+refuses "with \$FAIRPLAYD_PID (a launched game has it) it refuses any root process but fairplayd" \
+  "not by the fairplayd that launched" FAIRPLAYD_SOCKET="$T/fake-root.sock" FAIRPLAYD_PID="$FPD"
+check "and accepts the real fairplayd" \
+  sh -c "FAIRPLAYD_PID=$FPD '$CTL' --socket '$SOCK' list | grep -q '\"ok\"'"
 # The game is fairplayd's child. Its exit reaches fairplayd through the
 # kernel (SIGCHLD, waitid), which the task_kill hook doesn't see.
 sudo kill "$GPID"
 wait_until grep -q "pid $GPID exited" "$T/daemon.err"
 check "fairplayd still sees its child exit (kernel-sent SIGCHLD and wait are untouched)" \
   grep -q "pid $GPID exited" "$T/daemon.err"
+# fairplayd itself is protected: PERF_GUARD stays on with no session.
+sleep 2 # longer than release_drained's tick
+cpu_perf_denied "no session, but fairplayd protects itself: CPU-wide perf_event_open"
 check "fairplayd is still running, after $((SECONDS - STARTED))s of $PROTECT_SECS" alive "$FPD"
 TOTAL="$(grep -c '^DENIED' "$T/daemon.out")"
 echo "      $TOTAL DENIED lines in all"

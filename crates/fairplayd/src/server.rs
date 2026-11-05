@@ -15,8 +15,8 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use fairplay_api::{
-    decode_request, encode, valid_nonce, ApiError, ErrorCode, Event, Reply, Request, Response,
-    StatusReport, ViolationEvent, MAX_REQUEST_BYTES, STDIO_FDS,
+    decode_request, encode, ApiError, ErrorCode, Event, Reply, Request, Response, StatusReport,
+    ViolationEvent, MAX_REQUEST_BYTES, STDIO_FDS,
 };
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
 use tokio::{
@@ -26,6 +26,7 @@ use tokio::{
 };
 
 use crate::{
+    attest::{self, AttestConfig},
     exec_allow, host, input, launch, sandbox,
     state::{launch_identity, Peer, Subscription},
     verify, Shared,
@@ -44,6 +45,8 @@ pub struct Ctx {
     pub system_devs: Arc<[u32]>,
     /// The API socket, which the anti-cheat's sandbox includes.
     pub socket: PathBuf,
+    /// The TPM and IMA log `attest` uses (milestone 10).
+    pub attest: Arc<AttestConfig>,
 }
 
 /// Binds the socket, refusing to steal one a live daemon is serving. The
@@ -110,7 +113,12 @@ async fn connection(stream: UnixStream, ctx: Ctx) -> Result<()> {
             )),
             Request::SessionStatus { session } => session_status(&ctx, &peer, session),
             Request::ListSessions {} => Ok(ctx.daemon.lock().unwrap().list(&peer)),
-            Request::Attest { nonce } => Err(attest(nonce)),
+            Request::Attest { nonce } => {
+                let cfg = ctx.attest.clone();
+                tokio::task::spawn_blocking(move || attest::attest(&cfg, &nonce))
+                    .await
+                    .unwrap_or_else(|e| Err(ApiError::new(ErrorCode::Internal, e.to_string())))
+            }
             Request::Violations { .. } => unreachable!("handled above"),
         };
         send(&stream, &resp.into()).await?;
@@ -334,35 +342,6 @@ fn session_status(ctx: &Ctx, peer: &Peer, session: Option<u64>) -> Result<Reply,
         lockdown: host::lockdown(),
         virtual_input_devices,
     }))
-}
-
-/// Milestone 10. There is no TPM in the VM, so say so; never fake a quote.
-fn attest(nonce: String) -> ApiError {
-    let mut e = if !valid_nonce(&nonce) {
-        ApiError::new(ErrorCode::BadRequest, "nonce must be 1-64 bytes of hex")
-    } else {
-        let bytes: Vec<u8> = (0..nonce.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&nonce[i..i + 2], 16).unwrap())
-            .collect();
-        match fairplay_attest::collect(&bytes) {
-            Err(fairplay_attest::Error::NoTpm) => ApiError::new(
-                ErrorCode::Unavailable,
-                if Path::new("/dev/tpmrm0").exists() {
-                    "attestation is not implemented yet (milestone 10)"
-                } else {
-                    "no TPM on this machine; attestation needs one (milestone 10)"
-                },
-            ),
-            Err(fairplay_attest::Error::Other(m)) => ApiError::new(ErrorCode::Unavailable, m),
-            Ok(_) => ApiError::new(
-                ErrorCode::Unavailable,
-                "evidence encoding is not defined yet (milestone 10)",
-            ),
-        }
-    };
-    e.nonce = Some(nonce);
-    e
 }
 
 async fn stream_violations(

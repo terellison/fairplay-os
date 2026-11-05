@@ -23,7 +23,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
-use fairplay_api::{ApiError, ErrorCode};
+use fairplay_api::{ApiError, ErrorCode, PID_ENV};
 
 use crate::{sandbox, state::Identity};
 
@@ -63,8 +63,14 @@ pub fn prepare(argv: &[String], env: &[String], cwd: &str) -> Result<Prepared, A
             dropped_env.push(key.to_owned());
             continue;
         }
+        if key == PID_ENV {
+            continue; // ours to set
+        }
         envp.push(c(kv)?);
     }
+    // Clients in the session check that the socket is served by us
+    // (fairplay_api::client), not by a fake put in its place.
+    envp.push(c(&format!("{PID_ENV}={}", std::process::id()))?);
     Ok(Prepared {
         argv: argv.iter().map(|a| c(a)).collect::<Result<_, _>>()?,
         envp,
@@ -301,6 +307,11 @@ unsafe fn child_main(a: &ChildArgs) -> ! {
             if let Err(stage) = sb.enter() {
                 fail(a, stage);
             }
+            // While we still hold CAP_SETPCAP: no later exec, even as
+            // root, gets more than the sandbox's one kept capability.
+            if let Err(stage) = sb.drop_bounding() {
+                fail(a, stage);
+            }
         }
 
         // Our own session: not in the daemon's terminal's process group.
@@ -321,6 +332,13 @@ unsafe fn child_main(a: &ChildArgs) -> ! {
         }
         if libc::setuid(a.uid) != 0 {
             fail(a, 4);
+        }
+        // A root anti-cheat keeps no root powers it doesn't need (setuid to
+        // anyone else has already cleared them).
+        if let Some(sb) = a.sandbox {
+            if let Err(stage) = sb.drop_caps() {
+                fail(a, stage);
+            }
         }
         // No setuid/file-capability elevation from here on: a protected
         // process (which even root can't inspect) shouldn't become privileged.
@@ -399,7 +417,8 @@ mod tests {
         )
         .unwrap();
         let env: Vec<_> = p.envp.iter().map(|c| c.to_str().unwrap()).collect();
-        assert_eq!(env, vec!["HOME=/h", "OLD_X=1"]);
+        let ours = format!("FAIRPLAYD_PID={}", std::process::id());
+        assert_eq!(env, vec!["HOME=/h", "OLD_X=1", &ours]);
         assert_eq!(p.dropped_env, vec!["LD_PRELOAD", "LD_LIBRARY_PATH"]);
     }
 
@@ -420,12 +439,14 @@ mod tests {
         )
         .unwrap();
         let env: Vec<_> = p.envp.iter().map(|c| c.to_str().unwrap()).collect();
+        let ours = format!("FAIRPLAYD_PID={}", std::process::id());
         assert_eq!(
             env,
             vec![
                 "WINEPREFIX=/h/pfx",
                 "WINEDLLOVERRIDES_X=1",
-                "MY_WINEDLLPATH=1"
+                "MY_WINEDLLPATH=1",
+                &ours,
             ]
         );
         assert_eq!(

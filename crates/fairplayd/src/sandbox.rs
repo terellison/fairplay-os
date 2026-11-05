@@ -712,12 +712,67 @@ pub fn prepare(r: Request) -> Result<Prepared, ApiError> {
 /// account uses (the kernel only refuses -1).
 pub const PROC_OPTIONS: &std::ffi::CStr = c"hidepid=invisible,gid=2147483646";
 
+/// Machine-wide files in the sandbox's `/proc`, bound read-only over
+/// themselves after `pivot_root` (skipped if missing). File permissions
+/// alone guard many of them: uid 0 may write most of `/proc/sys` (sysctls,
+/// e.g. Yama's `ptrace_scope` with only CAP_SYS_PTRACE) and
+/// `/proc/sysrq-trigger` (crash or reboot the machine) without any other
+/// capability, so dropping capabilities isn't enough for a root
+/// anti-cheat. The same list container runtimes use.
+pub const PROC_READ_ONLY: &[&std::ffi::CStr] = &[
+    c"/proc/sys",
+    c"/proc/sysrq-trigger",
+    c"/proc/bus",
+    c"/proc/fs",
+    c"/proc/irq",
+];
+
+/// `CAP_SYS_PTRACE` (`<linux/capability.h>`; not in the libc crate).
+pub const CAP_SYS_PTRACE: u32 = 19;
+
+/// The only capability a sandboxed process may keep (as a bit mask):
+/// `CAP_SYS_PTRACE`, and only if it already has it (root). Without it a
+/// root anti-cheat can't read a root game at all (checked on the VM: 0/3,
+/// and the game drops out of its `hidepid` `/proc`). Two kernel rules
+/// apply to every ptrace-style access: a caller must hold every
+/// capability the target holds (a root game holds them all), unless it
+/// has CAP_SYS_PTRACE; and Yama (`ptrace_scope` 1, Ubuntu's default)
+/// allows `process_vm_readv` and `/proc/<game>/mem` ("attach" mode) only to
+/// the target's ancestors or holders of CAP_SYS_PTRACE, while the
+/// anti-cheat is the game's sibling. What the
+/// capability could add beyond reading the game is closed off elsewhere:
+/// every use goes through `ptrace_access_check`, whose outward rule keeps
+/// it to its own domain, and seccomp refuses `ptrace` itself,
+/// `process_vm_writev`, `pidfd_getfd` and `process_madvise`.
+pub const KEPT_CAPS: u64 = 1 << CAP_SYS_PTRACE;
+
+/// `<linux/capability.h>`: `_LINUX_CAPABILITY_VERSION_3` (two 32-bit
+/// words per set).
+const CAP_VERSION_3: u32 = 0x2008_0522;
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
 /// Stage numbers [`Prepared::enter`] reports, after `launch`'s own.
 pub const STAGE_UNSHARE: u32 = 1000;
 pub const STAGE_PRIVATE: u32 = 1001;
 pub const STAGE_PIVOT: u32 = 1002;
 pub const STAGE_ROOT_RO: u32 = 1003;
 pub const STAGE_SECCOMP: u32 = 1004;
+pub const STAGE_PROC_RO: u32 = 1005;
+pub const STAGE_CAPBSET: u32 = 1006;
+pub const STAGE_CAPSET: u32 = 1007;
 /// Step `i` fails as stage `STAGE_STEP + i`.
 pub const STAGE_STEP: u32 = 2000;
 
@@ -730,6 +785,9 @@ impl Prepared {
             STAGE_PIVOT => "pivot_root".into(),
             STAGE_ROOT_RO => "remounting / read-only".into(),
             STAGE_SECCOMP => "seccomp filter".into(),
+            STAGE_PROC_RO => "making /proc's system files read-only".into(),
+            STAGE_CAPBSET => "dropping the capability bounding set".into(),
+            STAGE_CAPSET => "dropping capabilities".into(),
             s if s >= STAGE_STEP => self.names.get((s - STAGE_STEP) as usize)?.clone(),
             _ => return None,
         })
@@ -832,6 +890,24 @@ impl Prepared {
             {
                 return Err(STAGE_PIVOT);
             }
+            // /proc's machine-wide files: read-only over themselves.
+            let proc_ro = libc::MS_BIND
+                | libc::MS_REMOUNT
+                | libc::MS_RDONLY
+                | libc::MS_NOSUID
+                | libc::MS_NODEV
+                | libc::MS_NOEXEC;
+            for p in PROC_READ_ONLY {
+                if libc::mount(p.as_ptr(), p.as_ptr(), null, libc::MS_BIND, null.cast()) != 0 {
+                    if *libc::__errno_location() == libc::ENOENT {
+                        continue;
+                    }
+                    return Err(STAGE_PROC_RO);
+                }
+                if libc::mount(null, p.as_ptr(), null, proc_ro, null.cast()) != 0 {
+                    return Err(STAGE_PROC_RO);
+                }
+            }
             let ro = libc::MS_BIND
                 | libc::MS_REMOUNT
                 | libc::MS_RDONLY
@@ -867,6 +943,72 @@ impl Prepared {
         }
         Ok(())
     }
+
+    /// Drops every capability but [`KEPT_CAPS`] from the bounding set (what
+    /// any later exec, root's included, can ever hold) and clears the
+    /// ambient set. Needs CAP_SETPCAP, so `launch` calls it before
+    /// `setuid`. Async-signal-safe.
+    ///
+    /// # Safety
+    /// Only in the forked child.
+    pub unsafe fn drop_bounding(&self) -> Result<(), u32> {
+        unsafe {
+            for cap in 0..64u32 {
+                if KEPT_CAPS & (1 << cap) != 0 {
+                    continue;
+                }
+                if libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) != 0 {
+                    // Past the kernel's last capability.
+                    if *libc::__errno_location() == libc::EINVAL {
+                        break;
+                    }
+                    return Err(STAGE_CAPBSET);
+                }
+            }
+            if libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) != 0
+            {
+                return Err(STAGE_CAPBSET);
+            }
+        }
+        Ok(())
+    }
+
+    /// Cuts the effective and permitted sets down to [`KEPT_CAPS`] (of what
+    /// the process still has: nothing, after `setuid` to anyone but root)
+    /// and empties the inheritable set. `launch` calls it after `setuid`,
+    /// so the exec starts from these. Async-signal-safe.
+    ///
+    /// # Safety
+    /// Only in the forked child.
+    pub unsafe fn drop_caps(&self) -> Result<(), u32> {
+        let mut hdr = CapHeader {
+            version: CAP_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapData::default(); 2];
+        // SAFETY: hdr and data are the layout capget/capset expect (v3).
+        unsafe {
+            if libc::syscall(libc::SYS_capget, &mut hdr, data.as_mut_ptr()) != 0 {
+                return Err(STAGE_CAPSET);
+            }
+            for (i, d) in data.iter_mut().enumerate() {
+                let keep = (KEPT_CAPS >> (32 * i)) as u32;
+                d.permitted &= keep;
+                d.effective = d.permitted;
+                d.inheritable = 0;
+            }
+            if libc::syscall(libc::SYS_capset, &hdr, data.as_ptr()) != 0 {
+                return Err(STAGE_CAPSET);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// System calls the sandbox refuses with EPERM (milestone 9, part B). The
@@ -877,12 +1019,74 @@ impl Prepared {
 /// and reading `/proc/<pid>/mem` stay. Writes to `/proc/<pid>/mem` and
 /// signals outside the sandbox are refused by the BPF LSM instead (seccomp
 /// sees neither paths nor targets).
+///
+/// The rest is defence in depth (#30): nothing that reads a game's memory
+/// and module list needs them, and each is a way to change what the
+/// sandbox sees or to reach a large kernel surface. Most already fail
+/// without capabilities, which the sandbox drops ([`KEPT_CAPS`]), but a new
+/// user namespace doesn't need any, and the filter doesn't depend on the
+/// capability drop being complete:
+///
+/// - namespaces: `setns`, `unshare` (and `clone` with a `CLONE_NEW*` flag,
+///   see [`seccomp_filter`]): a new user namespace makes even an ordinary
+///   user root inside it, with mounts of its own;
+/// - mounts: `mount`, `umount2` (uncovering what the sandbox's mounts
+///   hide), the new mount API (`open_tree`, `move_mount`, `fsopen`,
+///   `fsconfig`, `fsmount`, `fspick`, `mount_setattr`: e.g. making a
+///   read-only mount writable), `pivot_root` and `chroot`;
+/// - the kernel keyring (`keyctl`, `add_key`, `request_key`): per user,
+///   shared with the user's other programs, outside any mount namespace;
+/// - `bpf`: loading programs or touching maps (fairplayd's too, as root)
+///   is the operating system's job, never the anti-cheat's.
+/// - large kernel surfaces with a long record of bugs, which nothing that
+///   reads a game needs: `io_uring_setup` (and `io_uring_enter`,
+///   `io_uring_register`), `perf_event_open`, `userfaultfd` (a way to
+///   stall the kernel mid-copy, a staple of exploits).
+///
+/// fairplayd's own mounts and `pivot_root` for the sandbox happen before
+/// the filter is installed (`launch`: [`Prepared::enter`], then
+/// [`Prepared::seccomp`]).
 pub const DENIED_SYSCALLS: &[(&str, libc::c_long)] = &[
     ("ptrace", libc::SYS_ptrace),
     ("process_vm_writev", libc::SYS_process_vm_writev),
     ("pidfd_getfd", libc::SYS_pidfd_getfd),
     ("process_madvise", libc::SYS_process_madvise),
+    ("setns", libc::SYS_setns),
+    ("unshare", libc::SYS_unshare),
+    ("mount", libc::SYS_mount),
+    ("umount2", libc::SYS_umount2),
+    ("open_tree", libc::SYS_open_tree),
+    ("move_mount", libc::SYS_move_mount),
+    ("fsopen", libc::SYS_fsopen),
+    ("fsconfig", libc::SYS_fsconfig),
+    ("fsmount", libc::SYS_fsmount),
+    ("fspick", libc::SYS_fspick),
+    ("mount_setattr", libc::SYS_mount_setattr),
+    ("pivot_root", libc::SYS_pivot_root),
+    ("chroot", libc::SYS_chroot),
+    ("keyctl", libc::SYS_keyctl),
+    ("add_key", libc::SYS_add_key),
+    ("request_key", libc::SYS_request_key),
+    ("bpf", libc::SYS_bpf),
+    ("io_uring_setup", libc::SYS_io_uring_setup),
+    ("io_uring_enter", libc::SYS_io_uring_enter),
+    ("io_uring_register", libc::SYS_io_uring_register),
+    ("perf_event_open", libc::SYS_perf_event_open),
+    ("userfaultfd", libc::SYS_userfaultfd),
 ];
+
+/// `clone` flags that make a new namespace (`<linux/sched.h>`; libc has
+/// no `CLONE_NEWTIME`). `clone`'s flags are its first argument on both
+/// x86-64 and arm64, and the kernel reads only their low 32 bits.
+pub const CLONE_NEW_FLAGS: u32 = libc::CLONE_NEWNS as u32
+    | libc::CLONE_NEWCGROUP as u32
+    | libc::CLONE_NEWUTS as u32
+    | libc::CLONE_NEWIPC as u32
+    | libc::CLONE_NEWUSER as u32
+    | libc::CLONE_NEWPID as u32
+    | libc::CLONE_NEWNET as u32
+    | CLONE_NEWTIME;
+const CLONE_NEWTIME: u32 = 0x80;
 
 /// `<linux/audit.h>`: the architecture a filter was written for. A system
 /// call made through another ABI (32-bit compat) kills the process.
@@ -899,13 +1103,17 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 const LD_W_ABS: u16 = 0x20;
 /// `BPF_JMP | BPF_JEQ | BPF_K`.
 const JMP_JEQ_K: u16 = 0x15;
+/// `BPF_JMP | BPF_JSET | BPF_K`.
+const JMP_JSET_K: u16 = 0x45;
 #[cfg(target_arch = "x86_64")]
 /// `BPF_JMP | BPF_JGE | BPF_K`.
 const JMP_JGE_K: u16 = 0x35;
 const RET_K: u16 = 0x06;
-/// `struct seccomp_data` offsets: `nr`, then `arch`.
+/// `struct seccomp_data` offsets: `nr`, `arch`, then the low 32 bits of
+/// the first argument (little-endian on both architectures).
 const OFFSET_NR: u32 = 0;
 const OFFSET_ARCH: u32 = 4;
+const OFFSET_ARG0_LO: u32 = 16;
 
 fn stmt(code: u16, k: u32) -> libc::sock_filter {
     libc::sock_filter {
@@ -921,9 +1129,16 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 }
 
 /// The sandbox's seccomp filter: wrong architecture -> kill; a call in
-/// [`DENIED_SYSCALLS`] -> EPERM; anything else allowed.
+/// [`DENIED_SYSCALLS`], or `clone` with a [`CLONE_NEW_FLAGS`] flag, ->
+/// EPERM; `clone3` -> ENOSYS; anything else allowed.
+///
+/// `clone3` passes its flags in memory, which seccomp can't read, so it
+/// can't be checked like `clone`. ENOSYS ("not implemented") makes glibc
+/// fall back to `clone` for threads and `posix_spawn`, as it does on
+/// kernels older than 5.3.
 pub fn seccomp_filter() -> Vec<libc::sock_filter> {
     let eperm = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32 & libc::SECCOMP_RET_DATA);
+    let enosys = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32 & libc::SECCOMP_RET_DATA);
     let mut f = vec![
         stmt(LD_W_ABS, OFFSET_ARCH),
         jump(JMP_JEQ_K, AUDIT_ARCH, 1, 0),
@@ -936,6 +1151,16 @@ pub fn seccomp_filter() -> Vec<libc::sock_filter> {
         f.push(jump(JMP_JEQ_K, nr as u32, 0, 1));
         f.push(stmt(RET_K, eperm));
     }
+    f.push(jump(JMP_JEQ_K, libc::SYS_clone3 as u32, 0, 1));
+    f.push(stmt(RET_K, enosys));
+    // clone: load its flags (last, since this replaces `nr` in the
+    // accumulator), EPERM if any namespace flag is set.
+    f.extend([
+        jump(JMP_JEQ_K, libc::SYS_clone as u32, 0, 3),
+        stmt(LD_W_ABS, OFFSET_ARG0_LO),
+        jump(JMP_JSET_K, CLONE_NEW_FLAGS, 0, 1),
+        stmt(RET_K, eperm),
+    ]);
     f.push(stmt(RET_K, libc::SECCOMP_RET_ALLOW));
     f
 }
@@ -1262,6 +1487,14 @@ mod tests {
     }
 
     #[test]
+    fn kept_caps_and_read_only_proc() {
+        assert_eq!(KEPT_CAPS, 0x80000, "CAP_SYS_PTRACE only");
+        for p in ["/proc/sys", "/proc/sysrq-trigger"] {
+            assert!(PROC_READ_ONLY.iter().any(|c| c.to_str() == Ok(p)), "{p}");
+        }
+    }
+
+    #[test]
     fn seccomp_filter_shape() {
         let f = seccomp_filter();
         // Architecture check first, allow last, one EPERM per denied call.
@@ -1280,6 +1513,23 @@ mod tests {
         }
         assert!(!f.iter().any(|x| x.code == JMP_JEQ_K
             && (x.k == libc::SYS_process_vm_readv as u32 || x.k == libc::SYS_openat as u32)));
+        // clone3 -> ENOSYS; clone with a namespace flag -> EPERM, last
+        // before allow (it overwrites the system call number).
+        let i = f
+            .iter()
+            .position(|x| x.code == JMP_JEQ_K && x.k == libc::SYS_clone3 as u32)
+            .unwrap();
+        let enosys = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+        assert_eq!((f[i + 1].code, f[i + 1].k), (RET_K, enosys));
+        let n = f.len();
+        assert_eq!(
+            (f[n - 5].code, f[n - 5].k, f[n - 5].jf),
+            (JMP_JEQ_K, libc::SYS_clone as u32, 3)
+        );
+        assert_eq!((f[n - 4].code, f[n - 4].k), (LD_W_ABS, OFFSET_ARG0_LO));
+        assert_eq!((f[n - 3].code, f[n - 3].k), (JMP_JSET_K, CLONE_NEW_FLAGS));
+        assert_eq!((f[n - 2].code, f[n - 2].k), (RET_K, eperm));
+        assert_eq!(CLONE_NEW_FLAGS & libc::SIGCHLD as u32, 0);
     }
 
     /// Installs the filter in a forked child (no root needed): ptrace and
@@ -1328,6 +1578,32 @@ mod tests {
                 if libc::process_vm_readv(me, &local, 1, &remote, 1, 0) != 8 || buf != src {
                     code |= 4;
                 }
+                // unshare(0) would succeed (and do nothing) without the filter.
+                if libc::unshare(0) != -1 || !eperm() {
+                    code |= 8;
+                }
+                let clone = |flags: libc::c_int| libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0);
+                if clone(libc::CLONE_NEWUSER | libc::SIGCHLD) != -1 || !eperm() {
+                    code |= 16;
+                }
+                if libc::syscall(libc::SYS_clone3, 0, 0) != -1
+                    || *libc::__errno_location() != libc::ENOSYS
+                {
+                    code |= 32;
+                }
+                // A plain clone (a fork) still works.
+                match clone(libc::SIGCHLD) {
+                    0 => libc::_exit(0),
+                    -1 => code |= 64,
+                    pid => {
+                        let mut st = 0;
+                        if libc::waitpid(pid as libc::pid_t, &mut st, 0) != pid as libc::pid_t
+                            || !libc::WIFEXITED(st)
+                        {
+                            code |= 64;
+                        }
+                    }
+                }
                 libc::_exit(code);
             },
             -1 => panic!("fork failed"),
@@ -1336,7 +1612,11 @@ mod tests {
                 // SAFETY: waiting for our own child.
                 unsafe { libc::waitpid(pid, &mut status, 0) };
                 assert!(libc::WIFEXITED(status), "status {status:#x}");
-                assert_eq!(libc::WEXITSTATUS(status), 0, "1 ptrace, 2 writev, 4 readv");
+                assert_eq!(
+                    libc::WEXITSTATUS(status),
+                    0,
+                    "1 ptrace, 2 writev, 4 readv, 8 unshare, 16 clone NEWUSER, 32 clone3, 64 fork"
+                );
             }
         }
     }

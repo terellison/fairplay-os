@@ -8,7 +8,10 @@
 //! `violations` turns the connection into a one-way stream of events.
 //!
 //! The daemon learns who is calling from the kernel (`SO_PEERCRED`), never
-//! from the request, so nothing in a request claims an identity.
+//! from the request, so nothing in a request claims an identity. The
+//! client checks the other way too: the socket must be served by root and,
+//! inside a protected session, by the fairplayd that launched it
+//! ([`PID_ENV`]).
 //!
 //! `launch_protected` starts only what a signed game manifest names
 //! (milestone 9, see [`manifest`]): a launch executable for a new session,
@@ -25,7 +28,8 @@
 //! -> {"op":"session_status","session":1}
 //! <- {"ok":{"status":{"protected":true,"session":{...},"lockdown":"none","virtual_input_devices":[]}}}
 //! -> {"op":"attest","nonce":"00ff"}
-//! <- {"error":{"code":"unavailable","message":"...","nonce":"00ff"}}
+//! <- {"ok":{"evidence":{"version":1,"nonce":"00ff","quote":"...",...}}}
+//! <- {"error":{"code":"unavailable","message":"no TPM ...","nonce":"00ff"}}
 //! -> {"op":"violations","session":1}
 //! <- {"ok":{"subscribed":{"session":1}}}
 //! <- {"event":{"violation":{"session":1,"caller":777,"comm":"cheatsim",...}}}
@@ -35,13 +39,20 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod attest;
 pub mod client;
 pub mod manifest;
+
+pub use attest::WireEvidence;
 
 /// Where fairplayd listens unless told otherwise.
 pub const DEFAULT_SOCKET: &str = "/run/fairplayd.sock";
 /// Environment variable clients read to find a non-default socket.
 pub const SOCKET_ENV: &str = "FAIRPLAYD_SOCKET";
+/// Environment variable fairplayd sets, to its own pid, for every process
+/// it launches (and so everything they start). A client that finds it
+/// refuses a socket served by any other process (see [`client`]).
+pub const PID_ENV: &str = "FAIRPLAYD_PID";
 /// Group whose members may call `launch_protected` (root always may).
 pub const DEFAULT_LAUNCHER_GROUP: &str = "fairplay-launcher";
 /// Longest request line the daemon accepts, newline included.
@@ -120,8 +131,10 @@ pub enum Request {
     },
     /// The caller's sessions (every session, for root).
     ListSessions {},
-    /// Evidence of what booted, for a server-chosen nonce (hex). Milestone 10;
-    /// answers `unavailable` until there is a TPM.
+    /// Evidence of what booted, for a server-chosen nonce (hex, 1 to
+    /// [`MAX_NONCE_BYTES`] bytes): a TPM quote over the boot PCRs and the
+    /// IMA log ([`Reply::Evidence`], milestone 10). `unavailable` on a
+    /// machine without a TPM; fairplayd never makes evidence up.
     Attest { nonce: String },
 }
 
@@ -148,6 +161,9 @@ pub enum Reply {
         session: Option<SessionId>,
     },
     Sessions(Vec<SessionInfo>),
+    /// The answer to `attest`, for the caller to pass to its server (see
+    /// [`attest`]).
+    Evidence(Box<WireEvidence>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +250,19 @@ pub struct SessionInfo {
     /// How many such processes (a lower bound).
     #[serde(default)]
     pub unprotected_children: u64,
+    /// The most processes the session's domain may have forked at once
+    /// (fairplayd's `--member-cap`). A protected process's fork beyond it
+    /// fails with `EAGAIN`, and is a `task_alloc` violation. The processes
+    /// fairplayd launched (`game`, `members`) don't count.
+    #[serde(default)]
+    pub member_cap: u32,
+    /// Processes forked into the domain that are still alive.
+    #[serde(default)]
+    pub forked_members: u64,
+    /// Forks refused at the cap, in total. The `task_alloc` violations are
+    /// rate-limited; each says in `mode` how many refusals it stands for.
+    #[serde(default)]
+    pub forks_denied: u64,
     /// The signed manifest the session was launched from (milestone 9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<Box<ManifestInfo>>,
@@ -453,10 +482,15 @@ pub fn decode_request(line: &[u8]) -> Result<Request, ApiError> {
 
 /// Checks an attestation nonce: non-empty hex, at most [`MAX_NONCE_BYTES`].
 pub fn valid_nonce(nonce: &str) -> bool {
-    !nonce.is_empty()
-        && nonce.len().is_multiple_of(2)
-        && nonce.len() <= 2 * MAX_NONCE_BYTES
-        && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+    parse_nonce(nonce).is_some()
+}
+
+/// An attestation nonce's bytes, if it is [valid](valid_nonce).
+pub fn parse_nonce(nonce: &str) -> Option<Vec<u8>> {
+    if nonce.is_empty() || nonce.len() > 2 * MAX_NONCE_BYTES {
+        return None;
+    }
+    attest::from_hex(nonce)
 }
 
 #[cfg(test)]
@@ -593,6 +627,9 @@ mod tests {
                 violations: 3,
                 protection_degraded: true,
                 unprotected_children: 2,
+                member_cap: 1024,
+                forked_members: 5,
+                forks_denied: 0,
                 manifest: Some(Box::new(ManifestInfo {
                     name: "g".into(),
                     sha256: "00".repeat(32),
