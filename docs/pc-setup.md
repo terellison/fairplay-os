@@ -15,28 +15,46 @@ Target machine: x86_64, NVIDIA RTX 40-series, firmware TPM, Windows 11 already i
    → untick "Turn on fast startup". With it on, Windows only half shuts down and leaves its disks
    locked.
 3. **Pick a disk for Linux.** A separate SSD of 256 GB or more is best: Windows stays untouched
-   and you can pull the drive to undo everything. Otherwise, shrink the Windows partition in
-   Disk Management (right-click the C: partition → Shrink Volume) to free about 256 GB.
+   and you can pull the drive to undo everything. A removable (USB) SSD works too; use a
+   USB 3.2 or USB-C port on the motherboard's back panel, not a front-panel hub. Otherwise,
+   shrink the Windows partition in Disk Management (right-click the C: partition → Shrink
+   Volume) to free about 256 GB.
+4. **Make the installer stick.** You need a USB stick of 8 GB or more, *separate* from the Linux
+   disk: you boot the installer from the stick, and it can't install onto the drive it's
+   running from. Writing the installer erases the stick. An old Windows install stick is fine;
+   Microsoft's Media Creation Tool can rebuild it later. Download the Ubuntu 24.04 LTS Desktop
+   ISO (an image of the installer disk) from <https://ubuntu.com/download/desktop>, then
+   write it to the stick with [Rufus](https://rufus.ie) or
+   [balenaEtcher](https://etcher.balena.io). In Rufus, pick the stick and the ISO and keep the
+   defaults (partition scheme GPT, target system UEFI); if it asks, choose "ISO Image mode".
 
 ## In the firmware (BIOS/UEFI setup)
 
-4. **Keep Secure Boot on, with the standard keys.** Don't clear or replace the keys. The RTX 40
+5. **Keep Secure Boot on, with the standard keys.** Don't clear or replace the keys. The RTX 40
    card's own firmware is signed with Microsoft's key, and without that key the screen stays
    black at boot. Linux boots through **shim**, a small loader that Microsoft signs, so it works
    with the standard keys.
-5. **Check the TPM is on.** It's usually called **fTPM** (AMD) or **PTT** (Intel). If Windows 11
+6. **Check the TPM is on.** It's usually called **fTPM** (AMD) or **PTT** (Intel). If Windows 11
    runs, it's already on.
 
 ## Install Linux
 
-6. **Install Ubuntu 24.04 LTS Desktop (x86_64)** from a USB stick, onto the Linux disk.
+7. **Install Ubuntu 24.04 LTS Desktop (x86_64)** from the installer stick, onto the Linux disk.
+   - Plug in the stick (and the Linux SSD, if it's removable), power on, and pick the stick from
+     the firmware's one-time boot menu (often F8, F11 or F12 at power-on).
+   - **Keep the boot files on the Linux disk.** Ubuntu's installer may otherwise put its boot
+     loader on the Windows drive's EFI partition (the small partition the firmware boots from),
+     so Windows' boot then depends on Linux. Simplest: unplug the internal Windows drive for the
+     install, if that's practical. If not, choose **Manual installation**, create on the Linux
+     disk an EFI partition (about 1 GB, FAT32) and a `/` partition (the rest, ext4), and set
+     "Device for boot loader installation" to the Linux disk.
    - Choose "Install third-party software for graphics" so the NVIDIA driver comes with it.
    - If the installer asks for a **Secure Boot (MOK) password**, set one you'll remember. On the
      next boot a blue screen appears: choose "Enroll MOK" and type that password. (MOK, the
      Machine Owner Key, is how shim learns to trust a key you add.)
    - **Don't mount the Windows drives in Linux.** Agents get root on the Linux side; keeping
      Windows unmounted keeps it out of their reach.
-7. **Check the hardware.** Open a terminal, run this and send the output to the lead agent:
+8. **Check the hardware.** Open a terminal, run this and send the output to the lead agent:
    ```
    ls /dev/tpmrm0; mokutil --sb-state; nvidia-smi | head -15; cat /sys/kernel/security/lsm
    ```
@@ -46,21 +64,21 @@ Target machine: x86_64, NVIDIA RTX 40-series, firmware TPM, Windows 11 already i
 
 ## Give agents access
 
-8. Install `git`, Rust's toolchain installer and Claude Code:
+9. Install `git`, Rust's toolchain installer and Claude Code:
    ```
    sudo apt install -y git curl build-essential
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
    Then install Claude Code and clone `terellison/fairplay-os`.
-9. **Copy the two GitHub App configs** from the VM to the PC, directly between your machines:
-   ```
-   scp -r <vm>:~/.config/fairplay-agents <vm>:~/.config/fairplay-lead ~/.config/
-   chmod 700 ~/.config/fairplay-agents ~/.config/fairplay-lead
-   chmod 600 ~/.config/fairplay-agents/*.pem ~/.config/fairplay-lead/*.pem
-   ```
-   These hold the Apps' private keys. Never paste them into chat, an issue or the repo. Edit the
-   key paths in each `app.env` if your home directory differs from the VM's.
-10. **Steam is optional for now.** Milestone 12's first test uses a standalone Proton build and our
+10. **Copy the two GitHub App configs** from the VM to the PC, directly between your machines:
+    ```
+    scp -r <vm>:~/.config/fairplay-agents <vm>:~/.config/fairplay-lead ~/.config/
+    chmod 700 ~/.config/fairplay-agents ~/.config/fairplay-lead
+    chmod 600 ~/.config/fairplay-agents/*.pem ~/.config/fairplay-lead/*.pem
+    ```
+    These hold the Apps' private keys. Never paste them into chat, an issue or the repo. Edit the
+    key paths in each `app.env` if your home directory differs from the VM's.
+11. **Steam is optional for now.** Milestone 12's first test uses a standalone Proton build and our
     own Windows test program, with no Steam login. Real games come later, and you sign in to Steam
     yourself; agents never handle your Steam password.
 
@@ -86,7 +104,7 @@ These don't block setup, but milestone 11 needs the first one.
 
 ## Undoing it
 
-With a separate disk: remove the Linux disk, or pick Windows Boot Manager first in the firmware's
-boot order. With a shrunk partition: in Windows, delete the Linux partitions in Disk Management
+With a separate disk whose boot files are on it: unplug the Linux disk, or put Windows Boot
+Manager first in the firmware's boot order; boot Linux from the one-time boot menu. With a shrunk partition: in Windows, delete the Linux partitions in Disk Management
 and extend C:, then remove the `ubuntu` boot entry (`bcdedit /enum firmware`, then
 `bcdedit /delete {id}` from an administrator prompt).
