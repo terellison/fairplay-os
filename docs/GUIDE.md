@@ -36,7 +36,7 @@ the parts that need a real gaming PC come later.
 | 11 | Player-mode system image | Needs an x86 PC | |
 | 12 | A Windows game under **Proton**, protected | Needs an x86 PC | |
 
-The [design doc](design.md#milestones) has each one's exit test.
+The [design doc](design.md#milestones) has each one's exit test. [Setting up the gaming PC](pc-setup.md) is the checklist for the x86 machine that 10–12 need.
 
 ## Player mode and developer mode
 
